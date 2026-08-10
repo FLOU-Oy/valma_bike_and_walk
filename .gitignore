@@ -1,0 +1,54 @@
+# --- Project data / generated artifacts -------------------------------
+# Raw OSM extracts and other input data
+/data/
+
+# Cached networks (tiled .npz, geometry, pyrosm shards, etc.)
+/.cache/
+
+# Generated results (matrices, link geopackages, ...)
+/output/
+
+# Common geodata / network / matrix formats, wherever they land
+*.osm.pbf
+*.npz
+*.gpkg
+*.gpkg-*
+*.graphml
+
+# --- Python -------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+wheels/
+.eggs/
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing / linting / type-checking caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# uv
+.uv/
+
+# IDE / OS cruft
+.DS_Store
+Thumbs.db
