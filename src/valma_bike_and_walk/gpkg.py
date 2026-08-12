@@ -1,8 +1,12 @@
-"""Export a routable network's links to a GeoPackage for visualization.
+"""Draw a per-edge result back onto the link layer, for GIS.
 
-Only meaningful for networks built with ``keep_geometry=True`` (``valma build
---gpkg``): the compact .npz cache normally keeps nothing but node coordinates
-and a CSR adjacency, which is enough to route but not to draw a road on a map.
+The routable network holds no geometry -- the link GeoPackage does, and every
+directed edge remembers the ``link_id`` it came from. So an export is a join:
+take an array with one value per directed edge, look up each edge's link, and
+write the link's shape out with the value attached.
+
+That indirection is what makes the workflow work. The GeoPackage you edited in
+QGIS is the same one the results come back on, row for row.
 """
 
 from __future__ import annotations
@@ -12,38 +16,44 @@ from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
-import shapely
 
-from valma_bike_and_walk.config import WGS84
+from valma_bike_and_walk.links import LINKS_LAYER
+from valma_bike_and_walk.links import read_links as read_links_gpkg
 from valma_bike_and_walk.network import RoutableNetwork
 
 logger = logging.getLogger(__name__)
 
 
 def edges_to_geodataframe(
-    network: RoutableNetwork, extra_columns: dict[str, np.ndarray] | None = None
+    network: RoutableNetwork,
+    links: gpd.GeoDataFrame,
+    extra_columns: dict[str, np.ndarray] | None = None,
 ) -> gpd.GeoDataFrame:
     """
-    One row per directed edge: geometry, OSM endpoint ids, length, time, speed.
+    One row per directed edge: the link's geometry, its endpoints and its costs.
 
-    Geometry is the merged road shape captured before simplification discarded
-    it, in WGS84 -- the CRS it was read from the PBF in, unrelated to the
-    projected metres the network routes in.
+    ``links`` is the layer the network was built from. A link that carries
+    traffic both ways produces two rows here, distinguished by ``direction``
+    (+1 along the link as digitised, -1 against it) and sharing one geometry.
+    Links that the build dropped -- outside the largest connected component, or
+    a slower parallel duplicate -- have no row.
 
-    ``extra_columns``, if given, is merged in as-is -- e.g. an assignment's
-    per-edge volume array from
-    :func:`valma_bike_and_walk.assignment.link_volume_frame`, which is aligned
-    with the network's edges the same way this function's own columns are.
+    ``extra_columns``, if given, is merged in as-is: an assignment's per-edge
+    volume array from :func:`valma_bike_and_walk.assignment.link_volume_frame`
+    is aligned with the network's edges exactly as this function's own columns
+    are.
     """
-    if network.geometry is None:
-        raise ValueError(
-            "This network was built without geometry. Rebuild with "
-            "`valma build --gpkg` (add --force-reload if a plain network is "
-            "already cached for this extent) to export its links."
-        )
-
     rows = np.repeat(np.arange(network.n_nodes), np.diff(network.indptr))
     cols = network.indices
+
+    geometry_by_link = links.set_index("link_id").geometry
+    missing = ~np.isin(network.link_id, geometry_by_link.index.to_numpy())
+    if missing.any():
+        raise ValueError(
+            f"{int(missing.sum())} of {network.n_edges} edges reference a link_id that "
+            "is not in this link layer. It is not the layer this network was built "
+            "from, or it has been edited since."
+        )
 
     length_m = network.length.astype(np.float64)
     travel_time_s = network.travel_time
@@ -51,6 +61,8 @@ def edges_to_geodataframe(
         speed_kmh = np.where(travel_time_s > 0, length_m / travel_time_s * 3.6, np.nan)
 
     columns = {
+        "link_id": network.link_id,
+        "direction": network.direction,
         "u": network.node_ids[rows],
         "v": network.node_ids[cols],
         "length_m": length_m,
@@ -62,25 +74,33 @@ def edges_to_geodataframe(
 
     return gpd.GeoDataFrame(
         columns,
-        geometry=shapely.from_wkb(network.geometry),
-        crs=WGS84,
+        geometry=geometry_by_link.loc[network.link_id].to_numpy(),
+        crs=links.crs,
     )
 
 
 def write_edges_gpkg(
     network: RoutableNetwork,
+    links: gpd.GeoDataFrame | Path | str,
     path: Path,
-    layer: str = "links",
+    layer: str = LINKS_LAYER,
     extra_columns: dict[str, np.ndarray] | None = None,
 ) -> Path:
-    """Write the network's links (geometry + speed/cost columns) to a GeoPackage."""
-    gdf = edges_to_geodataframe(network, extra_columns=extra_columns)
+    """
+    Write the network's edges, with their link geometry, to a GeoPackage.
+
+    ``links`` is either the layer itself or a path to the GeoPackage
+    ``valma extract`` wrote.
+    """
+    if isinstance(links, (str, Path)):
+        links = read_links_gpkg(Path(links))
+    gdf = edges_to_geodataframe(network, links, extra_columns=extra_columns)
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     gdf.to_file(path, driver="GPKG", layer=layer)
 
     logger.info(
-        "Saved %d links to %s (%.1f MB)", len(gdf), path, path.stat().st_size / 1e6
+        "Saved %d edges to %s (%.1f MB)", len(gdf), path, path.stat().st_size / 1e6
     )
     return path

@@ -17,8 +17,8 @@ dependencies = [
     "geopandas>=0.14",
     "numpy>=1.24",
     "pandas>=2.0",
+    "osmium>=4.0",
     "pyproj>=3.5",
-    "pyrosm>=0.13",
     "scipy>=1.11",
     "shapely>=2.0",
 ]
@@ -62,8 +62,13 @@ testpaths = ["tests"]
 
 [tool.mypy]
 python_version = "3.10"
-# pyrosm, scipy and geopandas ship no type stubs.
+# osmium, scipy and geopandas ship no type stubs.
 ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 100
+
+[tool.black]
+# Match requires-python, so black does not guess a newer grammar than the
+# interpreter running it can parse.
+target-version = ["py310"]

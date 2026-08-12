@@ -4,29 +4,9 @@ import numpy as np
 import pytest
 
 from valma_bike_and_walk.matrix import choose_chunk_size, summarise, travel_time_matrix
-from valma_bike_and_walk.network import RoutableNetwork, _build_csr
+from valma_bike_and_walk.network import RoutableNetwork
 
-
-def make_network(edges, n_nodes, mode="bike"):
-    """edges: list of (u, v, seconds)."""
-    u = np.array([e[0] for e in edges], dtype=np.int64)
-    v = np.array([e[1] for e in edges], dtype=np.int64)
-    t = np.array([e[2] for e in edges], dtype=float)
-    length = t.astype(np.float32)
-
-    indptr, indices, travel_time, length, _geometry = _build_csr(
-        u, v, t, length, n_nodes
-    )
-    return RoutableNetwork(
-        mode=mode,
-        node_ids=np.arange(n_nodes, dtype=np.int64),
-        x=np.arange(n_nodes, dtype=float) * 100.0,
-        y=np.zeros(n_nodes, dtype=float),
-        indptr=indptr,
-        indices=indices,
-        travel_time=travel_time,
-        length=length,
-    )
+from .conftest import make_network
 
 
 def test_path_travel_time_is_sum_of_edges():

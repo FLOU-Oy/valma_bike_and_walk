@@ -8,41 +8,39 @@ makes every shortest-path call slow.
 This module keeps the same information in a handful of numpy arrays plus a SciPy
 CSR matrix -- roughly two orders of magnitude smaller, and routable with SciPy's
 compiled Dijkstra instead of NetworkX's pure-Python one.
+
+This is stage two of the pipeline. Its input is the link layer
+(:mod:`valma_bike_and_walk.links`), not the PBF: geometry, tags and every
+editable decision stay in the GeoPackage, and what lands here is the minimum
+needed to route. Each directed edge keeps its ``link_id``, so a result computed
+here maps straight back onto the rows you edited.
 """
 
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+import geopandas as gpd
 import numpy as np
 import shapely
 from pyproj import Transformer
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
-from shapely.geometry import box
 
+from valma_bike_and_walk import links as links_module
 from valma_bike_and_walk.config import (
-    FINLAND_BOUNDS,
     PROJECTED_CRS,
     WGS84,
     Settings,
     validate_mode,
 )
-from valma_bike_and_walk.extract import (
-    build_directed_edges,
-    read_network_tables,
-    resolve_clip,
-)
-from valma_bike_and_walk.speeds import profile_for
+from valma_bike_and_walk.osm import read_links, resolve_clip
 
 logger = logging.getLogger(__name__)
-
-TRAVEL_TIME_COL = "travel_time"
 
 
 @dataclass
@@ -57,13 +55,12 @@ class RoutableNetwork:
     indices: np.ndarray  # int32 CSR column indices
     travel_time: np.ndarray  # float64 seconds, one per directed edge
     length: np.ndarray  # float32 metres, one per directed edge
+    #: link_id of the link layer row this edge came from, one per directed edge.
+    #: This is how an assignment's volumes are drawn back onto the GeoPackage.
+    link_id: np.ndarray  # int64
+    #: +1 if the edge runs along the link's digitised direction, -1 against it.
+    direction: np.ndarray  # int8
     crs: str = PROJECTED_CRS
-    #: object array of WKB bytes, one per directed edge, aligned with
-    #: travel_time/length -- i.e. edges for row i live at
-    #: geometry[indptr[i]:indptr[i+1]], same as every other per-edge array.
-    #: WGS84 (the CRS the geometry was captured in, before node x/y are
-    #: projected). None unless the network was built with keep_geometry=True.
-    geometry: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         self._tree: cKDTree | None = None
@@ -123,7 +120,8 @@ class RoutableNetwork:
         """Persist as a compressed .npz -- far smaller and faster than GraphML."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = dict(
+        np.savez_compressed(
+            path,
             mode=np.array(self.mode),
             crs=np.array(self.crs),
             node_ids=self.node_ids,
@@ -133,22 +131,16 @@ class RoutableNetwork:
             indices=self.indices,
             travel_time=self.travel_time,
             length=self.length,
+            link_id=self.link_id,
+            direction=self.direction,
         )
-        if self.geometry is not None:
-            payload["geometry"] = self.geometry
-        np.savez_compressed(path, **payload)  # type: ignore[arg-type]
         logger.info("Saved network to %s (%.1f MB)", path, path.stat().st_size / 1e6)
         return path
 
     @classmethod
     def load(cls, path: Path) -> "RoutableNetwork":
         path = Path(path)
-        # The geometry array is object-dtype WKB and needs pickling to read;
-        # every other field doesn't, so pickling only turns on for files that
-        # actually carry geometry -- a plain build keeps the stricter default.
-        with np.load(path, allow_pickle=False) as probe:
-            has_geometry = "geometry" in probe.files
-        with np.load(path, allow_pickle=has_geometry) as data:
+        with np.load(Path(path), allow_pickle=False) as data:
             return cls(
                 mode=str(data["mode"]),
                 crs=str(data["crs"]),
@@ -159,7 +151,8 @@ class RoutableNetwork:
                 indices=data["indices"],
                 travel_time=data["travel_time"],
                 length=data["length"],
-                geometry=data["geometry"] if has_geometry else None,
+                link_id=data["link_id"],
+                direction=data["direction"],
             )
 
 
@@ -201,18 +194,17 @@ def _build_csr(
     v_idx: np.ndarray,
     travel_time: np.ndarray,
     length: np.ndarray,
+    link_id: np.ndarray,
+    direction: np.ndarray,
     n_nodes: int,
-    geometry: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+) -> tuple[np.ndarray, ...]:
     """
     Build CSR arrays, keeping only the fastest edge for any repeated node pair.
 
-    Parallel edges between the same two nodes are common in OSM, and a shortest
-    path can only ever use the quickest one.
-
-    ``geometry``, if given, is an object array of per-edge WKB bytes aligned
-    with ``travel_time``/``length``; it is carried through the same sort and
-    dedup so the returned array stays aligned with the returned CSR edges.
+    Parallel links between the same two nodes are common in OSM, and a shortest
+    path can only ever use the quickest one. ``link_id`` and ``direction`` ride
+    through the same sort and dedup, so every per-edge array stays aligned with
+    the CSR and the surviving edge names the link it actually came from.
     """
     if u_idx.shape[0] == 0:
         return (
@@ -220,14 +212,14 @@ def _build_csr(
             np.empty(0, dtype=np.int32),
             np.empty(0, dtype=np.float64),
             np.empty(0, dtype=np.float32),
-            None if geometry is None else np.empty(0, dtype=object),
+            np.empty(0, dtype=np.int64),
+            np.empty(0, dtype=np.int8),
         )
 
     order = np.lexsort((travel_time, v_idx, u_idx))
     u_idx, v_idx = u_idx[order], v_idx[order]
     travel_time, length = travel_time[order], length[order]
-    if geometry is not None:
-        geometry = geometry[order]
+    link_id, direction = link_id[order], direction[order]
 
     first = np.empty(u_idx.shape[0], dtype=bool)
     first[0] = True
@@ -235,8 +227,7 @@ def _build_csr(
 
     u_idx, v_idx = u_idx[first], v_idx[first]
     travel_time, length = travel_time[first], length[first]
-    if geometry is not None:
-        geometry = geometry[first]
+    link_id, direction = link_id[first], direction[first]
 
     # int32 throughout: SciPy wants indptr and indices to share a dtype, and a
     # mismatch makes it silently copy both arrays -- which on a country-sized
@@ -250,7 +241,8 @@ def _build_csr(
         v_idx.astype(index_dtype),
         travel_time.astype(np.float64),
         length.astype(np.float32),
-        geometry,
+        link_id.astype(np.int64),
+        direction.astype(np.int8),
     )
 
 
@@ -265,51 +257,48 @@ class _EdgeArrays:
     v: np.ndarray
     travel_time: np.ndarray
     length: np.ndarray
-    #: object array of per-edge WKB bytes, aligned with u/v/travel_time/length.
-    #: None unless keep_geometry was requested.
-    geometry: np.ndarray | None = None
+    link_id: np.ndarray
+    direction: np.ndarray
 
 
-def _extract_arrays(
-    settings: Settings, mode: str, clip, keep_geometry: bool = False
-) -> _EdgeArrays:
+def edge_arrays(links: gpd.GeoDataFrame, mode: str) -> _EdgeArrays:
     """
-    Read one extent and reduce it to plain arrays keyed by OSM node id.
+    Reduce a normalised link layer to the plain arrays the graph is built from.
 
-    Returning compact arrays rather than DataFrames lets the caller drop the
-    pandas objects immediately, which is what makes tiled building affordable.
+    The link layer's geometry is dropped here and never enters the network: the
+    GeoPackage keeps it, and ``link_id`` is enough to find it again.
     """
-    nodes, edges = read_network_tables(settings, mode, clip=clip)
+    directed = links_module.directed_edges(links, mode)
 
-    # Speed first, simplification second: pyrosm sums the columns named in
-    # length_cols along each collapsed chain, so travel time stays exact while
-    # the tags that produced it can safely be discarded.
-    profile = profile_for(mode)
-    edges[TRAVEL_TIME_COL] = profile.travel_times_seconds(
-        edges["length"].to_numpy(dtype=float),
-        edges["highway"],
-        edges["surface"] if "surface" in edges.columns else None,
+    # Node coordinates come from the link ends. Both ends of every link are in
+    # the directed frame (each link contributes at least one row, and u/v are
+    # swapped on the reverse row), so taking first and last vertex of each link
+    # covers every node the edges can reference.
+    geometry = links.geometry
+    if links.crs is not None and str(links.crs).upper() != WGS84:
+        geometry = geometry.to_crs(WGS84)
+    coords = geometry.to_numpy()
+
+    head = shapely.get_point(coords, 0)
+    tail = shapely.get_point(coords, -1)
+
+    node_ids = np.concatenate(
+        [links["u"].to_numpy(dtype=np.int64), links["v"].to_numpy(dtype=np.int64)]
     )
-
-    nodes, directed = build_directed_edges(nodes, edges, mode, TRAVEL_TIME_COL)
-    logger.info(
-        "Simplified to %d nodes and %d directed edges", len(nodes), len(directed)
-    )
-
-    # simplify_graph keeps the full merged road geometry per collapsed chain
-    # (still WGS84, as read from the PBF); only materialise it into WKB when
-    # asked, since it roughly doubles this step's memory otherwise.
-    geometry = shapely.to_wkb(directed.geometry.to_numpy()) if keep_geometry else None
+    lon = np.concatenate([shapely.get_x(head), shapely.get_x(tail)])
+    lat = np.concatenate([shapely.get_y(head), shapely.get_y(tail)])
+    node_ids, first = np.unique(node_ids, return_index=True)
 
     return _EdgeArrays(
-        node_ids=nodes["id"].to_numpy(dtype=np.int64),
-        lon=nodes["lon"].to_numpy(dtype=float),
-        lat=nodes["lat"].to_numpy(dtype=float),
+        node_ids=node_ids,
+        lon=lon[first],
+        lat=lat[first],
         u=directed["u"].to_numpy(dtype=np.int64),
         v=directed["v"].to_numpy(dtype=np.int64),
-        travel_time=directed[TRAVEL_TIME_COL].to_numpy(dtype=float),
-        length=directed["length"].to_numpy(dtype=np.float32),
-        geometry=geometry,
+        travel_time=directed["travel_time_s"].to_numpy(dtype=float),
+        length=directed["length_m"].to_numpy(dtype=np.float32),
+        link_id=directed["link_id"].to_numpy(dtype=np.int64),
+        direction=directed["direction"].to_numpy(dtype=np.int8),
     )
 
 
@@ -317,12 +306,12 @@ def _assemble(mode: str, parts: list[_EdgeArrays]) -> RoutableNetwork:
     """
     Turn one or more extents into a single routable network.
 
-    Tiles are stitched purely on OSM node id: a node on a tile boundary carries
-    the same id in both tiles, so concatenating and de-duplicating reconnects
-    them. Ways duplicated across overlapping tiles collapse in ``_build_csr``,
-    which keeps only the fastest edge per node pair -- and a chain that one tile
-    simplified further than another still costs the same total time, so shortest
-    paths are unaffected.
+    Extents are stitched purely on OSM node id: a node on the seam carries the
+    same id in both, so concatenating and de-duplicating reconnects them. Links
+    duplicated across an overlap collapse in :func:`_build_csr`, which keeps
+    only the fastest edge per node pair. Callers merging several extents must
+    make ``link_id`` unique across them first, or results will join back onto
+    the wrong rows.
     """
     node_ids = np.concatenate([p.node_ids for p in parts])
     lon = np.concatenate([p.lon for p in parts])
@@ -335,11 +324,8 @@ def _assemble(mode: str, parts: list[_EdgeArrays]) -> RoutableNetwork:
     v_osm = np.concatenate([p.v for p in parts])
     travel_time = np.concatenate([p.travel_time for p in parts])
     length = np.concatenate([p.length for p in parts])
-    geometry = (
-        np.concatenate([p.geometry for p in parts])
-        if parts[0].geometry is not None
-        else None
-    )
+    link_id = np.concatenate([p.link_id for p in parts])
+    direction = np.concatenate([p.direction for p in parts])
 
     # An edge can only survive if both of its endpoints did.
     u_idx = np.searchsorted(node_ids, u_osm)
@@ -352,14 +338,13 @@ def _assemble(mode: str, parts: list[_EdgeArrays]) -> RoutableNetwork:
     )
     u_idx, v_idx = u_idx[valid], v_idx[valid]
     travel_time, length = travel_time[valid], length[valid]
-    if geometry is not None:
-        geometry = geometry[valid]
+    link_id, direction = link_id[valid], direction[valid]
 
     transformer = Transformer.from_crs(WGS84, PROJECTED_CRS, always_xy=True)
     x, y = transformer.transform(lon, lat)
 
-    indptr, indices, travel_time, length, geometry = _build_csr(
-        u_idx, v_idx, travel_time, length, len(node_ids), geometry=geometry
+    indptr, indices, travel_time, length, link_id, direction = _build_csr(
+        u_idx, v_idx, travel_time, length, link_id, direction, len(node_ids)
     )
 
     # Walking is modelled bidirectionally, so weak and strong components agree;
@@ -377,10 +362,59 @@ def _assemble(mode: str, parts: list[_EdgeArrays]) -> RoutableNetwork:
             indices=indices,
             travel_time=travel_time,
             length=length,
-            geometry=geometry,
+            link_id=link_id,
+            direction=direction,
         ),
         keep,
     )
+
+
+def network_from_links(links: gpd.GeoDataFrame, mode: str) -> RoutableNetwork:
+    """
+    Build a routable network from a link layer -- stage two, in one call.
+
+    The layer is normalised first (:func:`valma_bike_and_walk.links.normalise`),
+    so lengths and speeds are recomputed from what is actually in the table and
+    hand-drawn links get endpoints. Pass a layer straight from
+    :func:`valma_bike_and_walk.links.read_links`; it does not have to be pristine.
+    """
+    validate_mode(mode)
+    normalised = links_module.normalise(links, mode)
+    network = _assemble(mode, [edge_arrays(normalised, mode)])
+    logger.info("Network ready: %d nodes, %d edges", network.n_nodes, network.n_edges)
+    return network
+
+
+def build_links(
+    settings: Settings,
+    mode: str,
+    area: str | None = None,
+    bbox: Sequence[float] | None = None,
+    force_reload: bool = False,
+    links_path: Path | None = None,
+) -> tuple[Path, gpd.GeoDataFrame]:
+    """
+    Stage one: read the PBF and write the editable link layer, or reuse it.
+
+    Returns the GeoPackage's path alongside the layer, so a caller that only
+    wanted the file can ignore the frame and one that wants to keep building can
+    skip reading it back.
+    """
+    validate_mode(mode)
+    settings.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    clip, extent_key = resolve_clip(settings, area, bbox, force_reload)
+    path = (
+        Path(links_path) if links_path else settings.links_cache_path(mode, extent_key)
+    )
+
+    if path.exists() and not force_reload:
+        logger.info("Loading links from %s", path)
+        return path, links_module.read_links(path)
+
+    links = links_module.annotate(read_links(settings, mode, clip), mode)
+    links_module.write_links(links, path)
+    return path, links
 
 
 def build_network(
@@ -388,235 +422,31 @@ def build_network(
     mode: str,
     area: str | None = None,
     bbox: Sequence[float] | None = None,
-    search_bbox: Sequence[float] | None = None,
     force_reload: bool = False,
-    keep_geometry: bool = False,
+    links_path: Path | None = None,
 ) -> RoutableNetwork:
     """
-    Build (or load from cache) a routable network for one mode.
+    Build (or load from cache) a routable network for one mode, PBF to graph.
 
-    Speeds come from this project's walk/bike profiles, applied per way *before*
-    simplification so each collapsed chain sums real per-segment travel times.
-
-    Reading a whole country in one call needs more memory than most machines
-    have; use :func:`build_network_tiled` for that.
-
-    ``keep_geometry`` additionally carries each edge's road geometry through to
-    the result (see :attr:`RoutableNetwork.geometry`), for exporting the
-    network to a GeoPackage. It costs extra memory and gets its own cache file,
-    so a plain build never loads (or is shadowed by) a --gpkg one.
+    Both stages are cached: the link GeoPackage from stage one and the ``.npz``
+    from stage two. Edit the GeoPackage between the two -- or point
+    ``links_path`` at your own edited copy -- and delete the ``.npz`` (or pass
+    ``force_reload``) to have the edits taken up.
     """
     validate_mode(mode)
     settings.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    clip, extent_key = resolve_clip(settings, area, bbox, search_bbox, force_reload)
-    cache_path = settings.network_cache_path(mode, extent_key, geometry=keep_geometry)
+    _, extent_key = resolve_clip(settings, area, bbox, force_reload)
+    cache_path = settings.network_cache_path(mode, extent_key)
 
     if cache_path.exists() and not force_reload:
         logger.info("Loading network from cache: %s", cache_path)
         return RoutableNetwork.load(cache_path)
 
-    network = _assemble(mode, [_extract_arrays(settings, mode, clip, keep_geometry)])
-
-    logger.info("Network ready: %d nodes, %d edges", network.n_nodes, network.n_edges)
-    network.save(cache_path)
-    return network
-
-
-def iter_tiles(
-    bounds: Sequence[float],
-    tile_degrees: float,
-    overlap_degrees: float = 0.02,
-) -> list[list[float]]:
-    """
-    Split a lon/lat box into overlapping tiles.
-
-    The overlap matters: pyrosm clips ways at the tile edge, and without a seam
-    of shared geometry two tiles can meet without sharing a node, leaving a cut
-    in the merged network exactly where a road crosses the boundary.
-    """
-    min_lon, min_lat, max_lon, max_lat = bounds
-    tiles = []
-    lat = min_lat
-    while lat < max_lat:
-        lon = min_lon
-        while lon < max_lon:
-            tiles.append(
-                [
-                    max(min_lon, lon - overlap_degrees),
-                    max(min_lat, lat - overlap_degrees),
-                    min(max_lon, lon + tile_degrees + overlap_degrees),
-                    min(max_lat, lat + tile_degrees + overlap_degrees),
-                ]
-            )
-            lon += tile_degrees
-        lat += tile_degrees
-    return tiles
-
-
-def _tile_cache_path(
-    settings: Settings, mode: str, tile: Sequence[float], geometry: bool = False
-) -> Path:
-    key = "_".join(f"{c:.4f}" for c in tile)
-    suffix = "_geom" if geometry else ""
-    return (
-        settings.cache_dir
-        / "tiles"
-        / f"{settings.pbf_path.stem}_{key}_{mode}{suffix}.npz"
+    _, links = build_links(
+        settings, mode, area, bbox, force_reload, links_path=links_path
     )
-
-
-def _build_one_tile(
-    settings: Settings,
-    mode: str,
-    tile: Sequence[float],
-    force_reload: bool,
-    keep_geometry: bool = False,
-) -> Path | None:
-    """
-    Extract one tile to its own .npz and return the path (None if empty).
-
-    Tiles are cached individually so that a country-sized build, which can run
-    for hours, resumes instead of starting over after an interruption. Workers
-    hand back a path rather than the arrays themselves, so a big tile is not
-    pickled across the process boundary.
-    """
-    path = _tile_cache_path(settings, mode, tile, geometry=keep_geometry)
-    if path.exists() and not force_reload:
-        return path
-
-    try:
-        part = _extract_arrays(
-            settings, mode, box(tile[0], tile[1], tile[2], tile[3]), keep_geometry
-        )
-    except ValueError:
-        # Most of Finland's area is forest, lake and sea; empty tiles are normal.
-        return None
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = dict(
-        node_ids=part.node_ids,
-        lon=part.lon,
-        lat=part.lat,
-        u=part.u,
-        v=part.v,
-        travel_time=part.travel_time,
-        length=part.length,
-    )
-    if part.geometry is not None:
-        payload["geometry"] = part.geometry
-    np.savez_compressed(path, **payload)  # type: ignore[arg-type]
-    return path
-
-
-def _load_tile(path: Path) -> _EdgeArrays:
-    with np.load(path, allow_pickle=False) as probe:
-        has_geometry = "geometry" in probe.files
-    with np.load(path, allow_pickle=has_geometry) as data:
-        return _EdgeArrays(
-            node_ids=data["node_ids"],
-            lon=data["lon"],
-            lat=data["lat"],
-            u=data["u"],
-            v=data["v"],
-            travel_time=data["travel_time"],
-            length=data["length"],
-            geometry=data["geometry"] if has_geometry else None,
-        )
-
-
-def build_network_tiled(
-    settings: Settings,
-    mode: str,
-    bounds: Sequence[float] = FINLAND_BOUNDS,
-    tile_degrees: float = 2.0,
-    overlap_degrees: float = 0.02,
-    force_reload: bool = False,
-    cache_key: str = "tiled",
-    tile_workers: int = 1,
-    keep_geometry: bool = False,
-) -> RoutableNetwork:
-    """
-    Build a network over a large area by reading it one tile at a time.
-
-    Peak memory is set by the busiest single tile rather than by the whole
-    extent, which is what makes a country-sized build possible on an ordinary
-    machine.
-
-    The cost is one full pass over the PBF per tile: pyrosm rescans the entire
-    file whatever bounding box you give it, so tiling trades I/O and CPU for
-    memory. Two ways to buy that back -- raise ``tile_degrees`` so there are
-    fewer passes, or raise ``tile_workers`` so passes happen concurrently.
-    Memory is roughly ``tile_workers`` times the busiest tile, so raise them
-    together with care.
-
-    Individual tiles are cached, so an interrupted build resumes.
-
-    ``keep_geometry`` -- see :func:`build_network`. It also gets its own tile
-    cache files, so tiles built with and without it never collide.
-    """
-    validate_mode(mode)
-    settings.cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = settings.network_cache_path(mode, cache_key, geometry=keep_geometry)
-
-    if cache_path.exists() and not force_reload:
-        logger.info("Loading network from cache: %s", cache_path)
-        return RoutableNetwork.load(cache_path)
-
-    tiles = iter_tiles(bounds, tile_degrees, overlap_degrees)
-    logger.info(
-        "Building %s network from %d tiles of %g deg, %d worker(s)",
-        mode,
-        len(tiles),
-        tile_degrees,
-        tile_workers,
-    )
-
-    if tile_workers > 1:
-        # Don't nest pools. pyrosm shards the PBF into one contiguous blob range
-        # per worker with no work stealing, so a per-tile bounding box leaves
-        # nearly every worker with nothing to do -- a brief flare of activity and
-        # then one core grinding. Reading each tile serially and running several
-        # tiles at once uses the machine far better.
-        #
-        # And read in memory unless told otherwise: out_of_core spills the whole
-        # decoded file to temporary shards on every read, so N concurrent tiles
-        # means N concurrent spills and the disk, not the CPU, sets the pace.
-        engine = "in_memory" if settings.engine == "auto" else settings.engine
-        settings = replace(settings, osm_workers=1, engine=engine)
-        logger.info("Parallel tiles: reading each tile serially with engine=%s", engine)
-
-    paths: list[Path] = []
-    if tile_workers <= 1:
-        for i, tile in enumerate(tiles, start=1):
-            logger.info("Tile %d/%d: %s", i, len(tiles), [round(c, 3) for c in tile])
-            path = _build_one_tile(settings, mode, tile, force_reload, keep_geometry)
-            if path is not None:
-                paths.append(path)
-    else:
-        with ProcessPoolExecutor(max_workers=tile_workers) as pool:
-            futures = {
-                pool.submit(
-                    _build_one_tile, settings, mode, tile, force_reload, keep_geometry
-                ): tile
-                for tile in tiles
-            }
-            for done, future in enumerate(as_completed(futures), start=1):
-                path = future.result()
-                logger.info(
-                    "Tile %d/%d done%s", done, len(tiles), "" if path else " (empty)"
-                )
-                if path is not None:
-                    paths.append(path)
-
-    if not paths:
-        raise ValueError(f"No {mode} network found anywhere in {bounds}.")
-
-    logger.info("Merging %d non-empty tiles", len(paths))
-    parts = [_load_tile(p) for p in sorted(paths)]
-
-    network = _assemble(mode, parts)
-    logger.info("Network ready: %d nodes, %d edges", network.n_nodes, network.n_edges)
+    network = network_from_links(links, mode)
     network.save(cache_path)
     return network
 
@@ -642,8 +472,9 @@ def _subset(network: RoutableNetwork, keep: np.ndarray) -> RoutableNetwork:
         v_idx=remap[cols[edge_keep]],
         travel_time=network.travel_time[edge_keep],
         length=network.length[edge_keep],
+        link_id=network.link_id[edge_keep],
+        direction=network.direction[edge_keep],
         crs=network.crs,
-        geometry=network.geometry[edge_keep] if network.geometry is not None else None,
     )
 
 
@@ -656,11 +487,12 @@ def _from_coo(
     v_idx: np.ndarray,
     travel_time: np.ndarray,
     length: np.ndarray,
+    link_id: np.ndarray,
+    direction: np.ndarray,
     crs: str,
-    geometry: np.ndarray | None = None,
 ) -> RoutableNetwork:
-    indptr, indices, travel_time, length, geometry = _build_csr(
-        u_idx, v_idx, travel_time, length, node_ids.shape[0], geometry=geometry
+    indptr, indices, travel_time, length, link_id, direction = _build_csr(
+        u_idx, v_idx, travel_time, length, link_id, direction, node_ids.shape[0]
     )
     return RoutableNetwork(
         mode=mode,
@@ -671,8 +503,9 @@ def _from_coo(
         indices=indices,
         travel_time=travel_time,
         length=length,
+        link_id=link_id,
+        direction=direction,
         crs=crs,
-        geometry=geometry,
     )
 
 

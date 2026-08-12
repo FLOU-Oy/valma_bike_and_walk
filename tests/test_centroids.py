@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from valma_bike_and_walk.centroids import read_points, snap_to_network
-from tests.test_routing import make_network
+from .conftest import make_network
 
 
 @pytest.fixture
