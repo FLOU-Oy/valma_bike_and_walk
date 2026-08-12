@@ -131,7 +131,7 @@ BIKE_FILTER = WayFilter(
         "area": ["yes"],
         "access": ["private"],
         "highway": _ALWAYS_EXCLUDED_HIGHWAY
-        + ["bus_guideway", "corridor", "elevator", "escalator", "footway", "steps"]
+        + ["bus_guideway", "corridor", "escalator"]
         + _MOTOR_HIGHWAY,
         "bicycle": ["no"],
         "service": ["private"],

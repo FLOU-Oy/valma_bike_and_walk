@@ -128,7 +128,7 @@ BIKE_PROFILE = SpeedProfile(
         "path": 11.0,
         "track": 10.0,
         "bridleway": 8.0,
-        "footway": 7.0,
+        "footway": 4.0,
         "pedestrian": 6.0,
         "corridor": 5.0,
         "living_street": 13.0,
