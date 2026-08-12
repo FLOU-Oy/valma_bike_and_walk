@@ -2,6 +2,7 @@
 
 valma build  --pbf finland.osm.pbf --mode bike --area Espoo
 valma matrix --pbf finland.osm.pbf --mode walk --centroids points.csv
+valma assign --pbf finland.osm.pbf --mode bike --centroids points.csv --demand od.csv
 """
 
 from __future__ import annotations
@@ -13,8 +14,21 @@ from pathlib import Path
 
 import numpy as np
 
+from valma_bike_and_walk.assignment import (
+    assign_traffic,
+    link_volume_frame,
+)
+from valma_bike_and_walk.assignment import summarise as summarise_assignment
 from valma_bike_and_walk.centroids import DEFAULT_MAX_SNAP_M, load_centroids
 from valma_bike_and_walk.config import FINLAND_BOUNDS, MODES, Settings
+from valma_bike_and_walk.demand import (
+    align_to_ids,
+    clip_minimum,
+    demand_matrix,
+    read_demand_long,
+    read_demand_npz,
+    read_demand_omx,
+)
 from valma_bike_and_walk.extract import resolve_clip
 from valma_bike_and_walk.gpkg import write_edges_gpkg
 from valma_bike_and_walk.matrix import default_workers, summarise, travel_time_matrix
@@ -263,6 +277,73 @@ def cmd_matrix(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_assign(args: argparse.Namespace) -> int:
+    network = _network(args)
+
+    centroids = load_centroids(
+        network,
+        args.centroids,
+        id_column=args.id_column,
+        x_column=args.x_column,
+        y_column=args.y_column,
+        crs=args.centroid_crs,
+        max_snap_distance=args.max_snap_distance,
+    ).drop_unsnapped()
+
+    if len(centroids) == 0:
+        logger.error("No centroids could be snapped to the network.")
+        return 1
+
+    suffix = args.demand.suffix.lower()
+    if suffix == ".omx":
+        if not args.demand_matrix:
+            raise SystemExit("--demand-matrix is required for an OMX --demand file.")
+        ids, demand = read_demand_omx(
+            args.demand,
+            matrix_name=args.demand_matrix,
+            mapping_name=args.demand_mapping,
+            minimum_demand=args.min_demand,
+        )
+        demand = align_to_ids(ids, demand, centroids.ids)
+    elif suffix == ".npz":
+        ids, demand = read_demand_npz(args.demand)
+        demand = align_to_ids(ids, demand, centroids.ids)
+    else:
+        long_demand = read_demand_long(
+            args.demand,
+            origin_column=args.origin_column,
+            destination_column=args.destination_column,
+            demand_column=args.demand_column,
+        )
+        demand = demand_matrix(long_demand, centroids.ids)
+
+    demand = clip_minimum(demand, args.min_demand)
+
+    link_volume = assign_traffic(
+        network,
+        centroids.node_index,
+        demand,
+        max_seconds=args.max_minutes * 60 if args.max_minutes else None,
+        workers=args.workers,
+        chunk_size=args.chunk_size,
+    )
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    frame = link_volume_frame(network, link_volume)
+    out = args.output_dir / f"link_volumes_{args.mode}.npz"
+    np.savez_compressed(out, **frame)  # type: ignore[arg-type]
+    print(f"Wrote {out} ({network.n_edges:,} links, {out.stat().st_size / 1e6:.1f} MB)")
+
+    if network.geometry is not None:
+        gpkg_path = args.output_dir / f"{args.mode}_volumes.gpkg"
+        write_edges_gpkg(network, gpkg_path, extra_columns={"volume": link_volume})
+        print(f"Wrote {gpkg_path} ({network.n_edges:,} rows)")
+
+    for key, value in summarise_assignment(link_volume).items():
+        print(f"  {key}: {value:,.3f}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="valma", description=__doc__)
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -302,6 +383,76 @@ def build_parser() -> argparse.ArgumentParser:
     matrix.add_argument("--workers", type=int, default=default_workers())
     matrix.add_argument("--chunk-size", type=int)
     matrix.set_defaults(func=cmd_matrix)
+
+    assign = sub.add_parser(
+        "assign",
+        help="Assign an OD demand matrix onto the network's shortest paths (link volumes).",
+    )
+    _add_common(assign)
+    assign.add_argument(
+        "--gpkg",
+        action="store_true",
+        help=(
+            "Also write link volumes to <output-dir>/<mode>_volumes.gpkg for "
+            "mapping. Needs a network built with --gpkg (or --network "
+            "pointing at one)."
+        ),
+    )
+    assign.add_argument(
+        "--centroids", type=Path, required=True, help="CSV or vector file of points."
+    )
+    assign.add_argument("--id-column")
+    assign.add_argument("--x-column", default="lon")
+    assign.add_argument("--y-column", default="lat")
+    assign.add_argument("--centroid-crs", default="EPSG:4326")
+    assign.add_argument("--max-snap-distance", type=float, default=DEFAULT_MAX_SNAP_M)
+    assign.add_argument(
+        "--demand",
+        type=Path,
+        required=True,
+        help=(
+            "OD demand: a CSV/TSV of (origin, destination, demand) rows -- "
+            "only nonzero demand needs a row -- a .npz with 'ids' and a "
+            "dense 'demand' matrix, or a .omx file (see --demand-matrix)."
+        ),
+    )
+    assign.add_argument("--origin-column", default="origin_id")
+    assign.add_argument("--destination-column", default="destination_id")
+    assign.add_argument("--demand-column", default="demand")
+    assign.add_argument(
+        "--demand-matrix",
+        help=(
+            "Name of the matrix inside the OMX file, e.g. 'bike'. Required "
+            "when --demand is a .omx file; ignored otherwise."
+        ),
+    )
+    assign.add_argument(
+        "--demand-mapping",
+        default="zone_number",
+        help=(
+            "Name of the OMX lookup that maps matrix row/column position to "
+            "zone/centroid id (default: 'zone_number')."
+        ),
+    )
+    assign.add_argument(
+        "--min-demand",
+        type=float,
+        default=0.0,
+        help=(
+            "Clip OD pairs with demand below this to zero before assigning, "
+            "so they don't need a shortest path built at all. Useful for "
+            "screening a large, mostly-noise demand matrix."
+        ),
+    )
+    assign.add_argument(
+        "--max-minutes",
+        type=float,
+        help="Don't search a source beyond this travel time. OD pairs further "
+        "apart than this are dropped, unassigned.",
+    )
+    assign.add_argument("--workers", type=int, default=default_workers())
+    assign.add_argument("--chunk-size", type=int)
+    assign.set_defaults(func=cmd_assign)
 
     return parser
 

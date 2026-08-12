@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterator, Sequence
 
@@ -178,9 +178,17 @@ def travel_time_matrix(
                 ): start
                 for start in offsets
             }
-            for done, (future, start) in enumerate(futures.items(), start=1):
+            # Pop each future as it's consumed (and iterate as-completed
+            # rather than submission order) so a finished chunk's block is
+            # freed once it's copied into `result`, instead of every
+            # completed future -- and the block inside it -- staying alive
+            # in `futures` until the very last chunk finishes.
+            done = 0
+            for future in as_completed(futures):
+                start = futures.pop(future)
                 block = future.result()
                 result[start : start + block.shape[0]] = block
+                done += 1
                 if progress_every and done % progress_every == 0:
                     logger.info("  %d/%d chunks", done, n_chunks)
 

@@ -4,8 +4,10 @@ Walking and cycling travel-time analysis built on a **local OpenStreetMap extrac
 No Overpass calls, no network access at run time — you point it at a `.osm.pbf`
 and it does the rest.
 
-Designed for the country-scale case: an origin–destination travel-time matrix
-between ~10 000 centroids across all of Finland.
+Three things, from one cached network: an origin–destination **travel-time
+matrix**, an **all-or-nothing assignment** of OD demand onto per-link volumes,
+and a **GeoPackage** of either for GIS. Designed for the country-scale case —
+~10 000 centroids across all of Finland.
 
 ---
 
@@ -53,10 +55,19 @@ is a compressed `.npz` rather than GraphML — for Espoo that is a few MB agains
 
 ## Install
 
+Python ≥ 3.10.
+
 ```bash
 uv sync                 # core
 uv sync --extra dev     # + pytest/ruff/black/mypy
+uv sync --extra omx     # + openmatrix, only for `assign --demand *.omx`
+uv sync --extra viz     # + networkx/matplotlib, only for to_networkx()/plotting
 ```
+
+You also need an OpenStreetMap extract of your own.
+[Geofabrik](https://download.geofabrik.de/europe/finland.html) publishes a daily
+`finland-latest.osm.pbf` (~740 MB); everything below assumes a local copy.
+Nothing here downloads anything at run time.
 
 ## Use
 
@@ -72,6 +83,11 @@ valma matrix --network .cache/finland-260805.osm_bbox_24.5000_60.1000_25.1000_60
 valma matrix --pbf finland-260805.osm.pbf --mode walk \
              --centroids centroids.csv --id-column id \
              --workers 8 --max-minutes 120
+
+# Assign an OD demand matrix onto the network -- per-link volumes
+valma assign --network .cache/finland-260805.osm_bbox_24.5000_60.1000_25.1000_60.4000_bike.npz \
+             --mode bike --centroids centroids.csv --id-column id \
+             --demand od.csv
 ```
 
 `valma build` prints the path it saved to, along with the ready-made `matrix`
@@ -82,11 +98,52 @@ in GIS software.
 
 `centroids.csv` needs `lon`/`lat` columns by default (`--x-column`/`--y-column`
 and `--centroid-crs` if not). Any vector format GeoPandas reads works too.
-Output is an `.npz` holding `ids` and a float32 `seconds` matrix.
+Points that snap no closer than `--max-snap-distance` (default 1000 m) are
+dropped, not silently routed from somewhere else. `valma matrix` writes an
+`.npz` holding `ids` and a float32 `seconds` matrix, rows and columns in `ids`
+order.
+
+### Assignment
+
+`valma assign` loads an origin–destination demand matrix onto the network's
+shortest paths and sums the result per link — **all-or-nothing** assignment.
+It ignores congestion, which for footpaths and bike lanes is the right
+trade-off: they essentially never reach the capacity that makes traffic
+reroute. See the module docstring in
+[`assignment.py`](src/valma_bike_and_walk/assignment.py) for when that stops
+holding and what the standard fixes are.
+
+`--demand` takes any of three shapes, picked by file extension:
+
+| `--demand` | what it is | relevant options |
+|---|---|---|
+| `.csv` / `.tsv` / anything else | long format: one `origin_id, destination_id, demand` row per **nonzero** pair | `--origin-column`, `--destination-column`, `--demand-column` |
+| `.npz` | dense matrix, as `ids` + `demand` arrays | — |
+| `.omx` | [Open Matrix](https://github.com/osPlanning/omx), the HDF5 format transport models exchange | `--demand-matrix` (required — which matrix in the file), `--demand-mapping` (default `zone_number`) |
+
+Ids are matched against the centroid ids, in any order; anything unmatched is
+dropped with a warning rather than failing the run. Repeated pairs are summed,
+so demand assembled per time period or trip purpose can just be concatenated.
+The demand is kept sparse end to end — a dense 10 000 × 10 000 float64 matrix
+would be 800 MB, and almost all of it structural zero.
+
+Output is `<output-dir>/link_volumes_<mode>.npz`, one row per **directed** edge
+(`u`, `v`, `length_m`, `travel_time_s`, `volume`), aligned with the network's
+own edge arrays. Add `--gpkg` to also write
+`<output-dir>/<mode>_volumes.gpkg` for mapping — that needs a network that
+carries geometry, i.e. built with `valma build --gpkg` (which caches to a
+separate `..._geom.npz`), so point `--network` at that file or rebuild from
+`--pbf`.
+
+### From Python
+
+The CLI is a thin wrapper; everything is callable directly.
 
 ```python
 from valma_bike_and_walk import Settings, build_network
+from valma_bike_and_walk.assignment import assign_traffic
 from valma_bike_and_walk.centroids import load_centroids
+from valma_bike_and_walk.demand import demand_matrix, read_demand_long
 from valma_bike_and_walk.matrix import travel_time_matrix
 
 settings = Settings(pbf_path="finland-260805.osm.pbf")
@@ -94,7 +151,16 @@ network = build_network(settings, mode="bike", bbox=[24.5, 60.1, 25.1, 60.4])
 
 centroids = load_centroids(network, "centroids.csv", id_column="id").drop_unsnapped()
 seconds = travel_time_matrix(network, centroids.node_index, workers=8)
+
+demand = demand_matrix(read_demand_long("od.csv"), centroids.ids)
+volume = assign_traffic(network, centroids.node_index, demand, workers=8)
 ```
+
+`centroids.ids` and `centroids.node_index` line up positionally, and that is the
+contract everything else relies on: the matrix rows, the demand matrix rows and
+columns, and the assignment's sources are all in that order. `volume` is one
+value per directed edge, in the same order as `network.travel_time` and
+`network.indices`.
 
 ---
 
@@ -115,6 +181,31 @@ tight a box silently truncates the boundary.
 ---
 
 ## Scaling to the whole of Finland
+
+The whole national run, with every step explained in the rest of this section:
+
+```bash
+# 1. Strip the PBF to highways once -- 5x faster to read, identical network
+osmium tags-filter finland-latest.osm.pbf w/highway -o finland-highways.osm.pbf
+
+# 2. Build the country network one tile at a time (hours; resumable)
+valma build --pbf finland-highways.osm.pbf --mode walk \
+            --tiled --tile-degrees 3 --tile-workers 4
+
+# 3. Route and assign against the cached network -- no more PBF parsing
+valma matrix --network .cache/finland-highways.osm_tiled_walk.npz --mode walk \
+             --centroids centroids.csv --id-column id \
+             --workers 14 --max-minutes 60
+
+valma assign --network .cache/finland-highways.osm_tiled_walk.npz --mode walk \
+             --centroids centroids.csv --id-column id \
+             --demand od.csv --workers 14 --max-minutes 60
+```
+
+Step 2 is the expensive one and the only one that touches the PBF. It caches per
+tile, so an interrupted build resumes; steps 3 onwards reload the finished `.npz`
+in seconds and can be re-run freely. Budget roughly `--tile-workers ×` the
+busiest tile in RAM, and see below before choosing those two numbers.
 
 ### Parse on every core
 
@@ -244,6 +335,12 @@ Cutting by area works too, and composes with the above:
 osmium extract -b 22,60,25,63 finland-highways.osm.pbf -o region.osm.pbf
 ```
 
+This is worth doing before a national build, not after. Since every tile rescans
+the whole file, a tiled build is dominated by parsing: the capital region alone
+took ~25 minutes, of which ~24 was parsing. Cutting the country into regional
+extracts first turns each pass into a small local read, and takes the build from
+hours to minutes.
+
 #### Watch the disk, not just the CPU
 
 If your disk sits at 100 % while the CPU idles, it is the `out_of_core` reader:
@@ -272,7 +369,10 @@ means 10 000 runs, so plan with the measured per-source time your run logs.
 Levers, in order of effect:
 
 1. **`--max-minutes`** — a cutoff stops the search expanding across the entire
-   country and is by far the biggest win if your analysis has one anyway.
+   country and is by far the biggest win if your analysis has one anyway. Use
+   one. Walking between distant centroids is not a meaningful number — Helsinki
+   to Utsjoki on foot is some 270 hours. In the capital-region benchmark below a
+   60-minute cutoff left only 3.8 % of pairs reachable, and it is **20× faster**.
 2. **`--workers`** — origins are embarrassingly parallel. The network is shared
    with the workers by memory-mapping, not pickling, so N workers do not cost N
    copies of the graph.
@@ -299,19 +399,26 @@ Scaling from a 9 500-node network to a 352 000-node one, cost grew as roughly
 10 000 origins is a few hours on one core or roughly 15 minutes across workers.
 Treat that as an estimate: it has not been measured end to end.
 
-### Two things to know before running a national matrix
+### Assigning demand
 
-**Use a cutoff.** Walking between distant centroids is not a meaningful number —
-Helsinki to Utsjoki on foot is some 270 hours. In the capital-region benchmark a
-60-minute cutoff left only 3.8 % of pairs reachable, and it is *20× faster*. If
-your analysis has a horizon, `--max-minutes` gives it to you almost free.
+`valma assign` runs the same one-Dijkstra-per-origin as the matrix, so the
+levers above apply unchanged — `--max-minutes` first, then `--workers`. Two
+things differ:
 
-**Pre-cut the PBF if you can.** pyrosm rescans the whole file for every tile, so
-a tiled national build is dominated by that: the capital region alone took ~25
-minutes, of which ~24 was parsing. Cutting the country into regional `.osm.pbf`
-files first with [osmium](https://osmcode.org/osmium-tool/) —
-`osmium extract -b <bbox> finland.osm.pbf -o region.osm.pbf` — turns each pass
-into a small local read and takes the build from hours to minutes.
+- **A source is routed whether or not it has demand.** The Dijkstra is per
+  origin, not per OD pair, so the run cost tracks the centroid count. On top of
+  it, each origin's nonzero destinations are walked back up the predecessor
+  tree — all of them in lockstep and vectorised, sharing the tail where their
+  paths converge — which is cheap next to the search itself. So `--min-demand`
+  trims the loading step, not the search; reach for `--max-minutes` first.
+- **Chunks hold fewer sources for the same memory.** Walking paths back needs
+  Dijkstra's int32 predecessor block on top of the float64 distances, so a
+  source costs 12 bytes per node instead of 8, and the same 256 MB
+  `--chunk-size` budget buys two-thirds as many sources per block. Nothing to
+  set — just don't expect the two commands to chunk identically.
+
+Unreachable pairs — including everything beyond `--max-minutes` — are dropped
+with a logged count rather than quietly assigned somewhere.
 
 ---
 
@@ -322,15 +429,17 @@ src/valma_bike_and_walk/
 ├── config.py      coordinate systems, mode names, cache paths
 ├── speeds.py      walk/bike speed profiles
 ├── extract.py     the only module that talks to pyrosm
-├── network.py     RoutableNetwork: CSR + coords + KD-tree
-├── centroids.py   reading points and snapping them
-├── matrix.py      chunked / parallel OD matrices
+├── network.py     RoutableNetwork: CSR + coords + KD-tree; build, tile, cache
+├── centroids.py   reading points and snapping them to nodes
+├── matrix.py      chunked / parallel OD travel-time matrices
+├── demand.py      reading OD demand (long / .npz / OMX) as a sparse matrix
+├── assignment.py  all-or-nothing assignment: demand -> per-link volumes
 ├── gpkg.py        export network links to GeoPackage for GIS
-└── cli.py
+└── cli.py         build / matrix / assign
 ```
 
-All pyrosm calls are confined to `extract.py`, so a pyrosm upgrade can only
-break there.
+Data flows one way: `extract` → `network` → (`centroids` +) `matrix` /
+`assignment` → output. Nothing downstream reaches back.
 
 ## Development
 
@@ -338,6 +447,35 @@ break there.
 uv run pytest
 uv run ruff check . && uv run black . && uv run mypy src/
 ```
+
+The test suite is entirely synthetic — small hand-built networks and demand
+matrices, no `.osm.pbf` needed — so it runs in seconds and CI needs no data.
+`test_routing.py` checks the SciPy routing against NetworkX as a reference
+implementation (hence networkx in the `dev` extra), and `test_tiling.py` covers
+the stitching a tiled build depends on: tiles joining on a shared boundary node,
+duplicate edges across an overlap collapsing, and tile coverage.
+
+Four invariants hold the design together. Breaking one is what the tests are
+mostly there to catch:
+
+- **All pyrosm calls live in `extract.py`.** Everything else sees plain
+  DataFrames and numpy arrays, so a pyrosm upgrade can only break in one module.
+- **Per-edge arrays are positionally aligned.** `network.travel_time`,
+  `network.length`, `network.indices`, the assignment's volume vector and
+  `gpkg.edges_to_geodataframe`'s rows are all the same order — CSR order. A new
+  per-edge quantity just needs to keep it.
+- **Speeds are applied before simplification.** A collapsed chain sums real
+  per-segment travel times, so editing `speeds.py` cannot be short-circuited by
+  the simplifier. Both profiles are plain dataclasses; change the tables, don't
+  add special cases downstream.
+- **Big intermediates stay chunked and sparse.** SciPy's Dijkstra returns a
+  dense `(sources, n_nodes)` block, which is why both `matrix` and `assignment`
+  size their chunks against a byte budget and merge results as they complete.
+  Anything new that scales with zones² should be sparse (see `demand.py`).
+
+Workers get the network by memory-mapping it from a temporary directory, not by
+pickling — so adding a parallel step means writing the arrays out once, not
+handing the graph to each process.
 
 ## Licence
 
