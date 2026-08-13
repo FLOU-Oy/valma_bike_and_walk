@@ -4,15 +4,21 @@ The pipeline is two stages, and the GeoPackage between them is the point:
 
   valma extract --pbf finland.osm.pbf --mode bike --bbox 24.5 60.1 25.1 60.4
      -> output/bike_links.gpkg          <- open in QGIS, edit, save
-  valma build   --links output/bike_links.gpkg --mode bike
-     -> output/bike.npz                 <- routable graph
 
   valma dem     --links output/bike_links.gpkg
      -> the same file, + z_u/z_v/ascent_m/descent_m  (optional; needs a key)
 
-  valma matrix  --network output/bike.npz --mode bike --centroids points.csv
-  valma assign  --network output/bike.npz --mode bike --centroids points.csv \\
-                --demand od.csv --links output/bike_links.gpkg --gpkg
+  valma matrix  --links output/bike_links.gpkg --mode bike --centroids points.csv
+  valma assign  --links output/bike_links.gpkg --mode bike --centroids points.csv \\
+                --demand od.csv --gpkg
+
+`matrix` and `assign` build the routable graph from `--links` themselves and
+cache it under `--cache-dir`, so there is normally no need to know it exists.
+Running `valma build --links output/bike_links.gpkg --mode bike` explicitly
+instead writes it to `--output-dir` as `bike.npz` -- a named, reusable graph
+worth keeping around when many `matrix`/`assign` runs will share it. Either
+way, point later runs at it directly with `--network output/bike.npz` to skip
+re-reading the link layer.
 
 `build`, `matrix` and `assign` also take `--pbf` directly and run the earlier
 stages themselves -- handy when there is nothing to edit. Those runs park their
@@ -125,7 +131,9 @@ def _add_source(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help=(
             "Build from this link GeoPackage (as written by 'valma extract', "
-            "edits and all). Also names the layer that --gpkg draws results on."
+            "edits and all). The graph is cached under --cache-dir, so there "
+            "is no separate 'valma build' step to run first. Also names the "
+            "layer that --gpkg draws results on."
         ),
     )
     parser.add_argument(
@@ -146,12 +154,14 @@ def _settings(args: argparse.Namespace) -> Settings:
 
 
 def _network_out(args: argparse.Namespace, settings: Settings) -> Path:
-    """Where the graph built from ``--links`` is written, and looked for again."""
+    """Where `valma build` writes the graph, and looks for it again."""
     out = getattr(args, "out", None)
     return Path(out) if out else settings.network_path(args.mode, args.links)
 
 
-def _network_and_links(args: argparse.Namespace) -> tuple[RoutableNetwork, Path | None]:
+def _network_and_links(
+    args: argparse.Namespace, *, explicit_build: bool = False
+) -> tuple[RoutableNetwork, Path | None]:
     """Load or build the network, and say which link layer it came from."""
     if args.network is not None:
         network = load_network(args.network)
@@ -171,7 +181,14 @@ def _network_and_links(args: argparse.Namespace) -> tuple[RoutableNetwork, Path 
     settings = _settings(args)
 
     if args.links is not None:
-        path = _network_out(args, settings)
+        if explicit_build:
+            # `valma build`: a named, reusable deliverable, next to the results.
+            path = _network_out(args, settings)
+        else:
+            # `matrix`/`assign` building it themselves, with no `valma build`
+            # in between: a cache, not a deliverable, so callers need not know
+            # it exists.
+            path = settings.network_cache_path_for_links(args.mode, args.links)
         if path.exists() and not args.force_reload:
             logger.info("Loading network from %s", path)
             return load_network(path), args.links
@@ -211,13 +228,16 @@ def cmd_extract(args: argparse.Namespace) -> int:
         links_path=out,
     )
     print(f"{args.mode}: {len(links):,} links -> {path}")
-    print("\nEdit it in QGIS if you like, then build the routable graph:")
-    print(f"  valma build --links {path} --mode {args.mode}")
+    print("\nEdit it in QGIS if you like, then route against it directly:")
+    print(
+        f"  valma matrix --links {path} --mode {args.mode} "
+        "--centroids points.csv --id-column id"
+    )
     return 0
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    network, links_path = _network_and_links(args)
+    network, links_path = _network_and_links(args, explicit_build=True)
     print(f"{args.mode}: {network.n_nodes:,} nodes, {network.n_edges:,} edges")
 
     if args.network is None:
@@ -490,7 +510,12 @@ def build_parser() -> argparse.ArgumentParser:
     extract.set_defaults(func=cmd_extract)
 
     build = sub.add_parser(
-        "build", help="Stage 2: turn a link GeoPackage into a routable graph."
+        "build",
+        help=(
+            "Turn a link GeoPackage into a routable graph, kept as a named "
+            "file under --output-dir. Optional -- 'matrix'/'assign' do this "
+            "themselves, as a cache, when given --links directly."
+        ),
     )
     _add_common(build)
     _add_source(build)

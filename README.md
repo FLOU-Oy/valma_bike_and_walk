@@ -13,11 +13,16 @@ The pipeline is deliberately two stages, with an **editable GeoPackage in the
 middle**:
 
 ```
-finland.osm.pbf ──valma extract──▶ walk_links.gpkg ──valma build──▶ walk.npz
-                                          ▲                            │
-                                    edit in QGIS                       ▼
-                                                            matrix · assign
+finland.osm.pbf ──valma extract──▶ walk_links.gpkg ──matrix · assign──▶ results
+                                          ▲
+                                    edit in QGIS
 ```
+
+`matrix` and `assign` build the routable graph from the link layer themselves
+and cache it under `--cache-dir` — there is no separate build step to run, and
+nothing named `walk.npz` to know about. `valma build` still exists for when a
+graph is worth keeping as a named file, to route against repeatedly with
+`--network` without re-reading the link layer each time.
 
 ---
 
@@ -111,12 +116,9 @@ export MML_API_KEY=...          # free, see "Elevation" below
 valma dem --links output/bike_links.gpkg
 #   -> z_u, z_v, ascent_m, descent_m added in place; tiles kept in .cache/dem/
 
-# Stage 2: link layer -> routable graph
-valma build --links output/bike_links.gpkg --mode bike
-#   -> output/bike.npz
-
-# Route against the graph -- no PBF, no GeoPackage
-valma matrix --network output/bike.npz --mode bike \
+# Route against the link layer directly -- the routable graph is built and
+# cached under .cache/ the first time, and reused after that
+valma matrix --links output/bike_links.gpkg --mode bike \
              --centroids centroids.csv --id-column id \
              --workers 8 --max-minutes 120
 
@@ -128,12 +130,19 @@ valma assign --links output/bike_links.gpkg --mode bike \
 
 Each command prints the path it wrote and the next command to run.
 
-Everything a command names in its output — the link layer, the graph, the
-matrix, the volumes — goes to `--output-dir` (default `output/`). If there is
-nothing you want to edit, `build`, `matrix` and `assign` all take `--pbf`
-directly and run stage one themselves; those runs park their intermediates
-under `--cache-dir` (default `.cache/`), keyed on the PBF and the extent, and
-that directory is always safe to delete:
+Everything a command names in its output — the link layer, the matrix, the
+volumes — goes to `--output-dir` (default `output/`). Everything a command
+builds for itself along the way and would rebuild identically next time — the
+graph built from `--links`, and anything a `--pbf` run extracts — is cached
+under `--cache-dir` (default `.cache/`) instead, keyed on its inputs, and that
+directory is always safe to delete. If a graph is worth keeping as a named
+file — routing against it many times over, or sharing it — run
+`valma build --links output/bike_links.gpkg --mode bike` explicitly; that
+writes `output/bike.npz`, which any later command can load directly with
+`--network output/bike.npz`, skipping the link layer entirely.
+
+If there is nothing you want to edit, `build`, `matrix` and `assign` all take
+`--pbf` directly and run stage one themselves too:
 
 ```bash
 valma matrix --pbf finland-260805.osm.pbf --mode walk \

@@ -465,6 +465,70 @@ def test_the_graph_is_named_after_its_link_layer(tmp_path):
     assert settings.network_path("walk", "espoo.gpkg").name == "espoo_walk.npz"
     assert settings.network_path("bike", "espoo.gpkg").name == "espoo_bike.npz"
 
+    # The implicit graph `matrix`/`assign` build from `--links` is the same
+    # name, just parked under --cache-dir instead of --output-dir.
+    settings = Settings(cache_dir=tmp_path / "cache", output_dir=tmp_path / "out")
+    assert (
+        settings.network_cache_path_for_links("walk", "out/walk_links.gpkg").name
+        == "walk.npz"
+    )
+    assert (
+        settings.network_cache_path_for_links("walk", "out/walk_links.gpkg").parent
+        == tmp_path / "cache"
+    )
+
+
+def test_cli_matrix_with_links_caches_the_graph_instead_of_writing_it_out(
+    chain_pbf, tmp_path
+):
+    out_dir = tmp_path / "out"
+    cache = tmp_path / "cache"
+    links_path = out_dir / "walk_links.gpkg"
+    main(
+        [
+            "extract",
+            "--pbf",
+            chain_pbf,
+            "--mode",
+            "walk",
+            "--output-dir",
+            str(out_dir),
+            "--cache-dir",
+            str(cache),
+        ]
+    )
+
+    centroids = tmp_path / "points.csv"
+    centroids.write_text("id,lon,lat\na,24.000,60.000\nb,24.006,60.000\n")
+
+    assert (
+        main(
+            [
+                "matrix",
+                "--links",
+                str(links_path),
+                "--mode",
+                "walk",
+                "--centroids",
+                str(centroids),
+                "--id-column",
+                "id",
+                "--output-dir",
+                str(out_dir),
+                "--cache-dir",
+                str(cache),
+                "--workers",
+                "1",
+            ]
+        )
+        == 0
+    )
+
+    # No explicit `valma build` ran, so the graph is a cache, not a named
+    # output sitting next to the results.
+    assert (cache / "walk.npz").exists()
+    assert not (out_dir / "walk.npz").exists()
+
 
 def test_cli_build_takes_an_explicit_out_path(chain_pbf, tmp_path, capsys):
     out_dir = tmp_path / "out"

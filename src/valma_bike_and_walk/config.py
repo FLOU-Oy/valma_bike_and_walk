@@ -54,18 +54,32 @@ class Settings:
             raise ValueError("This step needs a .osm.pbf; none was configured.")
         return self.pbf_path
 
+    def _network_stem(self, mode: str, links_path: Path | str) -> str:
+        stem = Path(links_path).stem.removesuffix("_links")
+        if mode not in stem:
+            stem = f"{stem}_{mode}"
+        return stem
+
     def network_path(self, mode: str, links_path: Path | str) -> Path:
         """
-        Where the graph built from a link layer goes: next to the results.
+        Where `valma build` writes the graph for a link layer: a deliverable.
 
         Named after the layer it came from, so `output/walk_links.gpkg` builds
         `output/walk.npz`. The mode is added when the name does not already
         carry it, so two modes off one hand-named layer cannot collide.
         """
-        stem = Path(links_path).stem.removesuffix("_links")
-        if mode not in stem:
-            stem = f"{stem}_{mode}"
-        return self.output_dir / f"{stem}.npz"
+        return self.output_dir / f"{self._network_stem(mode, links_path)}.npz"
+
+    def network_cache_path_for_links(self, mode: str, links_path: Path | str) -> Path:
+        """
+        Where `matrix`/`assign` park a graph they built themselves from
+        `--links`, without an explicit `valma build` in between.
+
+        Same naming as :meth:`network_path`, but under `--cache-dir`: nobody
+        asked for this file by name, so it should not show up next to the
+        results.
+        """
+        return self.cache_dir / f"{self._network_stem(mode, links_path)}.npz"
 
     def links_cache_path(self, mode: str, extent_key: str) -> Path:
         """Where a `--pbf` run parks the link layer nobody asked for by name."""
