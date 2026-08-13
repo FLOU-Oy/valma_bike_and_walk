@@ -88,12 +88,15 @@ uv sync                 # core
 uv sync --extra dev     # + pytest/ruff/black/mypy
 uv sync --extra omx     # + openmatrix, only for `assign --demand *.omx`
 uv sync --extra viz     # + networkx/matplotlib, only for to_networkx()/plotting
+uv sync --extra dem     # + rasterio, only for reading cached elevation tiles
 ```
 
 You also need an OpenStreetMap extract of your own.
 [Geofabrik](https://download.geofabrik.de/europe/finland.html) publishes a daily
 `finland-latest.osm.pbf` (~740 MB); everything below assumes a local copy.
-Nothing here downloads anything at run time.
+
+`valma dem` is the one command that goes to the network, and only to fill its
+tile cache; nothing else here downloads anything at run time.
 
 ## Use
 
@@ -103,6 +106,11 @@ valma extract --pbf finland-260805.osm.pbf --mode bike --bbox 24.5 60.1 25.1 60.
 #   -> output/bike_links.gpkg
 
 #   ... open it in QGIS, fix what needs fixing, save ...
+
+# Optional: attach elevation, fetching only the DEM tiles these links cross
+export MML_API_KEY=...          # free, see "Elevation" below
+valma dem --links output/bike_links.gpkg
+#   -> z_u, z_v, ascent_m, descent_m added in place; tiles kept in .cache/dem/
 
 # Stage 2: link layer -> routable graph
 valma build --links output/bike_links.gpkg --mode bike
@@ -396,6 +404,63 @@ with a logged count rather than quietly assigned somewhere.
 
 ---
 
+## Elevation
+
+The National Land Survey publishes no whole-country GeoTIFF to download. What it
+publishes is a [WCS query
+service](https://www.maanmittauslaitos.fi/ortokuvien-ja-korkeusmallien-kyselypalvelu/tekninen-kuvaus)
+that cuts an arbitrary rectangle out of the 2 m laser-scanned elevation model,
+capped at 10 km × 10 km and 5000 px a request. So `valma dem` is a tiling client:
+it cuts the area into 8 km tiles on a fixed grid aligned to the EPSG:3067 origin,
+fetches the ones that are missing, and keeps them under `.cache/dem/`.
+
+The grid is fixed on purpose. An extent-shaped request is unshareable — shift the
+bbox by a metre and none of it can be reused — whereas a fixed tile is the same
+file whichever run asked for it. The cache is additive: every run can only add to
+what the next one finds already there. Which tiles get fetched is decided from
+the **links**, not their bounding box, so a sparse rural network pays for the
+ground its roads actually cross.
+
+```bash
+export MML_API_KEY=...                       # or pass --api-key
+
+valma dem --links output/bike_links.gpkg     # attach elevation, fetch as needed
+valma dem --bbox 24.5 60.1 25.1 60.4         # just pre-fill the cache
+valma dem --links output/bike_links.gpkg --dem-resolution 10
+```
+
+An API key is free from
+[maanmittauslaitos.fi](https://www.maanmittauslaitos.fi/rajapinnat/api-avaimen-ohje).
+The data is CC BY 4.0 — attribute the National Land Survey of Finland in anything
+you publish from it.
+
+**Columns added** to the link layer, alongside the existing `speed_override_kmh`
+convention:
+
+| column | meaning |
+|---|---|
+| `z_u`, `z_v` | height at the link's first and last vertex, metres |
+| `ascent_m` | metres climbed following the digitised direction |
+| `descent_m` | metres dropped following it |
+| `grade_override` | empty, for you to fill in where the DEM is wrong |
+
+Ascent and descent are kept apart rather than netted off: a link that climbs ten
+metres and drops them again costs nothing like a flat one, and the two swap
+places when it is traversed backwards.
+
+Two things are deliberate and worth knowing. Profiles are read at a fixed 25 m
+spacing rather than at the geometry's own vertices, so a long two-vertex link
+cannot hide a hill between its ends. And steps below 0.5 m are read as noise and
+dropped — without that dead band, sampling a flat road picks up the kerb and the
+ditch either side of it and reports a climb that is not there. Links tagged
+`bridge` or `tunnel` are forced flat, because MML's model is a *terrain* model:
+it reports the valley floor under a bridge and the hilltop over a tunnel.
+
+> **Not yet wired into routing.** `valma build` does not read these columns.
+> Travel time is still one scalar per link, applied to both directions, so a hill
+> currently costs the same up as down. Making slope bite means splitting
+> `travel_time_s` per direction in `links.directed_edges`.
+
 ## Layout
 
 ```
@@ -409,8 +474,9 @@ src/valma_bike_and_walk/
 ├── matrix.py      chunked / parallel OD travel-time matrices
 ├── demand.py      reading OD demand (long / .npz / OMX) as a sparse matrix
 ├── assignment.py  all-or-nothing assignment: demand -> per-link volumes
+├── elevation.py   DEM tiles from the NLS: fetch, cache, height profiles
 ├── gpkg.py        draw a per-edge result back onto the link layer
-└── cli.py         extract / build / matrix / assign
+└── cli.py         dem / extract / build / matrix / assign
 ```
 
 Data flows one way: `osm` → `links` → `network` → (`centroids` +) `matrix` /

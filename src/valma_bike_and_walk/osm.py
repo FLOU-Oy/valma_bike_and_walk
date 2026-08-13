@@ -124,8 +124,9 @@ WALK_FILTER = WayFilter(
     }
 )
 
-#: Cyclable ways. Steps and footways go, because pushing a bike up a staircase
-#: is not a cycling route; the speed profiles never see them.
+#: Cyclable ways. Footways, steps and elevators stay: shared-use paths are
+#: often only tagged footway, and stairs or a lift can still be part of a
+#: real route -- the speed profile prices the dismount-and-push instead.
 BIKE_FILTER = WayFilter(
     {
         "area": ["yes"],

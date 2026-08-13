@@ -21,6 +21,7 @@ dependencies = [
     "pyproj>=3.5",
     "scipy>=1.11",
     "shapely>=2.0",
+    "truststore>=0.9",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +37,12 @@ viz = [
 omx = [
     "openmatrix>=0.3",
 ]
+# Reading cached elevation tiles needs a raster reader. Downloading them does
+# not -- that is stdlib urllib -- so a run that only fills the cache, or one that
+# takes its heights from somewhere else, needs none of this.
+dem = [
+    "rasterio>=1.3",
+]
 dev = [
     "pytest>=7.0",
     "black>=24.0",
@@ -43,6 +50,7 @@ dev = [
     "mypy>=1.8",
     "networkx>=3.0",
     "openmatrix>=0.3",
+    "rasterio>=1.3",
 ]
 
 [project.scripts]

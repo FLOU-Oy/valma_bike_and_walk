@@ -81,7 +81,7 @@ def write_pbf(path, nodes: dict[int, tuple[float, float]], ways, relations=()) -
 #:           |
 #:           4              way 101, path, oneway=yes
 #:           |
-#:           5              way 102, steps  (walkable, not cyclable)
+#:           5              way 102, steps  (walkable and cyclable)
 #:
 #: Node 2 is the only junction, so way 100 splits into two links there.
 GRID_NODES = {

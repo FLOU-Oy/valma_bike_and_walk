@@ -7,6 +7,9 @@ The pipeline is two stages, and the GeoPackage between them is the point:
   valma build   --links output/bike_links.gpkg --mode bike
      -> output/bike.npz                 <- routable graph
 
+  valma dem     --links output/bike_links.gpkg
+     -> the same file, + z_u/z_v/ascent_m/descent_m  (optional; needs a key)
+
   valma matrix  --network output/bike.npz --mode bike --centroids points.csv
   valma assign  --network output/bike.npz --mode bike --centroids points.csv \\
                 --demand od.csv --links output/bike_links.gpkg --gpkg
@@ -24,6 +27,7 @@ import logging
 import sys
 from pathlib import Path
 
+import geopandas as gpd
 import numpy as np
 
 from valma_bike_and_walk import links as links_module
@@ -33,7 +37,13 @@ from valma_bike_and_walk.assignment import (
 )
 from valma_bike_and_walk.assignment import summarise as summarise_assignment
 from valma_bike_and_walk.centroids import DEFAULT_MAX_SNAP_M, load_centroids
-from valma_bike_and_walk.config import DEFAULT_INDEX_STORAGE, MODES, Settings
+from valma_bike_and_walk.config import (
+    DEFAULT_INDEX_STORAGE,
+    MODES,
+    PROJECTED_CRS,
+    WGS84,
+    Settings,
+)
 from valma_bike_and_walk.demand import (
     align_to_ids,
     clip_minimum,
@@ -41,6 +51,16 @@ from valma_bike_and_walk.demand import (
     read_demand_long,
     read_demand_npz,
     read_demand_omx,
+)
+from valma_bike_and_walk.elevation import (
+    API_KEY_ENV,
+    DEFAULT_RESOLUTION_M,
+    DEFAULT_TILE_M,
+    INSECURE_ENV,
+    RESOLUTIONS_M,
+    DemCache,
+    add_elevation,
+    tiles_for_bounds,
 )
 from valma_bike_and_walk.gpkg import write_edges_gpkg
 from valma_bike_and_walk.matrix import default_workers, summarise, travel_time_matrix
@@ -212,6 +232,46 @@ def cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dem_cache(args: argparse.Namespace, settings: Settings) -> DemCache:
+    return DemCache(
+        root=settings.dem_cache_dir,
+        resolution_m=args.dem_resolution,
+        tile_m=args.dem_tile,
+        api_key=args.api_key,
+        insecure=args.insecure or None,
+    )
+
+
+def cmd_dem(args: argparse.Namespace) -> int:
+    settings = _settings(args)
+    cache = _dem_cache(args, settings)
+
+    if args.links is not None:
+        links = links_module.read_links(args.links)
+        links = add_elevation(links, cache, workers=args.dem_workers)
+        out = args.out or args.links
+        links_module.write_links(links, out)
+        print(f"Elevation written to {out} ({len(links):,} links)")
+        rise = links["ascent_m"].to_numpy()
+        print(f"  total ascent: {np.nansum(rise):,.0f} m")
+        print(f"  steepest link: {np.nanmax(rise):,.1f} m of climb")
+    else:
+        if args.bbox is None and args.area is None:
+            raise SystemExit(
+                "valma dem needs --links (to attach elevation to a link layer) "
+                "or --bbox/--area (to pre-fill the tile cache)."
+            )
+        clip, _ = resolve_clip(settings, args.area, args.bbox)
+        assert clip is not None
+        bounds = gpd.GeoSeries([clip], crs=WGS84).to_crs(PROJECTED_CRS).total_bounds
+        tiles = tiles_for_bounds(bounds, args.dem_resolution, args.dem_tile)
+        cache.ensure(tiles, workers=args.dem_workers)
+        print(f"{len(tiles):,} tile(s) cached in {cache.directory}")
+
+    print("\nElevation data (c) National Land Survey of Finland, CC BY 4.0.")
+    return 0
+
+
 def _centroids(args: argparse.Namespace, network: RoutableNetwork):
     return load_centroids(
         network,
@@ -333,6 +393,50 @@ def _add_routing(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--chunk-size", type=int)
 
 
+def _add_dem(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--dem-resolution",
+        type=float,
+        default=DEFAULT_RESOLUTION_M,
+        choices=RESOLUTIONS_M,
+        help=(
+            "Grid spacing to fetch elevation at, in metres. The service scales "
+            "its 2 m model to whatever is asked; these are the spacings that "
+            "divide the default tile exactly. Coarser means much smaller tiles "
+            "-- 10 m is a sixteenth of the bytes 2 m is."
+        ),
+    )
+    parser.add_argument(
+        "--dem-tile",
+        type=int,
+        default=DEFAULT_TILE_M,
+        help=(
+            "Edge of one cached tile in metres. The service refuses anything "
+            "over 10000 m or 5000 px a side."
+        ),
+    )
+    parser.add_argument("--dem-workers", type=int, default=4)
+    parser.add_argument(
+        "--api-key",
+        help=(
+            "National Land Survey API key. Defaults to the "
+            f"{API_KEY_ENV} environment variable. Free, from "
+            "https://www.maanmittauslaitos.fi/rajapinnat/api-avaimen-ohje"
+        ),
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help=(
+            "Skip TLS certificate verification when downloading elevation "
+            "tiles. For a network that inspects TLS and whose root cannot be "
+            "reached otherwise; installing truststore is the better fix. The "
+            "API key travels in the URL, so this exposes it. Also settable as "
+            f"{INSECURE_ENV}=1."
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="valma",
@@ -374,6 +478,38 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     build.set_defaults(func=cmd_build)
+
+    dem = sub.add_parser(
+        "dem",
+        help="Fetch elevation tiles into the cache, and attach them to a link layer.",
+    )
+    # Deliberately no --mode: the ground is the same height whichever way you
+    # travel over it, and one cache serves both modes.
+    dem.add_argument("--cache-dir", type=Path, default=Path(".cache"))
+    dem.add_argument("--output-dir", type=Path, default=Path("output"))
+    dem.add_argument("--force-reload", action="store_true")
+    _add_extent(dem)
+    _add_dem(dem)
+    dem.add_argument(
+        "--pbf",
+        type=Path,
+        help="Only needed when --area has to be looked up in the PBF.",
+    )
+    dem.add_argument(
+        "--links",
+        type=Path,
+        help=(
+            "Link GeoPackage to attach elevation to. Only the tiles these links "
+            "actually touch are fetched. Without it, --bbox/--area just fills "
+            "the tile cache."
+        ),
+    )
+    dem.add_argument(
+        "--out",
+        type=Path,
+        help="Where to write the elevated link layer (default: in place).",
+    )
+    dem.set_defaults(func=cmd_dem)
 
     matrix = sub.add_parser("matrix", help="Compute an OD travel-time matrix.")
     _add_common(matrix)

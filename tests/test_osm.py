@@ -30,13 +30,20 @@ def test_a_way_without_highway_is_never_a_link():
     assert not BIKE_FILTER.keeps({"waterway": "river"})
 
 
-def test_modes_disagree_about_steps_and_cycleways():
+def test_modes_disagree_about_corridors_and_cycleways():
     """The whole point of having two filters."""
-    assert WALK_FILTER.keeps({"highway": "steps"})
-    assert not BIKE_FILTER.keeps({"highway": "steps"})
+    assert WALK_FILTER.keeps({"highway": "corridor"})
+    assert not BIKE_FILTER.keeps({"highway": "corridor"})
 
     assert BIKE_FILTER.keeps({"highway": "cycleway"})
     assert not WALK_FILTER.keeps({"highway": "cycleway"})
+
+
+def test_the_bike_filter_allows_dismount_and_push_ways():
+    """Footways, steps and elevators are part of real cycling routes too."""
+    assert BIKE_FILTER.keeps({"highway": "footway"})
+    assert BIKE_FILTER.keeps({"highway": "steps"})
+    assert BIKE_FILTER.keeps({"highway": "elevator"})
 
 
 def test_mode_specific_access_tags_are_honoured():
@@ -93,10 +100,10 @@ def test_a_link_keeps_the_full_shape_between_its_junctions(tmp_path):
     assert shapely.get_num_coordinates(links.geometry.iloc[0]) == 3
 
 
-def test_the_cycling_filter_drops_steps(grid_pbf, tmp_path):
+def test_the_cycling_filter_keeps_steps(grid_pbf, tmp_path):
     links = read_links(settings_for(grid_pbf, tmp_path), "bike")
-    assert set(links["osm_way_id"]) == {100, 101}
-    assert 5 not in set(links["u"]) | set(links["v"])
+    assert set(links["osm_way_id"]) == {100, 101, 102}
+    assert 5 in set(links["u"]) | set(links["v"])
 
 
 def test_link_ids_are_unique_and_dense(grid_pbf, tmp_path):

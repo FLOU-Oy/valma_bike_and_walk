@@ -75,6 +75,18 @@ class Settings:
         """The same, for the graph built from it."""
         return self.cache_dir / f"{self.source_stem}_{extent_key}_{mode}.npz"
 
+    @property
+    def dem_cache_dir(self) -> Path:
+        """
+        Where downloaded elevation tiles live.
+
+        Deliberately keyed on nothing -- not the PBF, not the extent. Elevation
+        tiles are cut on a fixed national grid, so a tile is the same file
+        whichever run asked for it, and every run shares the ones it has in
+        common with every other.
+        """
+        return self.cache_dir / "dem"
+
     def boundary_cache_path(self, area: str) -> Path:
         safe = area.split(",")[0].strip().replace(" ", "_")
         return self.cache_dir / f"{self.source_stem}_{safe}_boundary.geojson"
