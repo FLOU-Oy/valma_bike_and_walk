@@ -13,6 +13,7 @@ from valma_bike_and_walk.demand import (
     read_demand_long,
     read_demand_npz,
     read_demand_omx,
+    write_omx_matrix,
 )
 
 
@@ -154,6 +155,52 @@ def test_read_demand_omx_unknown_mapping_raises(tmp_path):
 
     with pytest.raises(ValueError, match="no lookup"):
         read_demand_omx(path, matrix_name="bike", mapping_name="taz_id")
+
+
+def test_write_omx_matrix_round_trips_through_read_demand_omx(tmp_path):
+    pytest.importorskip("openmatrix")
+    path = tmp_path / "times.omx"
+    ids = np.array([10, 20, 30])
+    dense = np.array([[0.0, 12.5, 30.0], [12.5, 0.0, 8.0], [30.0, 8.0, 0.0]])
+
+    write_omx_matrix(path, ids, dense, matrix_name="walk")
+
+    read_ids, matrix = read_demand_omx(path, matrix_name="walk")
+    np.testing.assert_array_equal(read_ids, ids)
+    np.testing.assert_allclose(matrix.toarray(), dense, atol=1e-3)
+
+
+def test_write_omx_matrix_uses_the_given_mapping_name(tmp_path):
+    omx = pytest.importorskip("openmatrix")
+    path = tmp_path / "times.omx"
+    ids = np.array([1, 2])
+    dense = np.zeros((2, 2))
+
+    write_omx_matrix(path, ids, dense, matrix_name="walk", mapping_name="taz_id")
+
+    with omx.open_file(str(path), "r") as f:
+        assert f.list_mappings() == ["taz_id"]
+        assert f.list_matrices() == ["walk"]
+
+
+def test_write_omx_matrix_rejects_shape_mismatch(tmp_path):
+    pytest.importorskip("openmatrix")
+    path = tmp_path / "times.omx"
+
+    with pytest.raises(ValueError, match="ids"):
+        write_omx_matrix(
+            path, np.array([1, 2, 3]), np.zeros((2, 2)), matrix_name="walk"
+        )
+
+
+def test_write_omx_matrix_rejects_non_integer_ids(tmp_path):
+    pytest.importorskip("openmatrix")
+    path = tmp_path / "times.omx"
+
+    with pytest.raises(ValueError, match="integer"):
+        write_omx_matrix(
+            path, np.array(["a", "b"]), np.zeros((2, 2)), matrix_name="walk"
+        )
 
 
 def test_align_to_ids_reorders_and_drops_unmatched(caplog):

@@ -86,7 +86,6 @@ Python ≥ 3.10.
 ```bash
 uv sync                 # core
 uv sync --extra dev     # + pytest/ruff/black/mypy
-uv sync --extra omx     # + openmatrix, only for `assign --demand *.omx`
 uv sync --extra viz     # + networkx/matplotlib, only for to_networkx()/plotting
 uv sync --extra dem     # + rasterio, only for reading cached elevation tiles
 ```
@@ -146,7 +145,11 @@ and `--centroid-crs` if not). Any vector format GeoPandas reads works too.
 Points that snap no closer than `--max-snap-distance` (default 1000 m) are
 dropped, not silently routed from somewhere else. `valma matrix` writes an
 `.npz` holding `ids` and a float32 `seconds` matrix, rows and columns in `ids`
-order.
+order. Add `--omx` to also write `<output-dir>/travel_times_<mode>.omx` (or
+`--omx path/to/file.omx` to name it yourself), in the same matrix+lookup
+layout `valma assign --demand-matrix` reads (needs integer centroid ids); use
+`--omx-matrix-name`/`--omx-mapping-name` to change the matrix/lookup names
+inside it (defaults: `--mode`, `zone_number`).
 
 ### Editing the link layer
 
@@ -472,7 +475,7 @@ src/valma_bike_and_walk/
 ├── network.py     RoutableNetwork: CSR + coords + KD-tree  [stage 2]
 ├── centroids.py   reading points and snapping them to nodes
 ├── matrix.py      chunked / parallel OD travel-time matrices
-├── demand.py      reading OD demand (long / .npz / OMX) as a sparse matrix
+├── demand.py      reading OD demand (long / .npz / OMX) as a sparse matrix, writing OMX
 ├── assignment.py  all-or-nothing assignment: demand -> per-link volumes
 ├── elevation.py   DEM tiles from the NLS: fetch, cache, height profiles
 ├── gpkg.py        draw a per-edge result back onto the link layer

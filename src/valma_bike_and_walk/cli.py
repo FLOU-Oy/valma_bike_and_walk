@@ -51,6 +51,7 @@ from valma_bike_and_walk.demand import (
     read_demand_long,
     read_demand_npz,
     read_demand_omx,
+    write_omx_matrix,
 )
 from valma_bike_and_walk.elevation import (
     API_KEY_ENV,
@@ -74,6 +75,11 @@ from valma_bike_and_walk.network import (
 from valma_bike_and_walk.osm import resolve_clip
 
 logger = logging.getLogger("valma_bike_and_walk")
+
+#: Sentinel for `matrix --omx` given bare (no path): write the default name,
+#: distinguishable from "not given at all" (args.omx is None) and from an
+#: explicit path (a Path instance).
+_OMX_DEFAULT_PATH = object()
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -308,6 +314,25 @@ def cmd_matrix(args: argparse.Namespace) -> int:
         f"{out.stat().st_size / 1e6:.1f} MB)"
     )
 
+    if args.omx is not None:
+        omx_out = (
+            args.output_dir / f"travel_times_{args.mode}.omx"
+            if args.omx is _OMX_DEFAULT_PATH
+            else args.omx
+        )
+        omx_out.parent.mkdir(parents=True, exist_ok=True)
+        write_omx_matrix(
+            omx_out,
+            centroids.ids,
+            matrix,
+            matrix_name=args.omx_matrix_name or args.mode,
+            mapping_name=args.omx_mapping_name,
+        )
+        print(
+            f"Wrote {omx_out} ({matrix.shape[0]}x{matrix.shape[1]}, "
+            f"{omx_out.stat().st_size / 1e6:.1f} MB)"
+        )
+
     for key, value in summarise(matrix).items():
         print(f"  {key}: {value:,.3f}")
     return 0
@@ -519,6 +544,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-minutes",
         type=float,
         help="Cut off the search here. The single biggest speed-up available.",
+    )
+    matrix.add_argument(
+        "--omx",
+        nargs="?",
+        const=_OMX_DEFAULT_PATH,
+        default=None,
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Also write an OMX matrix, in the same matrix+lookup layout "
+            "'valma assign' reads with --demand-matrix (needs integer "
+            "centroid ids). Defaults to <output-dir>/travel_times_<mode>.omx; "
+            "give a path to write somewhere else."
+        ),
+    )
+    matrix.add_argument(
+        "--omx-matrix-name",
+        help="Name of the matrix inside the OMX file (default: --mode).",
+    )
+    matrix.add_argument(
+        "--omx-mapping-name",
+        default="zone_number",
+        help=(
+            "Name of the OMX lookup mapping row/column position to centroid "
+            "id (default: 'zone_number')."
+        ),
     )
     matrix.set_defaults(func=cmd_matrix)
 

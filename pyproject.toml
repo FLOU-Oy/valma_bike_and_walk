@@ -17,6 +17,7 @@ dependencies = [
     "geopandas>=0.14",
     "numpy>=1.24",
     "pandas>=2.0",
+    "openmatrix>=0.3",
     "osmium>=4.0",
     "pyproj>=3.5",
     "scipy>=1.11",
@@ -32,11 +33,7 @@ viz = [
     "matplotlib>=3.7",
     "networkx>=3.0",
 ]
-# Only needed for `valma assign --demand *.omx` (demand.read_demand_omx); the
-# rest of the assignment pipeline works fine without it.
-omx = [
-    "openmatrix>=0.3",
-]
+
 # Reading cached elevation tiles needs a raster reader. Downloading them does
 # not -- that is stdlib urllib -- so a run that only fills the cache, or one that
 # takes its heights from somewhere else, needs none of this.

@@ -9,6 +9,7 @@ import pytest
 
 from valma_bike_and_walk.cli import main
 from valma_bike_and_walk.config import Settings
+from valma_bike_and_walk.demand import read_demand_omx
 from valma_bike_and_walk.links import LINKS_LAYER, read_links, write_links
 from valma_bike_and_walk.matrix import travel_time_matrix
 from valma_bike_and_walk.network import (
@@ -239,6 +240,127 @@ def test_cli_extract_then_build_then_matrix(chain_pbf, tmp_path, capsys):
     result = np.load(out_dir / "travel_times_walk.npz")
     assert result["seconds"].shape == (2, 2)
     assert result["seconds"][0, 1] > 0
+
+
+def test_cli_matrix_omx_round_trips_through_read_demand_omx(chain_pbf, tmp_path):
+    pytest.importorskip("openmatrix")
+    out_dir = tmp_path / "out"
+    cache = tmp_path / "cache"
+    links_path = out_dir / "walk_links.gpkg"
+    assert (
+        main(
+            [
+                "extract",
+                "--pbf",
+                chain_pbf,
+                "--mode",
+                "walk",
+                "--output-dir",
+                str(out_dir),
+                "--cache-dir",
+                str(cache),
+            ]
+        )
+        == 0
+    )
+
+    # Unlike the CSV/npz outputs, OMX zone mappings need integer ids.
+    centroids = tmp_path / "points.csv"
+    centroids.write_text("id,lon,lat\n1,24.000,60.000\n2,24.006,60.000\n")
+
+    assert (
+        main(
+            [
+                "matrix",
+                "--links",
+                str(links_path),
+                "--mode",
+                "walk",
+                "--centroids",
+                str(centroids),
+                "--id-column",
+                "id",
+                "--output-dir",
+                str(out_dir),
+                "--cache-dir",
+                str(cache),
+                "--workers",
+                "1",
+                "--omx",
+            ]
+        )
+        == 0
+    )
+
+    omx_path = out_dir / "travel_times_walk.omx"
+    assert omx_path.exists()
+
+    npz_result = np.load(out_dir / "travel_times_walk.npz")
+    ids, matrix = read_demand_omx(omx_path, matrix_name="walk")
+    np.testing.assert_array_equal(ids, npz_result["ids"])
+    np.testing.assert_allclose(
+        matrix.toarray(), npz_result["seconds"], rtol=1e-5, atol=1e-2
+    )
+
+
+def test_cli_matrix_omx_accepts_an_explicit_path(chain_pbf, tmp_path):
+    pytest.importorskip("openmatrix")
+    out_dir = tmp_path / "out"
+    cache = tmp_path / "cache"
+    links_path = out_dir / "walk_links.gpkg"
+    assert (
+        main(
+            [
+                "extract",
+                "--pbf",
+                chain_pbf,
+                "--mode",
+                "walk",
+                "--output-dir",
+                str(out_dir),
+                "--cache-dir",
+                str(cache),
+            ]
+        )
+        == 0
+    )
+
+    centroids = tmp_path / "points.csv"
+    centroids.write_text("id,lon,lat\n1,24.000,60.000\n2,24.006,60.000\n")
+
+    # A path in a directory that doesn't exist yet -- it should be created,
+    # and the default <output-dir>/travel_times_<mode>.omx name skipped.
+    omx_path = tmp_path / "elsewhere" / "walk_times.omx"
+
+    assert (
+        main(
+            [
+                "matrix",
+                "--links",
+                str(links_path),
+                "--mode",
+                "walk",
+                "--centroids",
+                str(centroids),
+                "--id-column",
+                "id",
+                "--output-dir",
+                str(out_dir),
+                "--cache-dir",
+                str(cache),
+                "--workers",
+                "1",
+                "--omx",
+                str(omx_path),
+            ]
+        )
+        == 0
+    )
+
+    assert omx_path.exists()
+    assert not (out_dir / "travel_times_walk.omx").exists()
+    ids, _ = read_demand_omx(omx_path, matrix_name="walk")
+    np.testing.assert_array_equal(ids, np.array([1, 2]))
 
 
 def test_cli_assign_draws_volumes_back_onto_the_link_layer(chain_pbf, tmp_path):

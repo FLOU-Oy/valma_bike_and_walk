@@ -12,6 +12,10 @@ Three source formats are supported: a long/triple-format CSV or similar
 (:func:`read_demand_npz`), and OMX -- the HDF5-based matrix format transport
 models exchange OD matrices in (:func:`read_demand_omx`). :func:`clip_minimum`
 applies a minimum-demand threshold uniformly across all three.
+
+:func:`write_omx_matrix` writes the other direction: a dense matrix (e.g. a
+travel-time matrix out of :mod:`valma_bike_and_walk.matrix`) in the same
+layout :func:`read_demand_omx` reads.
 """
 
 from __future__ import annotations
@@ -199,6 +203,68 @@ def read_demand_omx(
         minimum_demand,
     )
     return ids, matrix
+
+
+def write_omx_matrix(
+    path: Path,
+    ids: np.ndarray,
+    matrix: np.ndarray,
+    matrix_name: str,
+    mapping_name: str = "zone_number",
+    title: str = "",
+) -> None:
+    """
+    Write a dense matrix to OMX, in the same layout :func:`read_demand_omx` reads.
+
+    ``matrix`` -- typically a travel-time matrix out of
+    :func:`valma_bike_and_walk.matrix.travel_time_matrix`, but any dense
+    ``(len(ids), len(ids))`` array works -- is written whole as one OMX
+    matrix named ``matrix_name``, alongside a ``mapping_name`` lookup giving
+    each row/column position's id. That's the same layout
+    :func:`read_demand_omx` reads, so the file opens in any other
+    OMX-consuming tool (and, structurally, could be read straight back in as
+    OD demand with ``valma assign --demand-matrix``, though a travel-time
+    matrix is a strange thing to assign). Requires the optional
+    ``openmatrix`` package.
+    """
+    try:
+        import openmatrix as omx
+    except ImportError as exc:  # pragma: no cover - exercised only without the extra
+        raise ImportError(
+            "Writing OMX needs the optional 'openmatrix' package: "
+            "pip install openmatrix (or install this project's 'omx' extra)."
+        ) from exc
+
+    path = Path(path)
+    ids = np.asarray(ids)
+    matrix = np.asarray(matrix)
+    n = len(ids)
+    if matrix.shape != (n, n):
+        raise ValueError(
+            f"matrix is {matrix.shape}, but there are {n} ids; they should match."
+        )
+
+    # OMX mappings are HDF5 arrays of unsigned ints (zone numbers), unlike
+    # the other formats here, which don't care what type an id is.
+    try:
+        id_entries = ids.astype(np.int64).tolist()
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"OMX zone mappings need integer ids; got dtype {ids.dtype}. Use "
+            "the .npz or long-format CSV output instead for non-integer ids."
+        ) from exc
+    if any(v < 0 for v in id_entries):
+        raise ValueError("OMX zone mappings need non-negative ids.")
+
+    with omx.open_file(str(path), "w") as f:
+        f.create_matrix(
+            matrix_name,
+            obj=np.ascontiguousarray(matrix, dtype=np.float32),
+            title=title,
+        )
+        f.create_mapping(mapping_name, id_entries)
+
+    logger.info("Wrote %r to %s: %dx%d", matrix_name, path, n, n)
 
 
 def align_to_ids(
