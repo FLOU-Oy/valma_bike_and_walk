@@ -477,6 +477,7 @@ def cmd_assign(args: argparse.Namespace) -> int:
             points,
             demand,
             max_seconds=max_seconds,
+            near_seconds=args.near_minutes * 60 if args.near_minutes else None,
             workers=args.workers,
             chunk_size=args.chunk_size,
         )
@@ -830,6 +831,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help="Don't search a source beyond this travel time. OD pairs further "
         "apart than this are dropped, unassigned.",
+    )
+    assign.add_argument(
+        "--near-minutes",
+        type=float,
+        help=(
+            "With --zones, route all access points only within this cutoff and "
+            "assign whatever they could not reach from one representative point "
+            "per zone. Spreading trip ends over a zone only changes the route "
+            "materially at short range, and a bounded search is far cheaper "
+            "than an open one, so this brings a --points-per-zone run back "
+            "towards the cost of a single-centroid one. Nothing is lost between "
+            "the tiers: the second one is given exactly what the first "
+            "reported it could not place."
+        ),
     )
     assign.set_defaults(func=cmd_assign)
 

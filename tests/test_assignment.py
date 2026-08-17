@@ -143,11 +143,13 @@ def test_solve_chunk_returns_only_touched_edges():
     demand = _as_demand_csr(np.array([[0.0, 0.0, 0.0, 5.0]]), 1, 4)
     edge_keys = _edge_keys(net)
 
-    idx, vals, dropped = _solve_chunk(
+    idx, vals, dropped, _ = _solve_chunk(
         net.csr(),
         np.array([0], dtype=np.int64),
         np.arange(4, dtype=np.int64),
-        demand,
+        demand.data,
+        demand.indices,
+        demand.indptr,
         0,
         edge_keys,
         net.n_nodes,
@@ -292,6 +294,92 @@ def test_one_point_per_zone_reproduces_a_centroid_assignment():
     np.testing.assert_allclose(
         assign_zone_traffic(net, zones, demand),
         assign_traffic(net, [1, 5], demand),
+    )
+
+
+def test_two_tier_assignment_matches_a_single_tier_one():
+    """The near cutoff must change the cost of the run, not its result."""
+    net = corridor_net()
+    zones = make_zones([[0, 1, 2], [4, 5, 6]], network=net)
+    demand = np.array([[90.0, 300.0], [120.0, 60.0]])
+
+    one_tier = assign_zone_traffic(net, zones, demand)
+    # 25 s reaches inside a zone but not across the bridge, so the far tier
+    # picks up every interzonal pair and the near tier keeps the intrazonal.
+    two_tier = assign_zone_traffic(net, zones, demand, near_seconds=25.0)
+
+    # Interzonal demand now travels between representative points, so the two
+    # differ on the approach links -- but the bridge every trip has to cross
+    # carries the same total either way, and nothing was lost between tiers.
+    assert volume_of(net, two_tier, 2, 3) == pytest.approx(
+        volume_of(net, one_tier, 2, 3)
+    )
+    assert volume_of(net, two_tier, 4, 3) == pytest.approx(
+        volume_of(net, one_tier, 4, 3)
+    )
+    # And the intrazonal demand, which only the near tier can place, is there.
+    assert volume_of(net, two_tier, 0, 1) > 0
+
+
+def test_a_generous_near_cutoff_makes_the_far_tier_a_no_op():
+    net = corridor_net()
+    zones = make_zones([[0, 1, 2], [4, 5, 6]], network=net)
+    demand = np.array([[90.0, 300.0], [120.0, 60.0]])
+
+    np.testing.assert_allclose(
+        assign_zone_traffic(net, zones, demand),
+        assign_zone_traffic(net, zones, demand, near_seconds=10_000.0),
+    )
+
+
+def test_two_tiers_lose_no_demand_between_them(caplog):
+    """Tier 2 is handed what tier 1 reported, not a guess from a distance rule."""
+    net = corridor_net()
+    zones = make_zones([[0, 1, 2], [4, 5, 6]], network=net)
+    demand = np.array([[0.0, 300.0], [0.0, 0.0]])
+
+    with caplog.at_level("WARNING"):
+        volume = assign_zone_traffic(net, zones, demand, near_seconds=25.0)
+
+    # Every trip crosses the bridge exactly once, so its volume is the demand.
+    assert volume_of(net, volume, 2, 3) == pytest.approx(300.0)
+    assert not any("no path within reach" in m for m in caplog.messages)
+
+
+def test_genuinely_unreachable_demand_is_still_dropped_and_warned(caplog):
+    net = make_network([(0, 1, 10.0), (1, 0, 10.0), (3, 4, 10.0), (4, 3, 10.0)], 5)
+    zones = make_zones([[0, 1], [3, 4]], network=net)
+    demand = np.array([[0.0, 50.0], [0.0, 0.0]])
+
+    with caplog.at_level("WARNING"):
+        volume = assign_zone_traffic(net, zones, demand, near_seconds=25.0)
+
+    assert volume.sum() == pytest.approx(0.0)
+    assert any("no path within reach" in m for m in caplog.messages)
+
+
+def test_intrazonal_demand_wider_than_the_near_cutoff_is_reported(caplog):
+    """It cannot fall through to the far tier, so it must not do so silently."""
+    net = corridor_net()
+    zones = make_zones([[0, 3, 6]], network=net)  # 30 s across, cutoff is 25 s
+    demand = np.array([[90.0]])
+
+    with caplog.at_level("WARNING"):
+        assign_zone_traffic(net, zones, demand, near_seconds=25.0)
+
+    assert any("intrazonal demand" in m and "near cutoff" in m for m in caplog.messages)
+
+
+def test_two_tier_assignment_survives_multiple_workers():
+    net = corridor_net()
+    zones = make_zones([[0, 1, 2], [4, 5, 6]], network=net)
+    demand = np.array([[90.0, 300.0], [120.0, 60.0]])
+
+    np.testing.assert_allclose(
+        assign_zone_traffic(net, zones, demand, near_seconds=25.0, workers=1),
+        assign_zone_traffic(
+            net, zones, demand, near_seconds=25.0, workers=2, chunk_size=1
+        ),
     )
 
 

@@ -136,6 +136,10 @@ valma assign --links output/bike_links.gpkg --mode bike \
 # and end all over it rather than at one node -- see "Zones as polygons" below
 valma matrix --links output/bike_links.gpkg --mode bike \
              --zones taz.gpkg --id-column zone_id --near-minutes 15
+
+valma assign --links output/bike_links.gpkg --mode bike \
+             --zones taz.gpkg --id-column zone_id \
+             --demand od.csv --near-minutes 15 --gpkg
 ```
 
 Each command prints the path it wrote and the next command to run.
@@ -289,13 +293,21 @@ zones = load_zones(
 
 seconds = zone_travel_time_matrix(network, zones, near_seconds=15 * 60, workers=8)
 demand = demand_matrix(read_demand_long("od.csv"), zones.ids)
-volume = assign_zone_traffic(network, zones, demand, workers=8)
+volume = assign_zone_traffic(network, zones, demand, near_seconds=15 * 60, workers=8)
 ```
 
 `zones.ids` indexes the result exactly as `centroids.ids` does, so everything
 downstream — the `.npz`, the OMX writer, the volumes GeoPackage — is unchanged.
 Inside, `zones.indptr` delimits each zone's block of access points the way a CSR
 matrix delimits its rows, and `zones.weight` sums to 1 within every zone.
+
+> **On Windows, put your script's work under `if __name__ == "__main__":`.**
+> Anything with `workers > 1` starts worker processes by *spawning* fresh
+> interpreters, which re-import your module — so unguarded top-level code runs
+> again in every worker. With a country-sized network that means each worker
+> loading its own copy of it before doing any work, and the run using several
+> times the memory it should for no benefit. The `valma` CLI is already guarded;
+> this only bites scripts that call the library directly.
 
 ## Zones as polygons
 
@@ -408,10 +420,20 @@ reach is roughly `--near-minutes` less the time to cross two zones — budget fo
 that rather than being surprised by it. The run logs what share of pairs the
 near tier resolved, which is the number to tune against.
 
-There is no equivalent for `valma assign`: placing demand across a zone means
-every origin access point has to be routed, so `--points-per-zone` is the cost
-dial there. A smaller K (4, say) is usually plenty for assignment, while the
-matrix can afford more.
+`valma assign` takes `--near-minutes` too, and splits the same way — but it
+cannot use a distance rule to decide what goes where, because a pair sorted into
+the near tier and then not reached within the cutoff would be demand silently
+lost. So the split is decided by what actually happened:
+
+1. Every access point, bounded at `--near-minutes`. This places all the demand
+   whose trips are short enough for the distribution to matter, including
+   everything intrazonal.
+2. Whatever tier 1 **reported** it could not reach — per zone pair, not guessed
+   at — assigned from one representative point per zone at `--max-minutes`.
+
+Total demand is conserved across the two by construction. A pair is either
+loaded distributed, loaded from representative points, or genuinely unreachable
+and dropped with a warning, exactly as in a single-tier run.
 
 ### What else changes
 
@@ -596,12 +618,50 @@ Unreachable pairs — including everything beyond `--max-minutes` — are droppe
 with a logged count rather than quietly assigned somewhere.
 
 With `--zones`, the source count is the *access point* count, so
-`--points-per-zone` multiplies the run directly — 8 points per zone means eight
-times the searches. The loading step grows too (K² times as many OD pairs), but
-it stays sparse and remains cheap next to the searches. There is no two-tier
-shortcut here as there is for the matrix: placing demand across a zone means
-every one of its access points genuinely has to be routed. A smaller K is
-usually enough for assignment than for a matrix.
+`--points-per-zone` multiplies the searches directly — and the demand grows by
+K² for having been spread over those points. Two levers keep that in hand:
+
+- **`--near-minutes`** bounds the multi-point searches and assigns the rest from
+  representative points, the same two-tier trade the matrix makes. Reach for it
+  first.
+- **`--min-demand`** thresholds the zone matrix *before* it is expanded, so
+  every pair it drops saves K² point pairs rather than one. On a large, mostly
+  noise demand matrix this is worth more here than it is for `--centroids`.
+
+#### Memory, and which dial moves which part of it
+
+A parallel run has two independent costs, and they respond to different flags.
+
+**Per worker**, and nothing to do with how many zones there are:
+
+```
+chunk_size x n_nodes x 12 bytes   the Dijkstra distance + predecessor block
+      + n_edges x  8 bytes        the volume accumulator
+```
+
+On the 3.4 M-node national bike network that is 308 MB per worker at the default
+chunk size, or 105 MB at `--chunk-size 1`. The graph, the edge-key lookup and the
+demand are **memory-mapped**, so they cost once for the machine rather than once
+per worker, and do not enter this. Multiply by `--workers` and budget
+accordingly: 16 workers wants ~5 GB before the demand is considered.
+
+**Once, shared:** the expanded demand, which the run logs as `Expanded N zone OD
+pair(s) ... M point pair(s)`. It grows with zones² × K², so it is the term that
+runs away on a big zone system — roughly 0.8 GB at 1000 zones with K=8, 3 GB at
+2000. Watch that log line.
+
+So, in order:
+
+| symptom | reach for |
+|---|---|
+| too slow | `--near-minutes`, then `--max-minutes` |
+| out of memory, big zone system | `--min-demand` (it cuts K² point pairs per zone pair dropped), then `--points-per-zone` |
+| out of memory, big *network* | `--chunk-size`, then `--workers` |
+
+`--chunk-size` only ever moves the per-worker Dijkstra block. Lowering it also
+makes chunks *more numerous*, so it does nothing for demand-side memory — that
+was worth saying because reaching for it first is the natural instinct and the
+wrong one when the zone system is what is large.
 
 ---
 
