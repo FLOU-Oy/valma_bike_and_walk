@@ -9,11 +9,13 @@ from valma_bike_and_walk.assignment import (
     _edge_keys,
     _solve_chunk,
     assign_traffic,
+    assign_zone_traffic,
+    expand_demand,
     link_volume_frame,
     summarise,
 )
 
-from .conftest import make_network
+from .conftest import make_network, make_zones
 
 
 def volume_of(network, link_volume, u, v):
@@ -207,3 +209,99 @@ def test_rejects_unsnapped_indices():
     net = make_network([(0, 1, 10.0)], 2)
     with pytest.raises(ValueError, match="non-negative"):
         assign_traffic(net, np.array([-1]), np.zeros((1, 2)), targets=[0, 1])
+
+
+# --- Assignment from zones, with demand spread over several access points ---
+
+#: Seven nodes in a row, 10 s between neighbours both ways. Zones {0,1,2} and
+#: {4,5,6} sit either side of the single 2<->4 bridge through node 3.
+CORRIDOR = [
+    (u, v, 10.0) for a, b in zip(range(6), range(1, 7)) for u, v in ((a, b), (b, a))
+]
+
+
+def corridor_net():
+    return make_network(CORRIDOR, 7)
+
+
+def test_expanding_demand_conserves_it():
+    net = corridor_net()
+    zones = make_zones([[0, 1, 2], [4, 5, 6]], network=net)
+    demand = np.array([[0.0, 300.0], [120.0, 0.0]])
+
+    expanded = expand_demand(demand, zones)
+
+    assert expanded.shape == (6, 6)
+    assert expanded.sum() == pytest.approx(420.0)
+
+
+def test_expanding_intrazonal_demand_conserves_it_and_skips_self_pairs():
+    net = corridor_net()
+    zones = make_zones([[0, 1, 2], [4, 5, 6]], network=net)
+    demand = np.array([[90.0, 0.0], [0.0, 0.0]])
+
+    expanded = expand_demand(demand, zones).toarray()
+
+    assert expanded.sum() == pytest.approx(90.0)
+    np.testing.assert_allclose(np.diag(expanded), 0.0)
+    # Six ordered pairs of distinct points share it evenly at equal weights.
+    np.testing.assert_allclose(expanded[:3, :3][~np.eye(3, dtype=bool)], 15.0)
+
+
+def test_intrazonal_demand_actually_loads_onto_links():
+    """A single centroid drops it entirely -- see test_diagonal_demand_is_ignored."""
+    net = corridor_net()
+    zones = make_zones([[0, 1, 2], [4, 5, 6]], network=net)
+    demand = np.array([[90.0, 0.0], [0.0, 0.0]])
+
+    volume = assign_zone_traffic(net, zones, demand)
+
+    # 0->1 carries the 0->1 and 0->2 flows, 15 each.
+    assert volume_of(net, volume, 0, 1) == pytest.approx(30.0)
+    assert volume_of(net, volume, 1, 2) == pytest.approx(30.0)
+    assert volume_of(net, volume, 2, 1) == pytest.approx(30.0)
+    # And none of it leaks out of the zone.
+    assert volume_of(net, volume, 2, 3) == pytest.approx(0.0)
+
+
+def test_distributing_demand_takes_the_peak_off_the_centroid_link():
+    net = corridor_net()
+    demand = np.array([[0.0, 300.0], [0.0, 0.0]])
+
+    zones = make_zones([[0, 1, 2], [4, 5, 6]], network=net)
+    spread = assign_zone_traffic(net, zones, demand)
+    single = assign_traffic(net, [1, 5], demand)
+
+    # Everything has to cross the bridge either way, so that link is unchanged.
+    assert volume_of(net, single, 2, 3) == pytest.approx(300.0)
+    assert volume_of(net, spread, 2, 3) == pytest.approx(300.0)
+
+    # But the link out of the centroid no longer carries the whole zone: only
+    # the third of the demand that starts beyond it does.
+    assert volume_of(net, single, 1, 2) == pytest.approx(300.0)
+    assert volume_of(net, spread, 1, 2) == pytest.approx(200.0)
+    assert volume_of(net, single, 0, 1) == pytest.approx(0.0)
+    assert volume_of(net, spread, 0, 1) == pytest.approx(100.0)
+
+
+def test_one_point_per_zone_reproduces_a_centroid_assignment():
+    net = corridor_net()
+    zones = make_zones([[1], [5]], network=net)
+    demand = np.array([[0.0, 300.0], [120.0, 0.0]])
+
+    np.testing.assert_allclose(
+        assign_zone_traffic(net, zones, demand),
+        assign_traffic(net, [1, 5], demand),
+    )
+
+
+def test_uneven_weights_split_demand_in_proportion():
+    net = corridor_net()
+    zones = make_zones([[0, 1, 2], [5]], [[0.5, 0.25, 0.25], [1.0]], network=net)
+    demand = np.array([[0.0, 400.0], [0.0, 0.0]])
+
+    volume = assign_zone_traffic(net, zones, demand)
+
+    assert volume_of(net, volume, 0, 1) == pytest.approx(200.0)
+    assert volume_of(net, volume, 1, 2) == pytest.approx(300.0)
+    assert volume_of(net, volume, 2, 3) == pytest.approx(400.0)

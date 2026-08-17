@@ -7,7 +7,12 @@ and it does the rest.
 Three things, from one cached network: an origin–destination **travel-time
 matrix**, an **all-or-nothing assignment** of OD demand onto per-link volumes,
 and a **GeoPackage** of either for GIS. Designed for the country-scale case —
-~10 000 centroids across all of Finland.
+~10 000 zones across all of Finland.
+
+Zones can be **points or polygons**. Given polygons, trips start and end all
+over a zone rather than at one centroid node, which keeps volumes off a single
+node, gets short trips right and lets intrazonal demand load onto the network at
+all — see [Zones as polygons](#zones-as-polygons).
 
 The pipeline is deliberately two stages, with an **editable GeoPackage in the
 middle**:
@@ -126,6 +131,11 @@ valma matrix --links output/bike_links.gpkg --mode bike \
 valma assign --links output/bike_links.gpkg --mode bike \
              --centroids centroids.csv --id-column id \
              --demand od.csv --gpkg
+
+# Or give it zone *polygons* instead of centroids, and each zone's trips start
+# and end all over it rather than at one node -- see "Zones as polygons" below
+valma matrix --links output/bike_links.gpkg --mode bike \
+             --zones taz.gpkg --id-column zone_id --near-minutes 15
 ```
 
 Each command prints the path it wrote and the next command to run.
@@ -148,6 +158,10 @@ If there is nothing you want to edit, `build`, `matrix` and `assign` all take
 valma matrix --pbf finland-260805.osm.pbf --mode walk \
              --centroids centroids.csv --id-column id
 ```
+
+`--centroids` and `--zones` are alternatives, and every routing command takes
+either. `--centroids` is the classic one point per zone; `--zones` takes
+polygons and is documented in its own section below.
 
 `centroids.csv` needs `lon`/`lat` columns by default (`--x-column`/`--y-column`
 and `--centroid-crs` if not). Any vector format GeoPandas reads works too.
@@ -219,6 +233,10 @@ own edge arrays. Add `--gpkg` (with `--links`) to also write
 geometry, with `link_id` and a `direction` of +1 or −1. A two-way link that
 carries traffic both ways gets two rows sharing one shape.
 
+Trips *within* a zone have no path to load with one centroid per zone, so they
+are dropped. Give `assign` polygons instead and they are assigned like any
+others — see the next section.
+
 ### From Python
 
 The CLI is a thin wrapper; everything is callable directly.
@@ -252,6 +270,169 @@ contract everything else relies on: the matrix rows, the demand matrix rows and
 columns, and the assignment's sources are all in that order. `volume` is one
 value per directed edge, in the same order as `network.travel_time`,
 `network.indices` and `network.link_id`.
+
+The polygon path is the same three calls with `Zones` in place of `Centroids`:
+
+```python
+from valma_bike_and_walk.assignment import assign_zone_traffic
+from valma_bike_and_walk.matrix import zone_travel_time_matrix
+from valma_bike_and_walk.zones import load_zones
+
+zones = load_zones(
+    network,
+    "taz.gpkg",
+    id_column="zone_id",
+    weights_path="population_grid.gpkg",   # omit to use network node density
+    weight_column="population",
+    points_per_zone=8,
+)
+
+seconds = zone_travel_time_matrix(network, zones, near_seconds=15 * 60, workers=8)
+demand = demand_matrix(read_demand_long("od.csv"), zones.ids)
+volume = assign_zone_traffic(network, zones, demand, workers=8)
+```
+
+`zones.ids` indexes the result exactly as `centroids.ids` does, so everything
+downstream — the `.npz`, the OMX writer, the volumes GeoPackage — is unchanged.
+Inside, `zones.indptr` delimits each zone's block of access points the way a CSR
+matrix delimits its rows, and `zones.weight` sums to 1 within every zone.
+
+## Zones as polygons
+
+Routing every trip from one centroid node per zone is the standard
+simplification, and it costs three things:
+
+- **Volumes pile up** on whatever links happen to meet the centroid node, which
+  makes the assignment as much a picture of where you put the centroids as of
+  where people cycle.
+- **Short trips come out wrong**, by however far the centroid sits from where
+  people actually are.
+- **Intrazonal trips come out as exactly zero** and are dropped from the
+  assignment entirely — for walking and cycling that is a large share of all
+  travel, and precisely the share that belongs on local streets.
+
+Give `--zones` a polygon layer instead and each zone is represented by several
+weighted **access points** inside it. Trips are routed point to point, and the
+result is aggregated back to zone level with those weights.
+
+```bash
+valma matrix --links output/bike_links.gpkg --mode bike \
+             --zones taz.gpkg --id-column zone_id \
+             --points-per-zone 8 --near-minutes 15
+
+valma assign --links output/bike_links.gpkg --mode bike \
+             --zones taz.gpkg --id-column zone_id \
+             --demand od.csv --gpkg
+```
+
+Points are accepted too, so an existing centroid file works unchanged; a
+one-point zone is just the single-centroid method with the snap distance
+charged for.
+
+### How wrong is one point, and where
+
+Write a trip as running from `c_i + u` to `c_j + v`, with `c` the zone centroids
+and `u`/`v` the within-zone offsets of the real origin and destination. Expand
+`|d + v − u|` around `d = |c_i − c_j|`: the linear term averages to zero by
+symmetry, and what survives is
+
+```
+E|a − b| ≈ d + E[perpendicular offset²] / 2d  =  d + O(R² / d)
+```
+
+for a zone of characteristic radius `R`. So a single centroid always
+**underestimates** mean travel time, and its relative error falls as `R²/2d²` —
+second order, not first:
+
+| separation | relative error |
+|---|---|
+| `d = 2R` | 12 % |
+| `d = 5R` | 2 % |
+| `d = 10R` | 0.5 % |
+| `d = 0` (intrazonal) | unbounded |
+
+That is the whole design in one table. The error lives in short trips, which is
+exactly where a walking or cycling model spends its attention — and it is why
+paying for multiple points over long distances buys nothing.
+
+### Where the points come from
+
+| `--weights` | what it uses | when |
+|---|---|---|
+| *not given* | **network node density** — every node in the zone, weighted by the length of link meeting it | the default; needs no extra data at all |
+| a point or polygon layer | those points, optionally sized by `--weight-column` | buildings, address points, a population or workplace grid as points |
+
+Street density is a fair proxy for where people are, which is what makes the
+no-extra-data default usable rather than a placeholder. Weighting by *length*
+rather than by node count is deliberate: this project splits links at tag
+changes as well as at junctions, so a node count would partly measure how finely
+OSM has been tagged.
+
+However many candidates a zone has, they are reduced to `--points-per-zone` by
+laying a grid over the zone, coarsening it until at most that many cells are
+occupied, and taking each occupied cell's weighted centroid. That is stratified
+rather than random sampling: deterministic (no seed to record), spread over the
+zone by construction, and it preserves the weighted mean position exactly — so
+`--points-per-zone 1` gives back the weighted centroid, and a zone's
+representative point does not move when you change K.
+
+Accuracy saturates quickly in K — as `1/√K` for random placement and faster for
+this one — so 8 is normally indistinguishable from 50. Write the points out with
+`--zone-points-gpkg` and look at them once for any new zone or weight layer; bad
+placement shows up there and nowhere else.
+
+### Two tiers, so it doesn't cost K times as much
+
+Every access point is a Dijkstra source, so K points per zone means K times the
+searches. But a Dijkstra tree's settled node count grows with the **square** of
+its cutoff — a 15-minute tree is roughly a sixteenth of a 60-minute one — and
+the table above says multiple points only earn their keep at short range. So
+`--near-minutes` splits the run in two:
+
+- **near tier** — every access point, bounded at `--near-minutes`. Accurate
+  exactly where the single-point error lives, including the whole diagonal.
+- **far tier** — one representative point per zone, bounded at `--max-minutes`.
+  The classic single-centroid matrix.
+
+Near values win wherever they exist. Eight points explored to 15 minutes cost
+roughly *half* of one unbounded run, so the two tiers together land close to the
+price of the single-point matrix. Set `--near-minutes` from the zone system
+rather than by feel — five or so zone radii, where the error is already down to
+about 2 %.
+
+A cell whose near tier only partly reached would average over exactly its
+closest point pairs, biasing it low; such cells fall through to the far tier
+instead rather than being reported. That also means a zone pair is resolved only
+when its *furthest* access-point pair is inside the cutoff, so the effective
+reach is roughly `--near-minutes` less the time to cross two zones — budget for
+that rather than being surprised by it. The run logs what share of pairs the
+near tier resolved, which is the number to tune against.
+
+There is no equivalent for `valma assign`: placing demand across a zone means
+every origin access point has to be routed, so `--points-per-zone` is the cost
+dial there. A smaller K (4, say) is usually plenty for assignment, while the
+matrix can afford more.
+
+### What else changes
+
+- **Snapping is no longer free.** A point up to `--max-snap-distance` (1000 m)
+  from the network used to be teleported onto it at no cost — twelve minutes of
+  unpriced walking. Each access point now carries the time to cover its own snap
+  distance, added at both ends of every trip. `--access-speed-kmh` sets the pace
+  (default: the mode's base speed); `--no-access-time` restores the old
+  behaviour.
+- **Intrazonal demand is assigned.** Zone `i`'s own demand is spread over the
+  ordered pairs of its access points, excluding the pair from a point to itself
+  and renormalising so the total is preserved. A zone with only one access point
+  still has nowhere to put it; that is reported, not silently dropped.
+- **The intrazonal travel time is a real number**, averaged over distinct point
+  pairs. Where routing cannot produce one — a single-point zone, or a zone the
+  near tier did not cover — it falls back to the equal-area circle,
+  `0.9054 · R / v` for `R = √(area/π)`. That is a crow-flies estimate, not a
+  routed answer, and it is only ever used to *fill* a missing value, never to
+  overrule one: a zone whose demand really does sit in one corner has genuinely
+  shorter internal trips than a uniform disc of the same area, and finding that
+  out is the whole reason for weighting the points.
 
 ---
 
@@ -414,6 +595,14 @@ things differ:
 Unreachable pairs — including everything beyond `--max-minutes` — are dropped
 with a logged count rather than quietly assigned somewhere.
 
+With `--zones`, the source count is the *access point* count, so
+`--points-per-zone` multiplies the run directly — 8 points per zone means eight
+times the searches. The loading step grows too (K² times as many OD pairs), but
+it stays sparse and remains cheap next to the searches. There is no two-tier
+shortcut here as there is for the matrix: placing demand across a zone means
+every one of its access points genuinely has to be routed. A smaller K is
+usually enough for assignment than for a matrix.
+
 ---
 
 ## Elevation
@@ -483,7 +672,8 @@ src/valma_bike_and_walk/
 ├── links.py       the editable link layer: schema, repair, direction
 ├── network.py     RoutableNetwork: CSR + coords + KD-tree  [stage 2]
 ├── centroids.py   reading points and snapping them to nodes
-├── matrix.py      chunked / parallel OD travel-time matrices
+├── zones.py       zone polygons -> weighted access points inside them
+├── matrix.py      chunked / parallel OD travel-time matrices, point or zone level
 ├── demand.py      reading OD demand (long / .npz / OMX) as a sparse matrix, writing OMX
 ├── assignment.py  all-or-nothing assignment: demand -> per-link volumes
 ├── elevation.py   DEM tiles from the NLS: fetch, cache, height profiles
@@ -491,8 +681,11 @@ src/valma_bike_and_walk/
 └── cli.py         dem / extract / build / matrix / assign
 ```
 
-Data flows one way: `osm` → `links` → `network` → (`centroids` +) `matrix` /
-`assignment` → `gpkg`. Nothing downstream reaches back.
+Data flows one way: `osm` → `links` → `network` → (`centroids` or `zones` +)
+`matrix` / `assignment` → `gpkg`. Nothing downstream reaches back. `zones`
+builds on `centroids` rather than replacing it: a zone's representative point
+*is* a `Centroids`, which is what lets the far tier of a two-tier matrix and the
+plain single-point method be the same code.
 
 ## Development
 
@@ -515,6 +708,8 @@ hand-built link layers and demand matrices, so the whole suite runs in seconds.
 | `test_gpkg.py` | results joining back onto the right rows |
 | `test_pipeline.py` | end to end, including the CLI and an edit in the middle |
 | `test_routing.py` | SciPy routing, checked against NetworkX as an oracle |
+| `test_zones.py` | where access points land, and how they are weighted |
+| `test_zone_matrix.py` | the point-pair-to-zone-pair aggregation arithmetic |
 
 Five invariants hold the design together. Breaking one is what the tests are
 mostly there to catch:

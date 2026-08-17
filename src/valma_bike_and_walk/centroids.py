@@ -53,6 +53,20 @@ class Centroids:
         )
 
 
+def normalise_ids(ids: np.ndarray) -> np.ndarray:
+    """
+    Turn object-dtype ids into fixed-width strings.
+
+    A text column out of pandas or a GeoPackage arrives as ``dtype=object``.
+    ``np.savez`` stores that as a pickle, and ``np.load`` then refuses to read
+    it back without ``allow_pickle`` -- so a matrix keyed on string zone ids
+    would write successfully and be unreadable. Nothing downstream needs object
+    ids, so they are converted once, here at the edge.
+    """
+    ids = np.asarray(ids)
+    return ids.astype(str) if ids.dtype == object else ids
+
+
 def read_points(
     path: Path,
     id_column: str | None = None,
@@ -89,7 +103,7 @@ def read_points(
     if id_column is not None:
         if id_column not in points.columns:
             raise ValueError(f"{path} has no id column {id_column!r}.")
-        ids = points[id_column].to_numpy()
+        ids = normalise_ids(points[id_column].to_numpy())
     else:
         ids = np.arange(len(points))
 

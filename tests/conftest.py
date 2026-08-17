@@ -14,8 +14,10 @@ import osmium.osm.mutable as mutable
 import pytest
 import shapely
 
+from valma_bike_and_walk.centroids import Centroids
 from valma_bike_and_walk.config import WGS84
 from valma_bike_and_walk.network import RoutableNetwork, _build_csr
+from valma_bike_and_walk.zones import Zones
 
 
 def make_network(edges, n_nodes, mode="bike") -> RoutableNetwork:
@@ -50,6 +52,113 @@ def make_network(edges, n_nodes, mode="bike") -> RoutableNetwork:
         length=length,
         link_id=link_id,
         direction=direction,
+    )
+
+
+def make_grid_network(
+    side: int = 5,
+    spacing: float = 100.0,
+    seconds: float = 10.0,
+    mode: str = "bike",
+) -> RoutableNetwork:
+    """
+    A ``side`` x ``side`` grid of nodes, 4-connected, every edge the same cost.
+
+    Node ``row * side + col`` sits at ``(col * spacing, row * spacing)`` in
+    PROJECTED_CRS metres. Zone tests need a network with two dimensions to it --
+    a polygon over a network laid out along a line cannot say much.
+    """
+    u: list[int] = []
+    v: list[int] = []
+    for row in range(side):
+        for col in range(side):
+            node = row * side + col
+            if col + 1 < side:
+                u += [node, node + 1]
+                v += [node + 1, node]
+            if row + 1 < side:
+                u += [node, node + side]
+                v += [node + side, node]
+
+    n_nodes = side * side
+    count = len(u)
+    indptr, indices, travel_time, length, link_id, direction = _build_csr(
+        np.array(u, dtype=np.int64),
+        np.array(v, dtype=np.int64),
+        np.full(count, seconds, dtype=float),
+        np.full(count, spacing, dtype=np.float32),
+        np.arange(count, dtype=np.int64),
+        np.ones(count, dtype=np.int8),
+        n_nodes,
+    )
+    rows, cols = np.divmod(np.arange(n_nodes), side)
+    return RoutableNetwork(
+        mode=mode,
+        node_ids=np.arange(n_nodes, dtype=np.int64),
+        x=cols.astype(float) * spacing,
+        y=rows.astype(float) * spacing,
+        indptr=indptr,
+        indices=indices,
+        travel_time=travel_time,
+        length=length,
+        link_id=link_id,
+        direction=direction,
+    )
+
+
+def make_zones(
+    nodes_per_zone: list[list[int]],
+    weights_per_zone: list[list[float]] | None = None,
+    access_per_zone: list[list[float]] | None = None,
+    ids: list | None = None,
+    area_m2: list[float] | None = None,
+    network: RoutableNetwork | None = None,
+) -> Zones:
+    """
+    Build a :class:`Zones` straight from node lists, skipping :func:`load_zones`.
+
+    For tests about the aggregation arithmetic rather than about where the
+    access points came from. Weights default to uniform within each zone and
+    access time to zero; the representative point of a zone is its first node.
+    """
+    n_zones = len(nodes_per_zone)
+    if weights_per_zone is None:
+        weights_per_zone = [[1.0 / len(n)] * len(n) for n in nodes_per_zone]
+    if access_per_zone is None:
+        access_per_zone = [[0.0] * len(n) for n in nodes_per_zone]
+
+    counts = np.array([len(n) for n in nodes_per_zone], dtype=np.int64)
+    indptr = np.zeros(n_zones + 1, dtype=np.int64)
+    np.cumsum(counts, out=indptr[1:])
+
+    node_index = np.array([n for zone in nodes_per_zone for n in zone], dtype=np.int64)
+    weight = np.array([w for zone in weights_per_zone for w in zone], dtype=float)
+    access = np.array([a for zone in access_per_zone for a in zone], dtype=float)
+
+    if network is not None:
+        x, y = network.x[node_index], network.y[node_index]
+    else:
+        x = y = np.zeros(node_index.shape[0])
+
+    zone_ids = np.array(ids if ids is not None else range(n_zones))
+    first = np.array([zone[0] for zone in nodes_per_zone], dtype=np.int64)
+    return Zones(
+        ids=zone_ids,
+        indptr=indptr,
+        node_index=node_index,
+        weight=weight,
+        access_seconds=access,
+        x=x,
+        y=y,
+        area_m2=np.array(area_m2 if area_m2 is not None else [0.0] * n_zones),
+        representative=Centroids(
+            ids=zone_ids,
+            x=x[indptr[:-1]],
+            y=y[indptr[:-1]],
+            node_index=first,
+            snap_distance=np.zeros(n_zones),
+        ),
+        representative_access_seconds=np.zeros(n_zones),
     )
 
 

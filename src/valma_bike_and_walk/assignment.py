@@ -55,11 +55,12 @@ from pathlib import Path
 from typing import Iterator, Sequence, cast
 
 import numpy as np
-from scipy.sparse import csr_matrix, issparse
+from scipy.sparse import coo_matrix, csr_matrix, diags, issparse
 from scipy.sparse.csgraph import dijkstra
 
 from valma_bike_and_walk.matrix import DEFAULT_CHUNK_BYTES
 from valma_bike_and_walk.network import RoutableNetwork
+from valma_bike_and_walk.zones import Zones
 
 logger = logging.getLogger(__name__)
 
@@ -416,6 +417,165 @@ def assign_traffic(
             dropped_total,
         )
     return link_volume
+
+
+def _intrazonal_pairs(zones: Zones, intrazonal: np.ndarray) -> coo_matrix:
+    """
+    Spread each zone's own demand over the ordered pairs of its access points.
+
+    A zone's intrazonal demand is the one part of an OD matrix a single-centroid
+    model cannot place at all: origin and destination are the same node, the
+    path is empty, and the trips vanish. For walking and cycling that is a large
+    share of all travel and precisely the share that belongs on local streets,
+    so it is worth getting right.
+
+    Pair ``(a, b)`` takes ``D_ii * w_a * w_b``, restricted to ``a != b`` and
+    renormalised by ``1 - sum(w^2)`` so the zone's total demand is preserved
+    rather than quietly losing the self-pair share. A zone with a single access
+    point has no distinct pair to carry its intrazonal demand; those zones are
+    reported and skipped.
+    """
+    indptr = zones.indptr
+    self_weight = zones.self_weight
+
+    rows: list[np.ndarray] = []
+    cols: list[np.ndarray] = []
+    values: list[np.ndarray] = []
+    unplaced = 0.0
+
+    for zone in np.flatnonzero(intrazonal > 0):
+        lo, hi = int(indptr[zone]), int(indptr[zone + 1])
+        scale = 1.0 - float(self_weight[zone])
+        if hi - lo < 2 or scale <= 0:
+            unplaced += float(intrazonal[zone])
+            continue
+
+        points = np.arange(lo, hi)
+        weight = zones.weight[lo:hi]
+        origin = np.repeat(points, points.shape[0])
+        destination = np.tile(points, points.shape[0])
+        value = (
+            float(intrazonal[zone])
+            * np.repeat(weight, weight.shape[0])
+            * np.tile(weight, weight.shape[0])
+            / scale
+        )
+        distinct = origin != destination
+        rows.append(origin[distinct])
+        cols.append(destination[distinct])
+        values.append(value[distinct])
+
+    if unplaced > 0:
+        logger.warning(
+            "%.6g intrazonal demand could not be placed: those zones have only "
+            "one access point, so there is no path inside them to load.",
+            unplaced,
+        )
+
+    n = zones.n_points
+    if not rows:
+        return coo_matrix((n, n), dtype=np.float64)
+    return coo_matrix(
+        (np.concatenate(values), (np.concatenate(rows), np.concatenate(cols))),
+        shape=(n, n),
+    )
+
+
+def expand_demand(
+    demand: np.ndarray | csr_matrix,
+    zones: Zones,
+    exclude_self_pairs: bool = True,
+) -> csr_matrix:
+    """
+    Split a zone-level OD matrix over the zones' weighted access points.
+
+    Zone pair ``(i, j)`` becomes the ``K_i * K_j`` point pairs between their
+    access points, each taking ``D_ij * w_a * w_b`` -- so total demand is
+    conserved and every zone's share leaves and arrives spread across its own
+    area instead of piling onto one node. That is the whole fix for volumes
+    stacking up around a centroid: nothing about the assignment changes, only
+    where the trips start and end.
+
+    The interzonal part is two sparse products, ``W @ D @ W.T``. The intrazonal
+    part is built separately by :func:`_intrazonal_pairs`, because it needs the
+    self-pairs excluded and the rest renormalised.
+
+    Cost is the honest one: nonzeros grow by roughly ``K^2``. At the default K
+    of 8 that is 64x more OD pairs, which is why they stay sparse -- and it
+    costs no extra shortest-path search, since :func:`assign_traffic` runs one
+    Dijkstra per *source*, of which there are ``K`` times as many either way.
+
+    Returns an ``(n_points, n_points)`` CSR matrix ready for
+    :func:`assign_traffic` with ``zones.node_index`` as its sources.
+    """
+    matrix = _as_demand_csr(demand, zones.n_zones, zones.n_zones)
+    weights = zones.weight_matrix()
+
+    intrazonal = matrix.diagonal()
+    interzonal = (matrix - diags(intrazonal, dtype=np.float64)).tocsr()
+    interzonal.eliminate_zeros()
+
+    expanded = (weights @ interzonal @ weights.T).tocsr()
+    if intrazonal.any():
+        if exclude_self_pairs:
+            expanded = (expanded + _intrazonal_pairs(zones, intrazonal)).tocsr()
+        else:
+            expanded = (
+                expanded + weights @ diags(intrazonal, dtype=np.float64) @ weights.T
+            ).tocsr()
+    expanded.sum_duplicates()
+    expanded.eliminate_zeros()
+
+    logger.info(
+        "Expanded %d zone OD pair(s) over %d access point(s): %d point pair(s), "
+        "%.6g total demand (was %.6g)",
+        matrix.nnz,
+        zones.n_points,
+        expanded.nnz,
+        float(expanded.sum()),
+        float(matrix.sum()),
+    )
+    return expanded
+
+
+def assign_zone_traffic(
+    network: RoutableNetwork,
+    zones: Zones,
+    demand: np.ndarray | csr_matrix,
+    max_seconds: float | None = None,
+    exclude_self_pairs: bool = True,
+    workers: int = 1,
+    chunk_size: int | None = None,
+    progress_every: int = 10,
+) -> np.ndarray:
+    """
+    All-or-nothing assignment of a zone-level demand matrix, distributed over access points.
+
+    :func:`expand_demand` followed by :func:`assign_traffic`. ``demand`` is
+    ``(n_zones, n_zones)`` in ``zones.ids`` order; the result is the same
+    per-directed-edge volume array :func:`assign_traffic` returns, so everything
+    downstream -- :func:`link_volume_frame`, the GeoPackage writer -- is
+    unchanged.
+
+    Two things this does that a single-centroid assignment cannot. Trips enter
+    and leave the network across the whole zone, so volumes near a centroid stop
+    being an artefact of where the centroid was put. And intrazonal demand
+    actually loads onto links, instead of being dropped for having no path.
+
+    What it still does not model is the access leg itself: the walk from a
+    building to the nearest network node is charged as *time* in the travel-time
+    matrix but has no link to be loaded onto, so it contributes no volume. That
+    is the right answer for a leg that is off-network by construction.
+    """
+    return assign_traffic(
+        network,
+        zones.node_index,
+        expand_demand(demand, zones, exclude_self_pairs=exclude_self_pairs),
+        max_seconds=max_seconds,
+        workers=workers,
+        chunk_size=chunk_size,
+        progress_every=progress_every,
+    )
 
 
 def link_volume_frame(
