@@ -93,6 +93,119 @@ def test_editing_the_highway_tag_changes_the_speed():
     assert slow["travel_time_s"].iloc[0] > fast["travel_time_s"].iloc[0]
 
 
+def test_traffic_light_penalty_applies_in_both_bike_directions():
+    links = normalise(
+        links_frame(
+            [
+                {
+                    **CHAIN[0],
+                    "crossing": "traffic_signals",
+                }
+            ],
+        ),
+        "bike",
+    )
+    base = links["travel_time_reverse_s"].iloc[0]
+    assert links["travel_time_s"].iloc[0] == pytest.approx(
+        base + links_module.TRAFFIC_LIGHT_PENALTY_SECONDS
+    )
+    edges = directed_edges(links, "bike")
+    assert edges.loc[edges["direction"] == 1, "travel_time_s"].iloc[0] == pytest.approx(
+        base + links_module.TRAFFIC_LIGHT_PENALTY_SECONDS
+    )
+    assert edges.loc[edges["direction"] == -1, "travel_time_s"].iloc[0] == pytest.approx(
+        base + links_module.TRAFFIC_LIGHT_PENALTY_SECONDS
+    )
+    walk_edges = directed_edges(
+        normalise(links_frame([{**CHAIN[0], "crossing": "traffic_signals"}]), "walk"),
+        "walk",
+    )
+    walk_base = walk_edges["travel_time_s"].iloc[0]
+    assert walk_edges["travel_time_s"].tolist() == pytest.approx(
+        [walk_base, walk_base]
+    )
+
+
+def test_non_signal_crossing_has_no_bike_penalty():
+    links = normalise(
+        links_frame([{**CHAIN[0], "crossing": "uncontrolled"}]),
+        "bike",
+    )
+    assert links["travel_time_s"].iloc[0] == pytest.approx(
+        links["travel_time_reverse_s"].iloc[0]
+    )
+
+
+def test_adjacent_signal_gets_penalty_without_crossing_tag():
+    links = normalise(
+        links_frame(
+            [
+                {
+                    **CHAIN[0],
+                    "traffic_signal_at_end": True,
+                }
+            ]
+        ),
+        "bike",
+    )
+    plain = normalise(links_frame([CHAIN[0]]), "bike")
+    assert links["travel_time_s"].iloc[0] == pytest.approx(
+        plain["travel_time_s"].iloc[0] + links_module.TRAFFIC_LIGHT_PENALTY_SECONDS
+    )
+
+
+def test_car_lane_gets_adjacent_signal_penalty():
+    signal = normalise(
+        links_frame(
+            [
+                {
+                    **CHAIN[0],
+                    "highway": "primary",
+                    "crossing": "traffic_signals",
+                    "traffic_signal_at_start": True,
+                    "traffic_signal_at_end": True,
+                }
+            ]
+        ),
+        "bike",
+    )
+    plain = normalise(
+        links_frame([{**CHAIN[0], "highway": "primary"}]),
+        "bike",
+    )
+    assert signal["travel_time_s"].iloc[0] == pytest.approx(
+        plain["travel_time_s"].iloc[0] + links_module.TRAFFIC_LIGHT_PENALTY_SECONDS
+    )
+
+
+def test_car_lane_crossing_tag_without_adjacent_signal_has_no_penalty():
+    signal_tag_only = normalise(
+        links_frame(
+            [{**CHAIN[0], "highway": "primary", "crossing": "traffic_signals"}]
+        ),
+        "bike",
+    )
+    plain = normalise(
+        links_frame([{**CHAIN[0], "highway": "primary"}]),
+        "bike",
+    )
+    assert signal_tag_only["travel_time_s"].iloc[0] == pytest.approx(
+        plain["travel_time_s"].iloc[0]
+    )
+
+
+def test_segregated_cycleway_changes_the_bike_link_speed():
+    shared = normalise(
+        links_frame([{**CHAIN[0], "highway": "cycleway", "segregated": "no"}]),
+        "bike",
+    )
+    separated = normalise(
+        links_frame([{**CHAIN[0], "highway": "cycleway", "segregated": "yes"}]),
+        "bike",
+    )
+    assert separated["speed_kmh"].iloc[0] > shared["speed_kmh"].iloc[0]
+
+
 def test_a_speed_override_wins_over_the_tags():
     forced = normalise(
         links_frame([{**CHAIN[0], "highway": "steps", "speed_override_kmh": 20.0}]),

@@ -27,6 +27,22 @@ def test_surface_slows_cycling_more_than_walking():
     assert bike_penalty < walk_penalty
 
 
+def test_cycleway_is_preferred_to_primary_and_secondary_for_cycling():
+    highway = pd.Series(["cycleway", "primary", "secondary"])
+    speeds = BIKE_PROFILE.speeds_kph(highway, pd.Series(["asphalt"] * 3))
+    assert speeds[0] > speeds[1]
+    assert speeds[0] > speeds[2]
+
+
+def test_segregated_cycleway_is_preferred_to_shared_cycleway():
+    highway = pd.Series(["cycleway", "cycleway"])
+    segregated = pd.Series(["yes", "no"])
+    speeds = BIKE_PROFILE.speeds_kph(
+        highway, pd.Series(["asphalt"] * 2), segregated
+    )
+    assert speeds[0] > speeds[1]
+
+
 def test_speeds_are_clamped_to_profile_range():
     highway = pd.Series(["steps", "cycleway"])
     speeds = BIKE_PROFILE.speeds_kph(highway)
@@ -47,11 +63,11 @@ def test_steps_are_slow_for_both_modes():
 
 
 def test_travel_time_matches_hand_calculation():
-    # 1000 m of cycleway at 18 km/h = 200 s
+    # 1000 m of cycleway at 20 km/h = 180 s
     seconds = BIKE_PROFILE.travel_times_seconds(
         np.array([1000.0]), pd.Series(["cycleway"]), pd.Series(["asphalt"])
     )
-    assert seconds[0] == pytest.approx(1000 / (18 * 1000 / 3600))
+    assert seconds[0] == pytest.approx(1000 / (20 * 1000 / 3600))
 
 
 def test_profile_lookup_rejects_unknown_mode():

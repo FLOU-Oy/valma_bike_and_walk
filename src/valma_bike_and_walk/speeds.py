@@ -35,6 +35,7 @@ class SpeedProfile:
         self,
         highway: pd.Series,
         surface: pd.Series | None = None,
+        segregated: pd.Series | None = None,
     ) -> np.ndarray:
         """
         Vectorised speed lookup for a whole edge table.
@@ -49,6 +50,9 @@ class SpeedProfile:
         else:
             factor = surface.map(self.surface_factor).astype(float).fillna(1.0)
 
+        if segregated is not None and self.name == "bike":
+            factor = factor * segregated.eq("yes").astype(float).mul(0.10).add(1.0)
+
         return np.clip(base * factor, self.min_kph, self.max_kph).to_numpy(dtype=float)
 
     def travel_times_seconds(
@@ -56,9 +60,12 @@ class SpeedProfile:
         length_m: np.ndarray,
         highway: pd.Series,
         surface: pd.Series | None = None,
+        segregated: pd.Series | None = None,
     ) -> np.ndarray:
         """Seconds to traverse each edge, given its length in metres."""
-        speed_ms = self.speeds_kph(highway, surface) * (1000.0 / SECONDS_PER_HOUR)
+        speed_ms = self.speeds_kph(highway, surface, segregated) * (
+            1000.0 / SECONDS_PER_HOUR
+        )
         return np.asarray(length_m, dtype=float) / speed_ms
 
 
@@ -124,7 +131,7 @@ BIKE_PROFILE = SpeedProfile(
     highway_kph={
         "steps": 1.2,
         "elevator": 1.0,
-        "cycleway": 18.0,
+        "cycleway": 20.0,
         "path": 11.0,
         "track": 10.0,
         "bridleway": 8.0,
