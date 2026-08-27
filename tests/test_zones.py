@@ -71,12 +71,8 @@ def test_one_point_per_zone_lands_on_the_weighted_centroid(net, tmp_path):
     # the nodes counted equally.
     nx, ny, nw = network_node_weights(net)
     inside = nx <= 250
-    np.testing.assert_allclose(
-        zones.x[0], (nw[inside] * nx[inside]).sum() / nw[inside].sum()
-    )
-    np.testing.assert_allclose(
-        zones.y[0], (nw[inside] * ny[inside]).sum() / nw[inside].sum()
-    )
+    np.testing.assert_allclose(zones.x[0], (nw[inside] * nx[inside]).sum() / nw[inside].sum())
+    np.testing.assert_allclose(zones.y[0], (nw[inside] * ny[inside]).sum() / nw[inside].sum())
     np.testing.assert_allclose(zones.representative.x[0], zones.x[0])
 
 
@@ -86,10 +82,52 @@ def test_more_points_per_zone_spreads_them_out(net, tmp_path):
     many = load_zones(net, path, id_column="zone_id", points_per_zone=6)
 
     assert many.n_points > one.n_points
-    # And the representative point does not move when K changes: the grid
-    # reduction preserves the weighted mean position exactly.
-    np.testing.assert_allclose(many.representative.x, one.representative.x, atol=1e-6)
-    np.testing.assert_allclose(many.representative.y, one.representative.y, atol=1e-6)
+    # The representative point stays put to within the access-point spacing: it
+    # is the point nearest the weighted mean, and the mean itself does not move
+    # with K because the grid reduction preserves it.
+    assert np.abs(many.representative.x - one.representative.x).max() <= 100.0
+    assert np.abs(many.representative.y - one.representative.y).max() <= 100.0
+
+
+def test_the_representative_is_one_of_the_access_points(net, tmp_path):
+    """
+    A zone in two separated pieces must not be represented by the gap between
+    them. The mean of the two clusters lands mid-network with nothing to route
+    from; the representative has to be somewhere a trip could start.
+    """
+    split = shapely.MultiPolygon([shapely.box(-50, -50, 50, 450), shapely.box(350, -50, 450, 450)])
+    path = write_zones(tmp_path / "zones.gpkg", [split], ids=["SPLIT"])
+    zones = load_zones(net, path, id_column="zone_id", points_per_zone=6)
+
+    points = np.column_stack([zones.x, zones.y])
+    rep = np.array([zones.representative.x[0], zones.representative.y[0]])
+    assert (np.abs(points - rep).sum(axis=1) == 0).any()
+
+    # The access points sit at x <= 50 and x >= 350, so their mean is near 200 --
+    # the middle of the network, in neither piece of the zone.
+    assert 150 <= float((zones.weight * zones.x).sum()) <= 250
+    assert rep[0] <= 50 or rep[0] >= 350
+    # And it snapped to the node it actually sits on.
+    assert net.x[zones.representative.node_index[0]] == pytest.approx(rep[0], abs=1e-6)
+
+
+def test_reduce_points_reaches_k_when_candidates_are_clustered(net, tmp_path):
+    """
+    Two tight clusters far apart must still yield K points, not one per cluster.
+
+    Sizing the grid from the bounding box alone made the very first grid too
+    coarse to separate anything inside a cluster, and coarsening could only make
+    it worse -- so a zone like this collapsed to two points however large K was.
+    """
+    x = np.concatenate([np.linspace(0, 40, 20), np.linspace(9960, 10000, 20)])
+    y = np.zeros(40)
+    w = np.ones(40)
+
+    for k in (2, 4, 8, 16):
+        rx, _, _ = _reduce_points(x, y, w, k)
+        assert rx.shape[0] == k, f"k={k} gave {rx.shape[0]} point(s)"
+        # Both clusters keep representation rather than one swallowing the grid.
+        assert (rx < 1000).any() and (rx > 9000).any()
 
 
 def test_external_weight_points_beat_network_density(net, tmp_path):
@@ -130,9 +168,7 @@ def test_a_zone_far_from_the_network_is_dropped_not_moved(net, tmp_path):
     far = shapely.box(90_000, 90_000, 91_000, 91_000)
     path = write_zones(tmp_path / "zones.gpkg", [LEFT, far], ids=["L", "far"])
 
-    zones = load_zones(
-        net, path, id_column="zone_id", points_per_zone=4, max_snap_distance=500.0
-    )
+    zones = load_zones(net, path, id_column="zone_id", points_per_zone=4, max_snap_distance=500.0)
     np.testing.assert_array_equal(zones.ids, ["L"])
 
 
@@ -141,9 +177,7 @@ def test_access_time_charges_for_the_snap_distance(net, tmp_path):
     offset = shapely.box(30, 30, 70, 70)  # 40 m box, nearest node is (0, 0)
     path = write_zones(tmp_path / "zones.gpkg", [offset])
 
-    charged = load_zones(
-        net, path, id_column="zone_id", points_per_zone=1, access_speed_kmh=3.6
-    )
+    charged = load_zones(net, path, id_column="zone_id", points_per_zone=1, access_speed_kmh=3.6)
     free = load_zones(
         net,
         path,
@@ -154,9 +188,7 @@ def test_access_time_charges_for_the_snap_distance(net, tmp_path):
     )
 
     # 3.6 km/h is 1 m/s, so access seconds equal the snap distance in metres.
-    assert charged.access_seconds[0] == pytest.approx(
-        float(np.hypot(50.0, 50.0)), rel=1e-6
-    )
+    assert charged.access_seconds[0] == pytest.approx(float(np.hypot(50.0, 50.0)), rel=1e-6)
     assert free.access_seconds[0] == 0.0
 
 

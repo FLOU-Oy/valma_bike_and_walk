@@ -45,13 +45,34 @@ back to a single point beyond a few zone radii.
   measures how finely OSM is tagged as much as how dense the streets are.
 
 **Reducing to K.** However many candidates a zone has, they are reduced to at
-most ``points_per_zone`` by laying a grid over the zone, coarsening it until at
-most K cells are occupied, and taking each occupied cell's weighted centroid.
-That is stratified sampling rather than random sampling: it is deterministic
-(no seed to record, no run-to-run drift), it spreads points over the zone by
-construction, and it preserves the weighted mean position exactly -- so ``K=1``
-falls out of the same code as the weighted centroid, and the representative
-point of a zone is the same whatever ``K`` is.
+most ``points_per_zone`` by laying a grid over the zone, sizing it to hold as
+close to K occupied cells as it can without exceeding them, and taking each
+occupied cell's weighted centroid. That is stratified sampling rather than
+random sampling: it is deterministic (no seed to record, no run-to-run drift),
+it spreads points over the zone by construction, and it preserves the weighted
+mean position exactly -- so ``K=1`` falls out of the same code as the weighted
+centroid.
+
+Sizing that grid is the fiddly part, and is why :func:`_fit_grid_cell` searches
+for it rather than guessing. Candidates are clustered, not spread evenly over
+the zone's bounding box, so a grid scaled from the box alone is normally far
+too coarse before it has done anything: a zone of twenty nodes in two clusters
+would come back as two points however large K was.
+
+**The single-point view.** ``representative`` is one of the access points --
+the one whose weighted mean distance to the others is smallest -- rather than
+the weighted mean position itself. For a compact zone the two are the same place
+to within the point spacing. For one whose streets come in separated clusters --
+an archipelago, a zone split by a bay, a ring drawn around somewhere else -- the
+mean sits in the gap between them, where there is no street to route from, and
+snapping it lands on whichever node happens to be within reach: a point carrying
+none of the zone's demand, chosen by nothing but proximity to open water. Since
+that one point carries the far tier of every matrix built from these zones, and
+the far tier is most of the matrix, it has to be somewhere trips could actually
+start. Picking an access point makes it so by construction, and picking the
+1-median rather than the nearest-to-mean keeps it in the heavier cluster. The
+price is that the single-point view no longer reproduces the weighted centroid
+exactly once K > 1.
 
 **Access time.** Snapping teleports a point to its nearest node for free, which
 at walking pace can quietly gift a trip twelve minutes over the 1000 m default
@@ -94,15 +115,25 @@ DEFAULT_POINTS_PER_ZONE = 8
 #: more memory than the network does; in batches it costs nothing.
 _JOIN_CHUNK = 200_000
 
-#: Safety valve on the grid-coarsening loop in :func:`_reduce_points`.
+#: Safety valve on the search for a grid coarse enough to hold at most K cells.
 _MAX_COARSEN_STEPS = 64
 
+#: Bisection steps used to refine that grid back down to the finest one that
+#: still fits. Each halves the bracket, which is far more precision than a cell
+#: size needs, and costs one sort of the zone's candidates apiece.
+_GRID_BISECT_STEPS = 16
 
-def _group_starts(counts: np.ndarray) -> np.ndarray:
-    """Group start offsets for ``np.add.reduceat``, from per-group counts."""
-    starts = np.zeros(counts.shape[0], dtype=np.int64)
-    np.cumsum(counts[:-1], out=starts[1:])
-    return starts
+#: How far a zone's representative point may sit from its weighted mean before
+#: it is worth saying so. Below this the two are the same point for practical
+#: purposes; well above it, the zone is in separated pieces.
+_REPRESENTATIVE_OFFSET_WARN_M = 500.0
+
+
+def _group_bounds(counts: np.ndarray) -> np.ndarray:
+    """CSR-style ``(n_groups + 1,)`` offsets from per-group counts."""
+    bounds = np.zeros(counts.shape[0] + 1, dtype=np.int64)
+    np.cumsum(counts, out=bounds[1:])
+    return bounds
 
 
 @dataclass
@@ -116,10 +147,10 @@ class Zones:
     aggregating a per-point quantity up to zone level is one ``reduceat``.
 
     ``weight`` sums to 1 within every zone. ``representative`` holds the
-    single-point view of the same zones (the weighted mean position, snapped),
-    positionally aligned with ``ids`` -- that is what the far tier of a two-tier
-    matrix routes from, and what keeps "one point per zone" available as a
-    method rather than as a separate code path.
+    single-point view of the same zones -- their most central access point, in
+    the weighted 1-median sense -- positionally aligned with ``ids``. That is
+    what the far tier of a two-tier matrix routes from, and what keeps "one
+    point per zone" available as a method rather than as a separate code path.
     """
 
     ids: np.ndarray  # (n_zones,)
@@ -281,9 +312,7 @@ def read_weight_points(
         frame = pd.read_csv(path, sep=None, engine="python")
         missing = [c for c in (x_column, y_column) if c not in frame.columns]
         if missing:
-            raise ValueError(
-                f"{path} has no column(s) {missing}; available: {list(frame.columns)}"
-            )
+            raise ValueError(f"{path} has no column(s) {missing}; available: {list(frame.columns)}")
         points = gpd.GeoDataFrame(
             frame,
             geometry=gpd.points_from_xy(frame[x_column], frame[y_column]),
@@ -299,8 +328,7 @@ def read_weight_points(
     if weight_column is not None:
         if weight_column not in points.columns:
             raise ValueError(
-                f"{path} has no weight column {weight_column!r}; "
-                f"available: {list(points.columns)}"
+                f"{path} has no weight column {weight_column!r}; available: {list(points.columns)}"
             )
         weight = points[weight_column].to_numpy(dtype=float)
         weight = np.clip(np.nan_to_num(weight, nan=0.0, posinf=0.0), 0.0, None)
@@ -345,9 +373,7 @@ def network_node_weights(
     return network.x, network.y, 0.5 * weight
 
 
-def _zone_of_points(
-    x: np.ndarray, y: np.ndarray, geometry: gpd.GeoSeries
-) -> np.ndarray:
+def _zone_of_points(x: np.ndarray, y: np.ndarray, geometry: gpd.GeoSeries) -> np.ndarray:
     """
     Which zone each candidate point falls in; -1 for none.
 
@@ -375,16 +401,68 @@ def _zone_of_points(
     return out
 
 
+def _cell_keys(x: np.ndarray, y: np.ndarray, x0: float, y0: float, cell: float) -> np.ndarray:
+    """Which cell of a square grid of side ``cell`` each candidate falls in."""
+    columns = np.floor((x - x0) / cell).astype(np.int64)
+    rows = np.floor((y - y0) / cell).astype(np.int64)
+    return rows * (int(columns.max()) + 2) + columns
+
+
+def _fit_grid_cell(
+    x: np.ndarray, y: np.ndarray, x0: float, y0: float, span: float, k: int
+) -> float | None:
+    """
+    Side of the finest square grid whose occupied cells number at most ``k``.
+
+    Occupancy only falls as the cell grows, so this coarsens until it finds a
+    size that fits and then bisects back down towards the finest one that still
+    does -- landing as close to ``k`` cells as the candidates allow.
+
+    The bisection is the part that matters. ``span / sqrt(k)`` scales the grid
+    as though the candidates were spread evenly over their bounding box, which
+    is right for a zone whose streets fill it and badly wrong for one whose
+    streets sit in a couple of clusters. In the second case that first grid
+    already holds fewer than ``k`` cells, and coarsening -- the only direction
+    the search used to run -- can never recover the points it has thrown away.
+
+    Returns None if no grid coarse enough turned up, which needs candidate
+    spacing pathological enough that ``_MAX_COARSEN_STEPS`` steps of growing the
+    cell did not bring the count down to ``k``.
+    """
+    cell = span / np.sqrt(k)
+    for _ in range(_MAX_COARSEN_STEPS):
+        if np.unique(_cell_keys(x, y, x0, y0, cell)).size <= k:
+            break
+        cell *= 1.3
+    else:
+        return None
+
+    lo, hi = 0.0, cell
+    for _ in range(_GRID_BISECT_STEPS):
+        mid = 0.5 * (lo + hi)
+        if mid <= 0.0:
+            break
+        occupied = np.unique(_cell_keys(x, y, x0, y0, mid)).size
+        if occupied <= k:
+            hi = mid
+            if occupied == k:
+                break
+        else:
+            lo = mid
+    return hi
+
+
 def _reduce_points(
     x: np.ndarray, y: np.ndarray, weight: np.ndarray, k: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Reduce one zone's candidates to at most ``k`` weighted points.
 
-    Lay a square grid over the candidates, coarsen it until at most ``k`` cells
-    are occupied, then collapse each occupied cell to its weighted centroid.
-    Deterministic, and it preserves the weighted mean position exactly: summing
-    ``w_c * centroid_c`` over cells gives back ``sum(w_i * x_i)``.
+    Lay a square grid over the candidates, sized by :func:`_fit_grid_cell` to
+    hold as many occupied cells as it can without passing ``k``, then collapse
+    each occupied cell to its weighted centroid. Deterministic, and it preserves
+    the weighted mean position exactly: summing ``w_c * centroid_c`` over cells
+    gives back ``sum(w_i * x_i)``.
     """
     if x.shape[0] <= k:
         return x, y, weight
@@ -397,33 +475,61 @@ def _reduce_points(
     if span <= 0:  # every candidate at the same spot
         return x[:1].copy(), y[:1].copy(), np.array([float(weight.sum())])
 
-    cell = span / np.sqrt(k)
-    inverse = np.zeros(x.shape[0], dtype=np.int64)
-    n_cells = x.shape[0]
-    for _ in range(_MAX_COARSEN_STEPS):
-        columns = np.floor((x - x0) / cell).astype(np.int64)
-        rows = np.floor((y - y0) / cell).astype(np.int64)
-        _, inverse = np.unique(
-            rows * (int(columns.max()) + 2) + columns, return_inverse=True
-        )
-        inverse = np.ravel(inverse)
-        n_cells = int(inverse.max()) + 1
-        if n_cells <= k:
-            break
-        cell *= 1.3
+    cell = _fit_grid_cell(x, y, x0, y0, span, k)
+    if cell is None:
+        # No grid fitted (pathological spacing). Keep the heaviest candidates;
+        # weights are renormalised per zone afterwards regardless.
+        keep = np.sort(np.argsort(weight)[::-1][:k])
+        return x[keep], y[keep], weight[keep]
+
+    _, inverse = np.unique(_cell_keys(x, y, x0, y0, cell), return_inverse=True)
+    inverse = np.ravel(inverse)
+    n_cells = int(inverse.max()) + 1
 
     cell_weight = np.bincount(inverse, weights=weight, minlength=n_cells)
     safe = np.where(cell_weight > 0, cell_weight, 1.0)
     cell_x = np.bincount(inverse, weights=weight * x, minlength=n_cells) / safe
     cell_y = np.bincount(inverse, weights=weight * y, minlength=n_cells) / safe
-
-    if n_cells > k:
-        # Coarsening ran out of steps (pathological spacing). Keep the heaviest
-        # cells; weights are renormalised per zone afterwards regardless.
-        keep = np.sort(np.argsort(cell_weight)[::-1][:k])
-        cell_x, cell_y, cell_weight = cell_x[keep], cell_y[keep], cell_weight[keep]
-
     return cell_x, cell_y, cell_weight
+
+
+def _representative_points(
+    bounds: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+    weight: np.ndarray,
+    usable: np.ndarray,
+) -> np.ndarray:
+    """
+    Each zone's most central access point; -1 for a zone with none.
+
+    Central in the 1-median sense: the point whose weighted mean distance to the
+    zone's other access points is smallest. Deliberately not the point nearest
+    the weighted mean *position* -- the mean of a zone in separated pieces sits
+    in the gap between them, and the point nearest a gap can as easily be in the
+    lighter piece as the heavier one. Minimising weighted distance puts the
+    representative where most of the zone's demand actually is.
+
+    Only points that snapped are eligible, and only they carry demand, so what
+    comes back always has a network node behind it and a zone is dropped for
+    exactly one reason: nothing inside it reached the network. Ties go to the
+    lowest-numbered point, which keeps the choice deterministic.
+    """
+    n_zones = bounds.shape[0] - 1
+    chosen = np.full(n_zones, -1, dtype=np.int64)
+
+    for zone in range(n_zones):
+        lo, hi = int(bounds[zone]), int(bounds[zone + 1])
+        local = np.flatnonzero(usable[lo:hi])
+        if local.size == 0:
+            continue
+        px, py = x[lo:hi][local], y[lo:hi][local]
+        cost = (
+            np.hypot(px[:, None] - px[None, :], py[:, None] - py[None, :]) * weight[lo:hi][local]
+        ).sum(axis=1)
+        chosen[zone] = lo + int(local[int(cost.argmin())])
+
+    return chosen
 
 
 def _place_access_points(
@@ -536,8 +642,7 @@ def _merge_shared_nodes(
         return zone_index, node_index, weight, access, x, y
 
     logger.info(
-        "Merged %d access point(s) sharing a network node with another in the "
-        "same zone",
+        "Merged %d access point(s) sharing a network node with another in the same zone",
         key.shape[0] - n_points,
     )
     merged_weight = np.bincount(inverse, weights=weight, minlength=n_points)
@@ -605,49 +710,66 @@ def load_zones(
     )
 
     speed_kmh = (
-        access_speed_kmh
-        if access_speed_kmh is not None
-        else profile_for(network.mode).base_kph
+        access_speed_kmh if access_speed_kmh is not None else profile_for(network.mode).base_kph
     )
     if speed_kmh <= 0:
         raise ValueError(f"access_speed_kmh must be positive, got {speed_kmh}.")
     metres_per_second = speed_kmh * (1000.0 / SECONDS_PER_HOUR)
 
-    node_index, snap_distance = network.nearest_nodes(
-        x, y, max_distance=max_snap_distance
-    )
-
-    # The representative point is the weighted mean of the access points, which
-    # -- because the grid reduction preserves the weighted centroid -- is also
-    # the weighted mean of every candidate that went into them. Computed before
-    # any unsnappable point is dropped, so it does not move when they are.
-    starts = _group_starts(np.bincount(zone_index, minlength=n_zones))
-    rep_x = np.add.reduceat(weight * x, starts)
-    rep_y = np.add.reduceat(weight * y, starts)
-    rep_node, rep_distance = network.nearest_nodes(
-        rep_x, rep_y, max_distance=max_snap_distance
-    )
+    node_index, snap_distance = network.nearest_nodes(x, y, max_distance=max_snap_distance)
 
     keep_point = node_index >= 0
     if not keep_point.all():
         logger.warning(
-            "%d of %d access point(s) are further than %.0f m from any %s node "
-            "and were dropped",
+            "%d of %d access point(s) are further than %.0f m from any %s node and were dropped",
             int((~keep_point).sum()),
             keep_point.shape[0],
             max_snap_distance,
             network.mode,
         )
 
-    keep_zone = (np.bincount(zone_index[keep_point], minlength=n_zones) > 0) & (
-        rep_node >= 0
-    )
+    # The weighted mean of the access points is -- because the grid reduction
+    # preserves the weighted centroid -- also the weighted mean of every
+    # candidate that went into them. It is where the zone sits, but not
+    # necessarily anywhere a trip could start from, so the representative point
+    # is an access point rather than the mean itself. See the module docstring;
+    # the short version is that a zone in separated pieces has its mean in the
+    # water between them. The mean is still worth computing: how far the chosen
+    # point ends up from it is exactly the diagnostic for that.
+    bounds = _group_bounds(np.bincount(zone_index, minlength=n_zones))
+    mean_x = np.add.reduceat(weight * x, bounds[:-1])
+    mean_y = np.add.reduceat(weight * y, bounds[:-1])
+    chosen = _representative_points(bounds, x, y, weight, keep_point)
+
+    keep_zone = chosen >= 0
     if not keep_zone.all():
         logger.warning(
             "Dropping %d zone(s) with no access point that snaps to the network",
             int((~keep_zone).sum()),
         )
     keep_point &= keep_zone[zone_index]
+
+    # Read the representative off the flat arrays now, before _merge_shared_nodes
+    # rebinds them.
+    rep = chosen[keep_zone]
+    rep_x, rep_y = x[rep], y[rep]
+    rep_node, rep_distance = node_index[rep], snap_distance[rep]
+
+    offset = np.hypot(rep_x - mean_x[keep_zone], rep_y - mean_y[keep_zone])
+    scattered = offset > _REPRESENTATIVE_OFFSET_WARN_M
+    if scattered.any():
+        logger.warning(
+            "%d zone(s) have no access point within %.0f m of their weighted mean "
+            "position, so their single-point view sits %.0f m away at the median "
+            "and %.0f m at worst. That is what a zone in separated pieces looks "
+            "like -- an archipelago, or a ring drawn around another zone. The far "
+            "tier of every matrix routes from these points, so they are worth a "
+            "look in --zone-points-gpkg.",
+            int(scattered.sum()),
+            _REPRESENTATIVE_OFFSET_WARN_M,
+            float(np.median(offset[scattered])),
+            float(offset.max()),
+        )
 
     remap = np.full(n_zones, -1, dtype=np.int64)
     remap[keep_zone] = np.arange(int(keep_zone.sum()))
@@ -668,7 +790,7 @@ def load_zones(
     totals = np.add.reduceat(weight, indptr[:-1])
     weight = weight / np.repeat(np.where(totals > 0, totals, 1.0), counts)
 
-    rep_access = rep_distance[keep_zone] / metres_per_second
+    rep_access = rep_distance / metres_per_second
     zones = Zones(
         ids=np.asarray(ids)[keep_zone],
         indptr=indptr,
@@ -680,10 +802,10 @@ def load_zones(
         area_m2=geometry.area.to_numpy(dtype=float)[keep_zone],
         representative=Centroids(
             ids=np.asarray(ids)[keep_zone],
-            x=rep_x[keep_zone],
-            y=rep_y[keep_zone],
-            node_index=rep_node[keep_zone],
-            snap_distance=rep_distance[keep_zone],
+            x=rep_x,
+            y=rep_y,
+            node_index=rep_node,
+            snap_distance=rep_distance,
         ),
         representative_access_seconds=(
             rep_access if charge_access_time else np.zeros(int(keep_zone.sum()))
