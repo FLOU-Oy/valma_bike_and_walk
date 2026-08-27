@@ -298,9 +298,11 @@ def cmd_dem(args: argparse.Namespace) -> int:
     cache = _dem_cache(args, settings)
 
     if args.links is not None:
+        logger.info("Reading link layer from %s", args.links)
         links = links_module.read_links(args.links)
         links = add_elevation(links, cache, workers=args.dem_workers)
         out = args.out or args.links
+        logger.info("Writing link layer to %s", out)
         links_module.write_links(links, out)
         print(f"Elevation written to {out} ({len(links):,} links)")
         rise = links["ascent_m"].to_numpy()

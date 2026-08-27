@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import ssl
 import time
 import urllib.error
@@ -66,6 +67,7 @@ import pandas as pd
 import shapely
 
 from valma_bike_and_walk.config import PROJECTED_CRS
+from valma_bike_and_walk.progress import Progress
 
 logger = logging.getLogger(__name__)
 
@@ -586,12 +588,10 @@ class DemCache:
                 len(outstanding),
             )
 
-        done = 0
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            for _ in pool.map(self.fetch, outstanding):
-                done += 1
-                if done % 25 == 0 or done == len(outstanding):
-                    logger.info("  %d/%d tiles", done, len(outstanding))
+        with Progress(len(outstanding), "  downloading tiles") as progress:
+            with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+                for _ in pool.map(self.fetch, outstanding):
+                    progress.advance()
 
         return [self.path(tile) for tile in wanted]
 
@@ -617,30 +617,36 @@ class DemCache:
         keys = np.column_stack([cols, rows])
         unique, inverse = np.unique(keys, axis=0, return_inverse=True)
 
-        for i, (col, row) in enumerate(unique):
-            tile = Tile(int(col), int(row), self.tile_m, self.resolution_m)
-            path = self.path(tile)
-            if not path.exists():
-                logger.warning(
-                    "No cached DEM tile for %s; leaving those NaN", tile.filename
-                )
-                continue
+        logger.info("Reading %d height(s) from %d DEM tile(s)", east.size, len(unique))
+        with Progress(len(unique), "  reading tiles") as progress:
+            for i, (col, row) in enumerate(unique):
+                tile = Tile(int(col), int(row), self.tile_m, self.resolution_m)
+                path = self.path(tile)
+                if not path.exists():
+                    logger.warning(
+                        "No cached DEM tile for %s; leaving those NaN", tile.filename
+                    )
+                    progress.advance()
+                    continue
 
-            selected = np.flatnonzero(inverse == i)
-            with rasterio.open(path) as dataset:
-                values = np.fromiter(
-                    (
-                        v[0]
-                        for v in dataset.sample(zip(east[selected], north[selected]))
-                    ),
-                    dtype=float,
-                    count=selected.size,
-                )
-                nodata = dataset.nodata
-            values[values == NODATA] = np.nan
-            if nodata is not None:
-                values[values == nodata] = np.nan
-            heights[selected] = values
+                selected = np.flatnonzero(inverse == i)
+                with rasterio.open(path) as dataset:
+                    values = np.fromiter(
+                        (
+                            v[0]
+                            for v in dataset.sample(
+                                zip(east[selected], north[selected])
+                            )
+                        ),
+                        dtype=float,
+                        count=selected.size,
+                    )
+                    nodata = dataset.nodata
+                values[values == NODATA] = np.nan
+                if nodata is not None:
+                    values[values == nodata] = np.nan
+                heights[selected] = values
+                progress.advance()
 
         return heights
 
@@ -654,7 +660,136 @@ def _require_rasterio():
             "dependency: pip install 'valma_bike_and_walk[dem]'. Downloading "
             "them does not."
         ) from error
+    _prepare_gdal(rasterio)
     return rasterio
+
+
+# --------------------------------------------------------------------------
+# Making GDAL usable on a machine that has other GIS software on it
+# --------------------------------------------------------------------------
+
+#: Where GDAL looks for its PROJ database, newest name first.
+PROJ_DATA_ENV: tuple[str, ...] = ("PROJ_DATA", "PROJ_LIB")
+
+_gdal_prepared = False
+
+
+def _prepare_gdal(rasterio) -> None:
+    """Repair the PROJ path and stop GDAL repeating itself. Runs once."""
+    global _gdal_prepared
+    if _gdal_prepared:
+        return
+    _gdal_prepared = True
+    _repair_proj_data(rasterio)
+    _quieten_repeated_gdal_messages()
+
+
+def _proj_layout_version(directory: Path) -> tuple[int, int] | None:
+    """
+    Layout version of the ``proj.db`` in this directory, None if there is none.
+
+    PROJ refuses a database whose layout is older than the library reading it,
+    and records that layout in the database itself, so this is the same number
+    the complaint in the GDAL warning quotes.
+    """
+    database = directory / "proj.db"
+    if not database.is_file():
+        return None
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        try:
+            rows = dict(
+                connection.execute(
+                    "SELECT key, value FROM metadata "
+                    "WHERE key LIKE 'DATABASE.LAYOUT.VERSION.%'"
+                )
+            )
+        finally:
+            connection.close()
+        return (
+            int(rows["DATABASE.LAYOUT.VERSION.MAJOR"]),
+            int(rows["DATABASE.LAYOUT.VERSION.MINOR"]),
+        )
+    except (sqlite3.Error, KeyError, ValueError, OSError):
+        return None
+
+
+def _repair_proj_data(rasterio) -> None:
+    """
+    Point GDAL at a PROJ database it can actually read.
+
+    ``PROJ_DATA`` (and the older ``PROJ_LIB``) is a machine-wide setting, and
+    on Windows more or less anything that ships PROJ sets it -- PostgreSQL with
+    PostGIS notably does. GDAL then reads *that* proj.db rather than the one
+    rasterio brings with it, and if it is the older of the two, every single
+    raster we open complains twice: once that the database layout is too old,
+    and once that it therefore could not match the file's CRS against the EPSG
+    registry. Six thousand tiles, twelve thousand warnings, and the CRS comes
+    back as an unnamed local system instead of EPSG:3067.
+
+    So when the database the environment points at is older than the one beside
+    rasterio, we prefer rasterio's. GDAL reads the variable the first time it
+    needs PROJ, which has not happened yet at import time, so setting it here is
+    still early enough. A newer database is left alone -- someone who installed
+    a current PROJ, with grid shifts we do not ship, should keep it. Nothing is
+    set that was not already set: an environment that says nothing about PROJ
+    already gets rasterio's own copy.
+    """
+    bundled = Path(rasterio.__file__).parent / "proj_data"
+    bundled_version = _proj_layout_version(bundled)
+    if bundled_version is None:  # pragma: no cover - a non-wheel rasterio
+        return
+
+    for variable in PROJ_DATA_ENV:
+        current = os.environ.get(variable)
+        if not current:
+            continue
+        # The variable is a search path, so one usable entry is enough.
+        versions = [
+            _proj_layout_version(Path(entry))
+            for entry in current.split(os.pathsep)
+            if entry
+        ]
+        if any(
+            version is not None and version >= bundled_version for version in versions
+        ):
+            continue
+        logger.info(
+            "%s=%s has no PROJ database GDAL can read; using rasterio's at %s",
+            variable,
+            current,
+            bundled,
+        )
+        os.environ[variable] = str(bundled)
+
+
+class _SayItOnce(logging.Filter):
+    """Pass each distinct message through the first time and no more."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._seen: set[str] = set()
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if message in self._seen:
+            return False
+        self._seen.add(message)
+        return True
+
+
+def _quieten_repeated_gdal_messages() -> None:
+    """
+    Let GDAL say each thing once instead of once per tile.
+
+    GDAL's complaints are about the environment, not about the file in hand, so
+    reading a few thousand tiles reproduces the same two or three lines a few
+    thousand times and buries everything else. Deduplicating is not the same as
+    silencing: whatever GDAL has to say is still said, in full, the first time
+    it says it -- and ``--verbose`` is unaffected, since the filter drops
+    repeats rather than lowering a level.
+    """
+    logging.getLogger("rasterio._env").addFilter(_SayItOnce())
 
 
 # --------------------------------------------------------------------------
@@ -726,6 +861,9 @@ def link_profiles(
     route. Flat is wrong for a bridge that genuinely rises, but it is wrong by
     far less, and ``grade_override`` is there for the ones that matter.
     """
+    logger.info(
+        "Laying out sample points every %g m along %d link(s)", spacing_m, len(links)
+    )
     link_index, east, north, counts = _sample_positions(links, spacing_m)
     z = np.asarray(sampler(east, north), dtype=float)
     if z.shape != east.shape:

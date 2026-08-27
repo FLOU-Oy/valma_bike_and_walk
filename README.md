@@ -731,6 +731,21 @@ endpoint. Gentler adjacent grades are retained. The resulting ascent and
 descent values are used directionally by routing; downhill travel receives no
 surcharge.
 
+Both slow phases — downloading tiles and reading heights back out of them —
+report progress with an estimate of the time left. On a terminal that is one
+line rewritten in place; redirected to a file it becomes an ordinary log line
+every couple of seconds.
+
+**If GDAL complains about PROJ.** On Windows, anything that ships PROJ tends to
+set the machine-wide `PROJ_DATA` / `PROJ_LIB` (PostgreSQL with PostGIS is the
+usual culprit), and GDAL then reads *that* PROJ database instead of the one
+rasterio brings with it. When it is the older of the two, every raster opened
+warns twice and the tile's CRS comes back as an unnamed local system rather than
+EPSG:3067. `valma dem` compares the two databases and prefers rasterio's when the
+one in the environment is too old, logging one line when it does; a newer PROJ,
+which may carry grid shifts we do not ship, is left alone. Whatever GDAL still
+has to say is logged once rather than once per tile.
+
 ## Layout
 
 ```
@@ -746,6 +761,7 @@ src/valma_bike_and_walk/
 ├── demand.py      reading OD demand (long / .npz / OMX) as a sparse matrix, writing OMX
 ├── assignment.py  all-or-nothing assignment: demand -> per-link volumes
 ├── elevation.py   DEM tiles from the NLS: fetch, cache, height profiles
+├── progress.py    a progress line with an ETA, for the slow loops
 ├── gpkg.py        draw a per-edge result back onto the link layer
 └── cli.py         dem / extract / build / matrix / assign
 ```
