@@ -709,18 +709,27 @@ Ascent and descent are kept apart rather than netted off: a link that climbs ten
 metres and drops them again costs nothing like a flat one, and the two swap
 places when it is traversed backwards.
 
+For routing, uphill grades below 2.5% receive no penalty. Grades from 2.5% to
+5% add `2.32 * gradient * length_m` seconds, and grades above 5% add
+`2.50 * gradient * length_m` seconds, where `gradient` is the decimal grade
+(`ascent_m / length_m`). Downhill travel receives no surcharge. In the reverse
+direction, the original `descent_m` is treated as ascent because that direction
+is uphill on the same link.
+is uphill on the same link. Grades of 20% or more are treated as unrealistic DEM
+artefacts and receive no elevation surcharge in that direction.
+
 Two things are deliberate and worth knowing. Profiles are read at a fixed 25 m
 spacing rather than at the geometry's own vertices, so a long two-vertex link
 cannot hide a hill between its ends. And steps below 0.5 m are read as noise and
 dropped — without that dead band, sampling a flat road picks up the kerb and the
 ditch either side of it and reports a climb that is not there. Links tagged
 `bridge` or `tunnel` are forced flat, because MML's model is a *terrain* model:
-it reports the valley floor under a bridge and the hilltop over a tunnel.
-
-> **Not yet wired into routing.** `valma build` does not read these columns.
-> Travel time is still one scalar per link, applied to both directions, so a hill
-> currently costs the same up as down. Making slope bite means splitting
-> `travel_time_s` per direction in `links.directed_edges`.
+it reports the valley floor under a bridge and the hilltop over a tunnel. A
+profile change above 15% on a link immediately next to one of these structures is
+also discarded, as the same terrain artefact can spill over the structure's
+endpoint. Gentler adjacent grades are retained. The resulting ascent and
+descent values are used directionally by routing; downhill travel receives no
+surcharge.
 
 ## Layout
 

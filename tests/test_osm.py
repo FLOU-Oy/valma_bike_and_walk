@@ -129,6 +129,34 @@ def test_tags_are_carried_onto_every_link_of_their_way(grid_pbf, tmp_path):
     assert links[links["osm_way_id"] == 101].iloc[0]["oneway"] == "yes"
 
 
+def test_signal_crossing_tag_is_carried_onto_links(tmp_path):
+    nodes = {1: (24.000, 60.000), 2: (24.002, 60.000)}
+    pbf = write_pbf(
+        tmp_path / "signals.osm.pbf",
+        nodes,
+        [(1, [1, 2], {"highway": "cycleway"})],
+        node_tags={2: {"crossing": "traffic_signals"}},
+    )
+    links = read_links(settings_for(pbf, tmp_path), "bike")
+    row = links.iloc[0]
+    assert row["crossing"] == "traffic_signals"
+    assert row["traffic_signal_at_end"]
+    assert not row["traffic_signal_at_start"]
+
+
+def test_traffic_signal_intersection_node_is_carried_onto_links(tmp_path):
+    nodes = {1: (24.000, 60.000), 2: (24.002, 60.000)}
+    pbf = write_pbf(
+        tmp_path / "intersection-signals.osm.pbf",
+        nodes,
+        [(1, [1, 2], {"highway": "cycleway"})],
+        node_tags={2: {"highway": "traffic_signals"}},
+    )
+    links = read_links(settings_for(pbf, tmp_path), "bike")
+    assert links.iloc[0]["crossing"] == "traffic_signals"
+    assert links.iloc[0]["traffic_signal_at_end"]
+
+
 def test_a_bbox_keeps_only_ways_that_reach_into_it(grid_pbf, tmp_path):
     links = read_links(
         settings_for(grid_pbf, tmp_path),

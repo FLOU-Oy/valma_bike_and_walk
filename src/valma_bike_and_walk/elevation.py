@@ -154,6 +154,10 @@ PROFILE_SPACING_M = 25.0
 #: phantom-ascent problem a GPS track has.
 DEAD_BAND_M = 0.5
 
+# A terrain-model spike at a bridge or tunnel can spill into its neighbouring
+# link. Only steep changes are treated as that artefact; gentler grades remain.
+STRUCTURE_ADJACENT_GRADE = 0.15
+
 #: Value MML writes where it has no measurement.
 NODATA = -9999.0
 
@@ -770,6 +774,8 @@ def link_profiles(
         profile.loc[flat, ["ascent_m", "descent_m"]] = 0.0
         profile.loc[flat, "z_v"] = profile.loc[flat, "z_u"]
 
+    _remove_structure_adjacent_spikes(links, profile, flat)
+
     return profile
 
 
@@ -781,6 +787,42 @@ def _structure_mask(links: gpd.GeoDataFrame) -> np.ndarray:
             values = links[column].astype("object")
             mask |= values.notna().to_numpy() & (values != "no").to_numpy()
     return mask
+
+
+def _remove_structure_adjacent_spikes(
+    links: gpd.GeoDataFrame, profile: pd.DataFrame, structure: np.ndarray
+) -> None:
+    """Discard steep DEM changes on links touching a bridge or tunnel."""
+    if not structure.any() or not {"u", "v"}.issubset(links.columns):
+        return
+
+    endpoints = links[["u", "v"]].apply(pd.to_numeric, errors="coerce").to_numpy()
+    structure_nodes = np.unique(endpoints[structure][np.isfinite(endpoints[structure])])
+    adjacent = np.isin(endpoints, structure_nodes).any(axis=1) & ~structure
+    if not adjacent.any():
+        return
+
+    length = shapely.length(_projected(links).geometry.to_numpy())
+    ascent = profile["ascent_m"].to_numpy(dtype=float)
+    descent = profile["descent_m"].to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ascent_grade = np.divide(
+            ascent, length, out=np.zeros_like(ascent), where=length > 0
+        )
+        descent_grade = np.divide(
+            descent, length, out=np.zeros_like(descent), where=length > 0
+        )
+
+    remove_ascent = adjacent & (ascent_grade > STRUCTURE_ADJACENT_GRADE)
+    remove_descent = adjacent & (descent_grade > STRUCTURE_ADJACENT_GRADE)
+    profile.loc[remove_ascent, "ascent_m"] = 0.0
+    profile.loc[remove_descent, "descent_m"] = 0.0
+    removed = int(remove_ascent.sum() + remove_descent.sum())
+    if removed:
+        logger.info(
+            "Removed %d steep ascent/descent artefact(s) next to bridges/tunnels",
+            removed,
+        )
 
 
 def add_elevation(

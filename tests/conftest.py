@@ -162,7 +162,9 @@ def make_zones(
     )
 
 
-def write_pbf(path, nodes: dict[int, tuple[float, float]], ways, relations=()) -> str:
+def write_pbf(
+    path, nodes: dict[int, tuple[float, float]], ways, relations=(), node_tags=None
+) -> str:
     """
     Write a tiny .osm.pbf.
 
@@ -172,7 +174,13 @@ def write_pbf(path, nodes: dict[int, tuple[float, float]], ways, relations=()) -
     writer = osmium.SimpleWriter(str(path))
     try:
         for node_id, (lon, lat) in nodes.items():
-            writer.add_node(mutable.Node(id=node_id, location=(lon, lat), tags={}))
+            writer.add_node(
+                mutable.Node(
+                    id=node_id,
+                    location=(lon, lat),
+                    tags=(node_tags or {}).get(node_id, {}),
+                )
+            )
         for way_id, refs, tags in ways:
             writer.add_way(mutable.Way(id=way_id, nodes=list(refs), tags=dict(tags)))
         for relation_id, members, tags in relations:
@@ -220,7 +228,8 @@ def links_frame(rows, crs: str = WGS84) -> gpd.GeoDataFrame:
 
     ``rows`` is a list of dicts with at least ``coords``; ``link_id``, ``u``,
     ``v`` and ``highway`` default to something sensible so a test only has to
-    say what it is actually about.
+    say what it is actually about. Any other key -- ``crossing``, ``ascent_m``,
+    a traffic-signal flag -- is carried onto the frame as its own column.
     """
     records = []
     geometries = []
@@ -232,13 +241,15 @@ def links_frame(rows, crs: str = WGS84) -> gpd.GeoDataFrame:
             "v": row.get("v", np.nan),
             "highway": row.get("highway", "residential"),
             "surface": row.get("surface", None),
+            "segregated": row.get("segregated", None),
             "oneway": row.get("oneway", None),
             "oneway_bicycle": row.get("oneway_bicycle", None),
             "junction": row.get("junction", None),
             "length_m": row.get("length_m", np.nan),
         }
-        if "speed_override_kmh" in row:
-            record["speed_override_kmh"] = row["speed_override_kmh"]
+        record.update(
+            {k: v for k, v in row.items() if k not in record and k != "coords"}
+        )
         records.append(record)
         geometries.append(shapely.LineString(coords))
     return gpd.GeoDataFrame(records, geometry=geometries, crs=crs)

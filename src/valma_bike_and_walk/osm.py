@@ -45,6 +45,8 @@ logger = logging.getLogger(__name__)
 WAY_TAGS: tuple[str, ...] = (
     "highway",
     "surface",
+    "segregated",
+    "crossing",
     "oneway",
     "oneway:bicycle",
     "junction",
@@ -160,13 +162,14 @@ class _WayBuffer:
     would cost several times what the finished network does.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, signal_nodes: set[int] | None = None) -> None:
         self.way_ids = array.array("q")
         self.refs = array.array("q")
         self.x = array.array("i")  # osmium's native 1e-7 degree integers
         self.y = array.array("i")
         self.counts = array.array("q")  # nodes per way
         self.tags: list[list[str | None]] = [[] for _ in WAY_TAGS]
+        self.signal_nodes = signal_nodes or set()
 
     def add(
         self, way: osmium.osm.Way, refs: list[int], xs: list[int], ys: list[int]
@@ -201,11 +204,35 @@ def _iter_ways(pbf_path, index_storage: str) -> Iterator[osmium.osm.Way]:
     return cast(Iterator[osmium.osm.Way], iter(processor))
 
 
+def _signal_nodes(pbf_path) -> set[int]:
+    """Ids of the nodes a cyclist has to stop at: signalled crossings and lights.
+
+    Both kinds cost the same wait, so they land in one set. ``crossing:signals=no``
+    is the mapper saying the signals are for pedestrians only, so it wins over an
+    inherited ``crossing=traffic_signals``.
+    """
+    processor = (
+        osmium.FileProcessor(str(pbf_path))
+        .with_filter(osmium.filter.EntityFilter(osmium.osm.NODE))
+        .with_filter(osmium.filter.KeyFilter("crossing", "highway"))
+    )
+    signal_nodes: set[int] = set()
+    for node in processor:
+        crossing = node.tags.get("crossing", "") or ""
+        is_crossing_signal = (
+            "traffic_signals" in crossing.split(";")
+            and node.tags.get("crossing:signals") != "no"
+        )
+        if is_crossing_signal or node.tags.get("highway") == "traffic_signals":
+            signal_nodes.add(int(node.id))
+    return signal_nodes
+
+
 def _read_ways(
     settings: Settings, mode: str, clip_bounds: Sequence[float] | None
 ) -> _WayBuffer:
     way_filter = filter_for(mode)
-    buffer = _WayBuffer()
+    buffer = _WayBuffer(_signal_nodes(settings.require_pbf()))
     seen = 0
 
     if clip_bounds is None:
@@ -253,7 +280,11 @@ def _read_ways(
     return buffer
 
 
-def _junction_positions(refs: np.ndarray, counts: np.ndarray) -> np.ndarray:
+def _junction_positions(
+    refs: np.ndarray,
+    counts: np.ndarray,
+    extra_boundary_refs: set[int] | None = None,
+) -> np.ndarray:
     """Boolean mask of the flat-ref positions where a link must start or end.
 
     A node splits the way if another way (or another part of the same way) also
@@ -277,6 +308,8 @@ def _junction_positions(refs: np.ndarray, counts: np.ndarray) -> np.ndarray:
     np.cumsum(counts, out=ends[1:])
     boundary[ends[:-1]] = True
     boundary[ends[1:] - 1] = True
+    if extra_boundary_refs:
+        boundary |= np.isin(refs, list(extra_boundary_refs))
     return boundary
 
 
@@ -316,7 +349,7 @@ def read_links(
     lon = np.frombuffer(buffer.x, dtype=np.int32) * 1e-7
     lat = np.frombuffer(buffer.y, dtype=np.int32) * 1e-7
 
-    boundary = _junction_positions(refs, counts)
+    boundary = _junction_positions(refs, counts, buffer.signal_nodes)
     marks = np.flatnonzero(boundary)
 
     # Consecutive marks bound a link -- unless they straddle the end of one way
@@ -364,6 +397,19 @@ def read_links(
         columns[_column_name(key)] = np.repeat(
             np.asarray(values, dtype=object), links_per_way
         )
+    # A link is split at every signal node (see _junction_positions), so a signal
+    # can only ever sit on an endpoint -- which end it is decides nothing yet, but
+    # the graph builder wants both flags to stay direction-aware.
+    signal_ids = np.fromiter(
+        buffer.signal_nodes, dtype=np.int64, count=len(buffer.signal_nodes)
+    )
+    signal_start = np.isin(refs[starts], signal_ids)
+    signal_end = np.isin(refs[ends], signal_ids)
+    columns["traffic_signal_at_start"] = signal_start
+    columns["traffic_signal_at_end"] = signal_end
+    columns["crossing"] = np.where(
+        signal_start | signal_end, "traffic_signals", columns["crossing"]
+    )
     columns["length_m"] = length_m
 
     links = gpd.GeoDataFrame(columns, geometry=geometry, crs=WGS84)

@@ -17,7 +17,9 @@ What the columns mean
 ``length_m``       metres. **Recomputed from the geometry on every read**, so
                    moving a vertex in QGIS is enough to change the cost.
 ``speed_kmh``      derived, informational -- for styling the layer.
-``travel_time_s``  derived, informational.
+``travel_time_s``  derived forward-direction travel time, including the
+                   bicycle traffic-light penalty when applicable.
+``travel_time_reverse_s``  derived reverse-direction travel time.
 ``speed_override_kmh``  empty for you to fill in. Where it is set, it wins over
                    ``highway``/``surface`` entirely.
 
@@ -66,9 +68,47 @@ ONEWAY_REVERSED_VALUES = frozenset({"-1", "T"})
 REQUIRED_COLUMNS = ("link_id", "u", "v", "highway", "geometry")
 
 #: Columns the build derives itself; present in a written layer for styling.
-DERIVED_COLUMNS = ("length_m", "speed_kmh", "travel_time_s")
+DERIVED_COLUMNS = ("length_m", "speed_kmh", "travel_time_s", "travel_time_reverse_s")
 
 OVERRIDE_COLUMN = "speed_override_kmh"
+
+TRAFFIC_LIGHT_PENALTY_SECONDS = 15.0
+
+GRADE_MODERATE_THRESHOLD = 0.025
+GRADE_STEEP_THRESHOLD = 0.05
+GRADE_MAX_VALID = 0.20
+GRADE_MODERATE_FACTOR = 2.32
+GRADE_STEEP_FACTOR = 2.50
+
+_BICYCLE_CROSSING_HIGHWAYS = frozenset(
+    {
+        "cycleway",
+        "path",
+        "track",
+        "bridleway",
+        "footway",
+        "pedestrian",
+        "steps",
+        "elevator",
+    }
+)
+
+_CAR_LANE_CROSSING_HIGHWAYS = frozenset(
+    {
+        "living_street",
+        "residential",
+        "service",
+        "unclassified",
+        "tertiary",
+        "tertiary_link",
+        "secondary",
+        "secondary_link",
+        "primary",
+        "primary_link",
+        "trunk",
+        "trunk_link",
+    }
+)
 
 
 # --------------------------------------------------------------------------
@@ -218,8 +258,89 @@ def normalise(links: gpd.GeoDataFrame, mode: str) -> gpd.GeoDataFrame:
         links = links.loc[~self_loop].reset_index(drop=True)
 
     links["speed_kmh"] = link_speeds(links, mode)
-    links["travel_time_s"] = links["length_m"] / (links["speed_kmh"] / 3.6)
+    _set_travel_times(links, mode)
     return links
+
+
+def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
+    """Set forward and reverse travel times on a link layer."""
+    base = links["length_m"] / (links["speed_kmh"] / 3.6)
+    forward_penalty = np.zeros(len(links), dtype=float)
+    reverse_penalty = np.zeros(len(links), dtype=float)
+    if mode == "bike":
+        signal_crossing = (
+            links["crossing"].eq("traffic_signals")
+            if "crossing" in links.columns
+            else pd.Series(False, index=links.index)
+        )
+        adjacent_signal = _signal_flag(links, "traffic_signal_at_start") | _signal_flag(
+            links, "traffic_signal_at_end"
+        )
+        # On a cycleway the crossing tag is the whole story; on a car lane the tag
+        # may be a crossing the cyclist rides past, so only a signal node counts.
+        bicycle_signal = signal_crossing & links["highway"].isin(
+            _BICYCLE_CROSSING_HIGHWAYS
+        )
+        car_signal = adjacent_signal & links["highway"].isin(
+            _CAR_LANE_CROSSING_HIGHWAYS
+        )
+        signal_penalty = (bicycle_signal | car_signal).to_numpy(
+            dtype=bool
+        ) * TRAFFIC_LIGHT_PENALTY_SECONDS
+        forward_penalty += signal_penalty
+        reverse_penalty += signal_penalty
+
+    if "ascent_m" in links.columns:
+        length = links["length_m"].to_numpy(dtype=float)
+        ascent = _metres(links, "ascent_m")
+        descent = _metres(links, "descent_m")
+        # Reverse is the same link read backwards, so its climb is the descent.
+        forward_penalty += _grade_penalty(ascent, length)
+        reverse_penalty += _grade_penalty(descent, length)
+
+    links["travel_time_s"] = base.to_numpy(dtype=float) + forward_penalty
+    links["travel_time_reverse_s"] = base.to_numpy(dtype=float) + reverse_penalty
+
+
+def _signal_flag(links: gpd.GeoDataFrame, column: str) -> pd.Series:
+    """A boolean column, or all-False when the layer does not carry it."""
+    if column not in links.columns:
+        return pd.Series(False, index=links.index)
+    return links[column].fillna(False).astype(bool)
+
+
+def _metres(links: gpd.GeoDataFrame, column: str) -> np.ndarray:
+    """A float column in metres, or all-zero when the layer does not carry it."""
+    if column not in links.columns:
+        return np.zeros(len(links), dtype=float)
+    return (
+        pd.to_numeric(links[column], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    )
+
+
+def _grade_penalty(ascent_m: np.ndarray, length_m: np.ndarray) -> np.ndarray:
+    """Return an uphill time penalty from ascent and link length.
+
+    A gradient at or above :data:`GRADE_MAX_VALID` is not a road a bicycle climbs
+    -- it is a bad elevation sample -- so it is dropped rather than believed.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        gradient = np.divide(
+            np.maximum(ascent_m, 0.0),
+            length_m,
+            out=np.zeros_like(ascent_m, dtype=float),
+            where=length_m > 0,
+        )
+    factor = np.where(
+        gradient >= GRADE_MAX_VALID,
+        0.0,
+        np.where(
+            gradient > GRADE_STEEP_THRESHOLD,
+            GRADE_STEEP_FACTOR,
+            np.where(gradient >= GRADE_MODERATE_THRESHOLD, GRADE_MODERATE_FACTOR, 0.0),
+        ),
+    )
+    return factor * gradient * length_m
 
 
 def _fill_link_ids(values: pd.Series) -> np.ndarray:
@@ -249,6 +370,7 @@ def link_speeds(links: gpd.GeoDataFrame, mode: str) -> np.ndarray:
     speed = profile.speeds_kph(
         links["highway"],
         links["surface"] if "surface" in links.columns else None,
+        links["segregated"] if "segregated" in links.columns else None,
     )
     if OVERRIDE_COLUMN in links.columns:
         override = pd.to_numeric(links[OVERRIDE_COLUMN], errors="coerce").to_numpy(
@@ -265,7 +387,7 @@ def annotate(links: gpd.GeoDataFrame, mode: str) -> gpd.GeoDataFrame:
     """Add the derived columns to a freshly extracted layer, ready to write."""
     links = links.copy()
     links["speed_kmh"] = link_speeds(links, mode)
-    links["travel_time_s"] = links["length_m"] / (links["speed_kmh"] / 3.6)
+    _set_travel_times(links, mode)
     # An empty column is an invitation: QGIS shows it, and filling one cell is
     # all it takes to pin a link's speed.
     links[OVERRIDE_COLUMN] = np.nan
@@ -336,8 +458,14 @@ def directed_edges(links: gpd.GeoDataFrame, mode: str) -> pd.DataFrame:
     reverse_only = is_oneway & against
 
     forward = base.loc[along | two_way].assign(direction=np.int8(1))
+    reverse_time = (
+        links["travel_time_reverse_s"].to_numpy(dtype=float)
+        if "travel_time_reverse_s" in links.columns
+        else base["travel_time_s"].to_numpy(dtype=float)
+    )
     backward = (
-        base.loc[reverse_only | two_way]
+        base.assign(travel_time_s=reverse_time)
+        .loc[reverse_only | two_way]
         .rename(columns={"u": "v", "v": "u"})
         .assign(direction=np.int8(-1))
     )

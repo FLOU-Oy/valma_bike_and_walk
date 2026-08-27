@@ -404,6 +404,46 @@ def test_bridges_and_tunnels_are_forced_flat():
     assert profile["ascent_m"].iloc[2] == pytest.approx(25.0)
 
 
+def test_steep_profile_changes_next_to_structures_are_removed():
+    links = links_frame(
+        [
+            {"u": 1, "v": 2, "coords": [(0.0, 0.0), (500.0, 0.0)]},
+            {
+                "u": 2,
+                "v": 3,
+                "coords": [(500.0, 0.0), (1_000.0, 0.0)],
+                "bridge": "yes",
+            },
+            {"u": 3, "v": 4, "coords": [(1_000.0, 0.0), (1_500.0, 0.0)]},
+        ],
+        crs=PROJECTED_CRS,
+    )
+    links["bridge"] = [None, "yes", None]
+    profile = elevation.link_profiles(links, slope_sampler(0.20))
+
+    assert profile["ascent_m"].to_numpy() == pytest.approx([0.0, 0.0, 0.0])
+    assert profile["descent_m"].to_numpy() == pytest.approx([0.0, 0.0, 0.0])
+
+
+def test_moderate_profile_changes_next_to_structures_are_kept():
+    links = links_frame(
+        [
+            {"u": 1, "v": 2, "coords": [(0.0, 0.0), (500.0, 0.0)]},
+            {
+                "u": 2,
+                "v": 3,
+                "coords": [(500.0, 0.0), (1_000.0, 0.0)],
+                "bridge": "yes",
+            },
+        ],
+        crs=PROJECTED_CRS,
+    )
+    links["bridge"] = [None, "yes"]
+    profile = elevation.link_profiles(links, slope_sampler(0.10))
+
+    assert profile["ascent_m"].iloc[0] == pytest.approx(50.0)
+
+
 def test_a_gap_in_the_dem_is_read_as_flat_rather_than_poisoning_the_total():
     def holey(east, north):
         z = 100.0 + 0.05 * np.asarray(east, dtype=float)
