@@ -74,6 +74,12 @@ OVERRIDE_COLUMN = "speed_override_kmh"
 
 TRAFFIC_LIGHT_PENALTY_SECONDS = 15.0
 
+GRADE_MODERATE_THRESHOLD = 0.025
+GRADE_STEEP_THRESHOLD = 0.05
+GRADE_MAX_VALID = 0.20
+GRADE_MODERATE_FACTOR = 2.32
+GRADE_STEEP_FACTOR = 2.50
+
 _BICYCLE_CROSSING_HIGHWAYS = frozenset(
     {"cycleway", "path", "track", "bridleway", "footway", "pedestrian", "steps", "elevator"}
 )
@@ -250,7 +256,8 @@ def normalise(links: gpd.GeoDataFrame, mode: str) -> gpd.GeoDataFrame:
 def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
     """Set forward and reverse travel times on a link layer."""
     base = links["length_m"] / (links["speed_kmh"] / 3.6)
-    penalty = np.zeros(len(links), dtype=float)
+    forward_penalty = np.zeros(len(links), dtype=float)
+    reverse_penalty = np.zeros(len(links), dtype=float)
     if mode == "bike":
         signal_crossing = (
             links["crossing"].eq("traffic_signals")
@@ -272,12 +279,49 @@ def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
         car_signal = adjacent_signal & links["highway"].isin(
             _CAR_LANE_CROSSING_HIGHWAYS
         )
-        penalty = (
+        signal_penalty = (
             (bicycle_signal | car_signal).to_numpy(dtype=bool)
             * TRAFFIC_LIGHT_PENALTY_SECONDS
         )
-    links["travel_time_s"] = base.to_numpy(dtype=float) + penalty
-    links["travel_time_reverse_s"] = base.to_numpy(dtype=float) + penalty
+        forward_penalty += signal_penalty
+        reverse_penalty += signal_penalty
+
+    if "ascent_m" in links.columns:
+        length = links["length_m"].to_numpy(dtype=float)
+        ascent = pd.to_numeric(links["ascent_m"], errors="coerce").fillna(0.0).to_numpy()
+        descent = (
+            pd.to_numeric(links["descent_m"], errors="coerce")
+            .fillna(0.0)
+            .to_numpy()
+            if "descent_m" in links.columns
+            else np.zeros(len(links), dtype=float)
+        )
+        forward_penalty += _grade_penalty(ascent, length)
+        reverse_penalty += _grade_penalty(descent, length)
+
+    links["travel_time_s"] = base.to_numpy(dtype=float) + forward_penalty
+    links["travel_time_reverse_s"] = base.to_numpy(dtype=float) + reverse_penalty
+
+
+def _grade_penalty(ascent_m: np.ndarray, length_m: np.ndarray) -> np.ndarray:
+    """Return an uphill time penalty from ascent and link length."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        gradient = np.divide(
+            np.maximum(ascent_m, 0.0),
+            length_m,
+            out=np.zeros_like(ascent_m, dtype=float),
+            where=length_m > 0,
+        )
+    factor = np.where(
+        gradient >= GRADE_MAX_VALID,
+        0.0,
+        np.where(
+            gradient > GRADE_STEEP_THRESHOLD,
+        GRADE_STEEP_FACTOR,
+        np.where(gradient >= GRADE_MODERATE_THRESHOLD, GRADE_MODERATE_FACTOR, 0.0),
+        ),
+    )
+    return factor * gradient * length_m
 
 
 def _fill_link_ids(values: pd.Series) -> np.ndarray:

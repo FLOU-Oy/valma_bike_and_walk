@@ -194,6 +194,74 @@ def test_car_lane_crossing_tag_without_adjacent_signal_has_no_penalty():
     )
 
 
+def test_elevation_penalty_uses_ascent_thresholds_and_not_descent():
+    base_row = {**CHAIN[0], "length_m": 1_000.0}
+    links = links_frame(
+        [
+            {**base_row, "ascent_m": 20.0, "descent_m": 20.0},
+            {**base_row, "ascent_m": 30.0, "descent_m": 30.0, "link_id": 1},
+            {**base_row, "ascent_m": 60.0, "descent_m": 60.0, "link_id": 2},
+        ]
+    )
+    normalised = normalise(links, "bike")
+    base_seconds = 1_000.0 / (normalised["speed_kmh"].iloc[0] / 3.6)
+
+    assert normalised["travel_time_s"].to_numpy() == pytest.approx(
+        [
+            base_seconds,
+            base_seconds + 2.32 * 0.03 * 1_000,
+            base_seconds + 2.50 * 0.06 * 1_000,
+        ]
+    )
+    assert normalised["travel_time_reverse_s"].to_numpy() == pytest.approx(
+        [
+            base_seconds,
+            base_seconds + 2.32 * 0.03 * 1_000,
+            base_seconds + 2.50 * 0.06 * 1_000,
+        ]
+    )
+
+
+def test_elevation_penalty_is_directional_for_an_asymmetric_profile():
+    links = links_frame(
+        [
+            {
+                **CHAIN[0],
+                "length_m": 1_000.0,
+                "ascent_m": 30.0,
+                "descent_m": 10.0,
+            }
+        ]
+    )
+    normalised = normalise(links, "bike")
+    base_seconds = 1_000.0 / (normalised["speed_kmh"].iloc[0] / 3.6)
+
+    assert normalised["travel_time_s"].iloc[0] == pytest.approx(
+        base_seconds + 2.32 * 0.03 * 1_000
+    )
+    assert normalised["travel_time_reverse_s"].iloc[0] == pytest.approx(base_seconds)
+
+
+def test_unrealistic_twenty_percent_grade_is_ignored():
+    links = links_frame(
+        [
+            {
+                **CHAIN[0],
+                "length_m": 1_000.0,
+                "ascent_m": 200.0,
+                "descent_m": 199.0,
+            }
+        ]
+    )
+    normalised = normalise(links, "bike")
+    base_seconds = 1_000.0 / (normalised["speed_kmh"].iloc[0] / 3.6)
+
+    assert normalised["travel_time_s"].iloc[0] == pytest.approx(base_seconds)
+    assert normalised["travel_time_reverse_s"].iloc[0] == pytest.approx(
+        base_seconds + 2.50 * 0.199 * 1_000
+    )
+
+
 def test_segregated_cycleway_changes_the_bike_link_speed():
     shared = normalise(
         links_frame([{**CHAIN[0], "highway": "cycleway", "segregated": "no"}]),
