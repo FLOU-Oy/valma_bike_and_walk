@@ -36,6 +36,7 @@ class SpeedProfile:
         highway: pd.Series,
         surface: pd.Series | None = None,
         segregated: pd.Series | None = None,
+        cycleway: pd.Series | None = None,
     ) -> np.ndarray:
         """
         Vectorised speed lookup for a whole edge table.
@@ -44,6 +45,30 @@ class SpeedProfile:
         of 1.0, so an edge is never left without a usable speed.
         """
         base = highway.map(self.highway_kph).astype(float).fillna(self.base_kph)
+
+        if self.name == "bike" and cycleway is not None:
+            lane_mask = (
+                cycleway.fillna("")
+                .astype(str)
+                .str.lower()
+                .str.split(";")
+                .map(lambda values: any(v.strip() == "lane" for v in values))
+            )
+            major_road_mask = highway.isin(
+                {
+                    "living_street",
+                    "residential",
+                    "service",
+                    "unclassified",
+                    "tertiary",
+                    "tertiary_link",
+                    "secondary",
+                    "secondary_link",
+                    "primary",
+                    "primary_link",
+                }
+            )
+            base = base * np.where(major_road_mask & lane_mask, 1.927 / 1.142, 1.0)
 
         if surface is None:
             factor: pd.Series | float = 1.0
@@ -131,7 +156,7 @@ BIKE_PROFILE = SpeedProfile(
     highway_kph={
         "steps": 1.2,
         "elevator": 1.0,
-        "cycleway": 20.0,
+        "cycleway": 18.0,
         "path": 11.0,
         "track": 10.0,
         "bridleway": 8.0,
