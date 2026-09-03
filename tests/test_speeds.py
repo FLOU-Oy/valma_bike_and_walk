@@ -34,6 +34,15 @@ def test_cycleway_is_preferred_to_primary_and_secondary_for_cycling():
     assert speeds[0] > speeds[2]
 
 
+def test_primary_road_with_cycleway_lane_uses_lane_multiplier():
+    highway = pd.Series(["primary", "primary"])
+    surface = pd.Series(["asphalt", "asphalt"])
+    lane_speed = BIKE_PROFILE.speeds_kph(highway, surface, cycleway=pd.Series(["lane", None]))
+    no_lane_speed = BIKE_PROFILE.speeds_kph(highway, surface, cycleway=pd.Series([None, None]))
+    assert lane_speed[0] > no_lane_speed[0]
+    assert lane_speed[0] > lane_speed[1]
+
+
 def test_segregated_cycleway_is_preferred_to_shared_cycleway():
     highway = pd.Series(["cycleway", "cycleway"])
     segregated = pd.Series(["yes", "no"])

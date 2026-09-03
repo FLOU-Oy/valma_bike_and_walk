@@ -367,10 +367,24 @@ def geometry_lengths(links: gpd.GeoDataFrame) -> np.ndarray:
 def link_speeds(links: gpd.GeoDataFrame, mode: str) -> np.ndarray:
     """Speed in km/h per link: the profile's answer, unless overridden."""
     profile = profile_for(mode)
+    cycleway = None
+    if mode == "bike":
+        bike_lane_columns = [
+            col for col in ("cycleway", "cycleway_left", "cycleway_right", "cycleway_both") if col in links.columns
+        ]
+        if bike_lane_columns:
+            lane_values = [
+                links[col].fillna("").astype(str).str.lower() for col in bike_lane_columns
+            ]
+            cycleway = lane_values[0].copy()
+            for values in lane_values[1:]:
+                cycleway = cycleway.where(cycleway != "", values)
+            cycleway = cycleway.mask(cycleway == "", pd.NA)
     speed = profile.speeds_kph(
         links["highway"],
         links["surface"] if "surface" in links.columns else None,
         links["segregated"] if "segregated" in links.columns else None,
+        cycleway,
     )
     if OVERRIDE_COLUMN in links.columns:
         override = pd.to_numeric(links[OVERRIDE_COLUMN], errors="coerce").to_numpy(
