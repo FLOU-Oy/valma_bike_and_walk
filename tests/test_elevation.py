@@ -8,6 +8,9 @@ on disk as if it were data -- without a key or a connection.
 
 from __future__ import annotations
 
+import logging
+import os
+import sqlite3
 import ssl
 import urllib.error
 from pathlib import Path
@@ -585,3 +588,125 @@ def test_geometry_is_reprojected_before_it_is_located(tmp_path, server):
     projected = wgs84.to_crs(PROJECTED_CRS)
 
     assert tiles_for_links(wgs84) == tiles_for_links(projected)
+
+
+# --------------------------------------------------------------------------
+# Making GDAL usable on a machine that has other GIS software on it
+# --------------------------------------------------------------------------
+
+
+def proj_data_dir(directory: Path, version: tuple[int, int] | None) -> Path:
+    """A directory that looks like a PROJ data dir of the given layout."""
+    directory.mkdir(parents=True, exist_ok=True)
+    if version is None:
+        return directory
+    connection = sqlite3.connect(directory / "proj.db")
+    with connection:
+        connection.execute("CREATE TABLE metadata (key TEXT, value TEXT)")
+        connection.executemany(
+            "INSERT INTO metadata VALUES (?, ?)",
+            [
+                ("DATABASE.LAYOUT.VERSION.MAJOR", str(version[0])),
+                ("DATABASE.LAYOUT.VERSION.MINOR", str(version[1])),
+            ],
+        )
+    connection.close()
+    return directory
+
+
+class FakeRasterio:
+    """Just enough rasterio for the repair: somewhere to find proj_data."""
+
+    def __init__(self, package: Path) -> None:
+        self.__file__ = str(package / "__init__.py")
+
+
+@pytest.fixture
+def rasterio_at(tmp_path):
+    def build(bundled_version: tuple[int, int] | None) -> FakeRasterio:
+        package = tmp_path / "rasterio"
+        proj_data_dir(package / "proj_data", bundled_version)
+        return FakeRasterio(package)
+
+    return build
+
+
+def test_an_older_proj_database_is_replaced_by_rasterio_s(
+    tmp_path, rasterio_at, monkeypatch
+):
+    """The PostGIS-on-Windows case: the machine-wide PROJ is too old for GDAL."""
+    stale = proj_data_dir(tmp_path / "postgis", (1, 2))
+    monkeypatch.setenv("PROJ_LIB", str(stale))
+    monkeypatch.delenv("PROJ_DATA", raising=False)
+
+    rasterio = rasterio_at((1, 6))
+    elevation._repair_proj_data(rasterio)
+
+    assert os.environ["PROJ_LIB"] == str(Path(rasterio.__file__).parent / "proj_data")
+    assert "PROJ_DATA" not in os.environ  # nothing said, nothing invented
+
+
+@pytest.mark.parametrize("version", [(1, 6), (2, 0)])
+def test_a_current_proj_database_is_left_alone(
+    tmp_path, rasterio_at, monkeypatch, version
+):
+    """Someone else's PROJ may carry grid shifts ours does not; keep it."""
+    theirs = proj_data_dir(tmp_path / "theirs", version)
+    monkeypatch.setenv("PROJ_DATA", str(theirs))
+
+    elevation._repair_proj_data(rasterio_at((1, 6)))
+
+    assert os.environ["PROJ_DATA"] == str(theirs)
+
+
+def test_one_usable_entry_in_the_search_path_is_enough(
+    tmp_path, rasterio_at, monkeypatch
+):
+    stale = proj_data_dir(tmp_path / "postgis", (1, 2))
+    good = proj_data_dir(tmp_path / "good", (1, 6))
+    path = os.pathsep.join([str(stale), str(good)])
+    monkeypatch.setenv("PROJ_DATA", path)
+
+    elevation._repair_proj_data(rasterio_at((1, 6)))
+
+    assert os.environ["PROJ_DATA"] == path
+
+
+def test_a_directory_without_a_database_is_replaced(tmp_path, rasterio_at, monkeypatch):
+    empty = proj_data_dir(tmp_path / "empty", None)
+    monkeypatch.setenv("PROJ_DATA", str(empty))
+
+    rasterio = rasterio_at((1, 6))
+    elevation._repair_proj_data(rasterio)
+
+    assert os.environ["PROJ_DATA"] == str(Path(rasterio.__file__).parent / "proj_data")
+
+
+def test_nothing_is_set_when_the_environment_says_nothing(rasterio_at, monkeypatch):
+    """No variable means GDAL already finds rasterio's own copy."""
+    for variable in elevation.PROJ_DATA_ENV:
+        monkeypatch.delenv(variable, raising=False)
+
+    elevation._repair_proj_data(rasterio_at((1, 6)))
+
+    assert not any(variable in os.environ for variable in elevation.PROJ_DATA_ENV)
+
+
+def test_gdal_says_each_thing_once_rather_than_once_per_tile(caplog):
+    """Six thousand tiles must not mean six thousand copies of one warning."""
+    logger = logging.getLogger("rasterio._env")
+    filters = list(logger.filters)
+    try:
+        elevation._quieten_repeated_gdal_messages()
+        with caplog.at_level(logging.WARNING, logger="rasterio._env"):
+            for _ in range(5):
+                logger.warning("CPLE_AppDefined in %s", "the CRS is not the EPSG one")
+            logger.warning("CPLE_AppDefined in something else entirely")
+    finally:
+        logger.filters = filters
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == [
+        "CPLE_AppDefined in the CRS is not the EPSG one",
+        "CPLE_AppDefined in something else entirely",
+    ]

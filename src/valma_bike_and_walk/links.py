@@ -1,7 +1,7 @@
 """The link layer: the editable GeoPackage that sits between OSM and the graph.
 
 Stage one (:mod:`valma_bike_and_walk.osm`) writes it, you may open it in QGIS and
-            (at_end & ~at_start)
+change it, and stage two (:mod:`valma_bike_and_walk.network`) turns it into a
 routable graph. Everything the graph needs is a column here, so an edit in QGIS
 is the whole configuration surface -- there is no second place to change.
 
@@ -81,7 +81,16 @@ GRADE_MODERATE_FACTOR = 2.32
 GRADE_STEEP_FACTOR = 2.50
 
 _BICYCLE_CROSSING_HIGHWAYS = frozenset(
-    {"cycleway", "path", "track", "bridleway", "footway", "pedestrian", "steps", "elevator"}
+    {
+        "cycleway",
+        "path",
+        "track",
+        "bridleway",
+        "footway",
+        "pedestrian",
+        "steps",
+        "elevator",
+    }
 )
 
 _CAR_LANE_CROSSING_HIGHWAYS = frozenset(
@@ -264,38 +273,28 @@ def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
             if "crossing" in links.columns
             else pd.Series(False, index=links.index)
         )
-        signal_at_start = (
-            links["traffic_signal_at_start"].fillna(False)
-            if "traffic_signal_at_start" in links.columns
-            else pd.Series(False, index=links.index)
+        adjacent_signal = _signal_flag(links, "traffic_signal_at_start") | _signal_flag(
+            links, "traffic_signal_at_end"
         )
-        signal_at_end = (
-            links["traffic_signal_at_end"].fillna(False)
-            if "traffic_signal_at_end" in links.columns
-            else pd.Series(False, index=links.index)
+        # On a cycleway the crossing tag is the whole story; on a car lane the tag
+        # may be a crossing the cyclist rides past, so only a signal node counts.
+        bicycle_signal = signal_crossing & links["highway"].isin(
+            _BICYCLE_CROSSING_HIGHWAYS
         )
-        adjacent_signal = signal_at_start | signal_at_end
-        bicycle_signal = signal_crossing & links["highway"].isin(_BICYCLE_CROSSING_HIGHWAYS)
         car_signal = adjacent_signal & links["highway"].isin(
             _CAR_LANE_CROSSING_HIGHWAYS
         )
-        signal_penalty = (
-            (bicycle_signal | car_signal).to_numpy(dtype=bool)
-            * TRAFFIC_LIGHT_PENALTY_SECONDS
-        )
+        signal_penalty = (bicycle_signal | car_signal).to_numpy(
+            dtype=bool
+        ) * TRAFFIC_LIGHT_PENALTY_SECONDS
         forward_penalty += signal_penalty
         reverse_penalty += signal_penalty
 
     if "ascent_m" in links.columns:
         length = links["length_m"].to_numpy(dtype=float)
-        ascent = pd.to_numeric(links["ascent_m"], errors="coerce").fillna(0.0).to_numpy()
-        descent = (
-            pd.to_numeric(links["descent_m"], errors="coerce")
-            .fillna(0.0)
-            .to_numpy()
-            if "descent_m" in links.columns
-            else np.zeros(len(links), dtype=float)
-        )
+        ascent = _metres(links, "ascent_m")
+        descent = _metres(links, "descent_m")
+        # Reverse is the same link read backwards, so its climb is the descent.
         forward_penalty += _grade_penalty(ascent, length)
         reverse_penalty += _grade_penalty(descent, length)
 
@@ -303,8 +302,28 @@ def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
     links["travel_time_reverse_s"] = base.to_numpy(dtype=float) + reverse_penalty
 
 
+def _signal_flag(links: gpd.GeoDataFrame, column: str) -> pd.Series:
+    """A boolean column, or all-False when the layer does not carry it."""
+    if column not in links.columns:
+        return pd.Series(False, index=links.index)
+    return links[column].fillna(False).astype(bool)
+
+
+def _metres(links: gpd.GeoDataFrame, column: str) -> np.ndarray:
+    """A float column in metres, or all-zero when the layer does not carry it."""
+    if column not in links.columns:
+        return np.zeros(len(links), dtype=float)
+    return (
+        pd.to_numeric(links[column], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    )
+
+
 def _grade_penalty(ascent_m: np.ndarray, length_m: np.ndarray) -> np.ndarray:
-    """Return an uphill time penalty from ascent and link length."""
+    """Return an uphill time penalty from ascent and link length.
+
+    A gradient at or above :data:`GRADE_MAX_VALID` is not a road a bicycle climbs
+    -- it is a bad elevation sample -- so it is dropped rather than believed.
+    """
     with np.errstate(divide="ignore", invalid="ignore"):
         gradient = np.divide(
             np.maximum(ascent_m, 0.0),
@@ -317,8 +336,8 @@ def _grade_penalty(ascent_m: np.ndarray, length_m: np.ndarray) -> np.ndarray:
         0.0,
         np.where(
             gradient > GRADE_STEEP_THRESHOLD,
-        GRADE_STEEP_FACTOR,
-        np.where(gradient >= GRADE_MODERATE_THRESHOLD, GRADE_MODERATE_FACTOR, 0.0),
+            GRADE_STEEP_FACTOR,
+            np.where(gradient >= GRADE_MODERATE_THRESHOLD, GRADE_MODERATE_FACTOR, 0.0),
         ),
     )
     return factor * gradient * length_m
@@ -452,9 +471,7 @@ def directed_edges(links: gpd.GeoDataFrame, mode: str) -> pd.DataFrame:
     along = is_oneway & ~against
     reverse_only = is_oneway & against
 
-    forward = base.loc[along | two_way].assign(
-        direction=np.int8(1)
-    )
+    forward = base.loc[along | two_way].assign(direction=np.int8(1))
     reverse_time = (
         links["travel_time_reverse_s"].to_numpy(dtype=float)
         if "travel_time_reverse_s" in links.columns

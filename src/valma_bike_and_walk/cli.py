@@ -12,6 +12,15 @@ The pipeline is two stages, and the GeoPackage between them is the point:
   valma assign  --links output/bike_links.gpkg --mode bike --centroids points.csv \\
                 --demand od.csv --gpkg
 
+`matrix` and `assign` route between zones given either way round. `--centroids`
+takes one point per zone, the classic method. `--zones` takes polygons instead
+and spreads each zone's trip ends over several weighted points inside it, which
+is what stops volumes piling onto one centroid node, gets short trips right and
+lets intrazonal demand load onto the network at all:
+
+  valma matrix  --links output/bike_links.gpkg --mode bike \\
+                --zones taz.gpkg --id-column zone_id --near-minutes 15
+
 `matrix` and `assign` build the routable graph from `--links` themselves and
 cache it under `--cache-dir`, so there is normally no need to know it exists.
 Running `valma build --links output/bike_links.gpkg --mode bike` explicitly
@@ -39,10 +48,15 @@ import numpy as np
 from valma_bike_and_walk import links as links_module
 from valma_bike_and_walk.assignment import (
     assign_traffic,
+    assign_zone_traffic,
     link_volume_frame,
 )
 from valma_bike_and_walk.assignment import summarise as summarise_assignment
-from valma_bike_and_walk.centroids import DEFAULT_MAX_SNAP_M, load_centroids
+from valma_bike_and_walk.centroids import (
+    DEFAULT_MAX_SNAP_M,
+    Centroids,
+    load_centroids,
+)
 from valma_bike_and_walk.config import (
     DEFAULT_INDEX_STORAGE,
     MODES,
@@ -70,7 +84,12 @@ from valma_bike_and_walk.elevation import (
     tiles_for_bounds,
 )
 from valma_bike_and_walk.gpkg import write_edges_gpkg
-from valma_bike_and_walk.matrix import default_workers, summarise, travel_time_matrix
+from valma_bike_and_walk.matrix import (
+    default_workers,
+    summarise,
+    travel_time_matrix,
+    zone_travel_time_matrix,
+)
 from valma_bike_and_walk.network import (
     RoutableNetwork,
     build_links,
@@ -79,6 +98,12 @@ from valma_bike_and_walk.network import (
     network_from_links,
 )
 from valma_bike_and_walk.osm import resolve_clip
+from valma_bike_and_walk.zones import (
+    DEFAULT_POINTS_PER_ZONE,
+    Zones,
+    load_zones,
+    zone_points_frame,
+)
 
 logger = logging.getLogger("valma_bike_and_walk")
 
@@ -273,9 +298,11 @@ def cmd_dem(args: argparse.Namespace) -> int:
     cache = _dem_cache(args, settings)
 
     if args.links is not None:
+        logger.info("Reading link layer from %s", args.links)
         links = links_module.read_links(args.links)
         links = add_elevation(links, cache, workers=args.dem_workers)
         out = args.out or args.links
+        logger.info("Writing link layer to %s", out)
         links_module.write_links(links, out)
         print(f"Elevation written to {out} ({len(links):,} links)")
         rise = links["ascent_m"].to_numpy()
@@ -298,7 +325,44 @@ def cmd_dem(args: argparse.Namespace) -> int:
     return 0
 
 
-def _centroids(args: argparse.Namespace, network: RoutableNetwork):
+def _analysis_points(
+    args: argparse.Namespace, network: RoutableNetwork
+) -> Centroids | Zones:
+    """
+    Whatever the run routes between: one point per zone, or several.
+
+    ``--centroids`` is the original method and is untouched by any of this --
+    one node per zone, no access time, intrazonal trips left at zero.
+    ``--zones`` takes polygons and spreads each zone's trip ends over weighted
+    access points inside it; see :mod:`valma_bike_and_walk.zones`.
+    """
+    if args.zones is not None:
+        zones = load_zones(
+            network,
+            args.zones,
+            id_column=args.id_column,
+            crs=args.centroid_crs,
+            weights_path=args.weights,
+            weight_column=args.weight_column,
+            weight_x_column=args.x_column,
+            weight_y_column=args.y_column,
+            weight_crs=args.centroid_crs,
+            points_per_zone=args.points_per_zone,
+            access_speed_kmh=args.access_speed_kmh,
+            charge_access_time=not args.no_access_time,
+            max_snap_distance=args.max_snap_distance,
+        )
+        if args.zone_points_gpkg is not None:
+            args.zone_points_gpkg.parent.mkdir(parents=True, exist_ok=True)
+            zone_points_frame(zones).to_file(
+                args.zone_points_gpkg, layer="zone_points", driver="GPKG"
+            )
+            print(
+                f"Wrote {args.zone_points_gpkg} "
+                f"({zones.n_points:,} access points across {zones.n_zones:,} zones)"
+            )
+        return zones
+
     return load_centroids(
         network,
         args.centroids,
@@ -312,23 +376,34 @@ def _centroids(args: argparse.Namespace, network: RoutableNetwork):
 
 def cmd_matrix(args: argparse.Namespace) -> int:
     network, _ = _network_and_links(args)
-    centroids = _centroids(args, network)
+    points = _analysis_points(args, network)
 
-    if len(centroids) == 0:
-        logger.error("No centroids could be snapped to the network.")
+    if len(points) == 0:
+        logger.error("Nothing could be snapped to the network.")
         return 1
 
-    matrix = travel_time_matrix(
-        network,
-        centroids.node_index,
-        max_seconds=args.max_minutes * 60 if args.max_minutes else None,
-        workers=args.workers,
-        chunk_size=args.chunk_size,
-    )
+    max_seconds = args.max_minutes * 60 if args.max_minutes else None
+    if isinstance(points, Zones):
+        matrix = zone_travel_time_matrix(
+            network,
+            points,
+            max_seconds=max_seconds,
+            near_seconds=args.near_minutes * 60 if args.near_minutes else None,
+            workers=args.workers,
+            chunk_size=args.chunk_size,
+        )
+    else:
+        matrix = travel_time_matrix(
+            network,
+            points.node_index,
+            max_seconds=max_seconds,
+            workers=args.workers,
+            chunk_size=args.chunk_size,
+        )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     out = args.output_dir / f"travel_times_{args.mode}.npz"
-    np.savez_compressed(out, ids=centroids.ids, seconds=matrix)
+    np.savez_compressed(out, ids=points.ids, seconds=matrix)
     print(
         f"Wrote {out} ({matrix.shape[0]}x{matrix.shape[1]}, "
         f"{out.stat().st_size / 1e6:.1f} MB)"
@@ -343,7 +418,7 @@ def cmd_matrix(args: argparse.Namespace) -> int:
         omx_out.parent.mkdir(parents=True, exist_ok=True)
         write_omx_matrix(
             omx_out,
-            centroids.ids,
+            points.ids,
             matrix,
             matrix_name=args.omx_matrix_name or args.mode,
             mapping_name=args.omx_mapping_name,
@@ -360,10 +435,10 @@ def cmd_matrix(args: argparse.Namespace) -> int:
 
 def cmd_assign(args: argparse.Namespace) -> int:
     network, links_path = _network_and_links(args)
-    centroids = _centroids(args, network)
+    points = _analysis_points(args, network)
 
-    if len(centroids) == 0:
-        logger.error("No centroids could be snapped to the network.")
+    if len(points) == 0:
+        logger.error("Nothing could be snapped to the network.")
         return 1
 
     if args.gpkg and links_path is None:
@@ -382,10 +457,10 @@ def cmd_assign(args: argparse.Namespace) -> int:
             mapping_name=args.demand_mapping,
             minimum_demand=args.min_demand,
         )
-        demand = align_to_ids(ids, demand, centroids.ids)
+        demand = align_to_ids(ids, demand, points.ids)
     elif suffix == ".npz":
         ids, demand = read_demand_npz(args.demand)
-        demand = align_to_ids(ids, demand, centroids.ids)
+        demand = align_to_ids(ids, demand, points.ids)
     else:
         long_demand = read_demand_long(
             args.demand,
@@ -393,18 +468,30 @@ def cmd_assign(args: argparse.Namespace) -> int:
             destination_column=args.destination_column,
             demand_column=args.demand_column,
         )
-        demand = demand_matrix(long_demand, centroids.ids)
+        demand = demand_matrix(long_demand, points.ids)
 
     demand = clip_minimum(demand, args.min_demand)
+    max_seconds = args.max_minutes * 60 if args.max_minutes else None
 
-    link_volume = assign_traffic(
-        network,
-        centroids.node_index,
-        demand,
-        max_seconds=args.max_minutes * 60 if args.max_minutes else None,
-        workers=args.workers,
-        chunk_size=args.chunk_size,
-    )
+    if isinstance(points, Zones):
+        link_volume = assign_zone_traffic(
+            network,
+            points,
+            demand,
+            max_seconds=max_seconds,
+            near_seconds=args.near_minutes * 60 if args.near_minutes else None,
+            workers=args.workers,
+            chunk_size=args.chunk_size,
+        )
+    else:
+        link_volume = assign_traffic(
+            network,
+            points.node_index,
+            demand,
+            max_seconds=max_seconds,
+            workers=args.workers,
+            chunk_size=args.chunk_size,
+        )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     frame = link_volume_frame(network, link_volume)
@@ -426,13 +513,90 @@ def cmd_assign(args: argparse.Namespace) -> int:
 
 
 def _add_routing(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--centroids", type=Path, required=True, help="CSV or vector file of points."
+    where = parser.add_mutually_exclusive_group(required=True)
+    where.add_argument(
+        "--centroids",
+        type=Path,
+        help=(
+            "CSV or vector file of points, one per zone. Every trip starts and "
+            "ends at the nearest network node to the point."
+        ),
+    )
+    where.add_argument(
+        "--zones",
+        type=Path,
+        help=(
+            "Vector file of zone polygons. Each zone's trip ends are spread "
+            "over --points-per-zone weighted access points inside it, which "
+            "keeps volumes off a single centroid node, makes short trips "
+            "realistic and lets intrazonal demand load onto the network."
+        ),
     )
     parser.add_argument("--id-column")
     parser.add_argument("--x-column", default="lon")
     parser.add_argument("--y-column", default="lat")
-    parser.add_argument("--centroid-crs", default="EPSG:4326")
+    parser.add_argument(
+        "--centroid-crs",
+        default="EPSG:4326",
+        help=(
+            "CRS to assume for a --centroids CSV, and for any --zones or "
+            "--weights layer that does not carry one of its own."
+        ),
+    )
+    parser.add_argument(
+        "--weights",
+        type=Path,
+        help=(
+            "With --zones: point or polygon layer saying where demand actually "
+            "sits -- buildings, address points, a population grid as points. "
+            "Without it, the network's own nodes are used, weighted by street "
+            "length, which needs no extra data and is a fair proxy for where "
+            "people are."
+        ),
+    )
+    parser.add_argument(
+        "--weight-column",
+        help=(
+            "Column in --weights giving each point's size (population, jobs, "
+            "floor area). Without it every point counts equally, which is "
+            "right for address points and wrong for a population grid."
+        ),
+    )
+    parser.add_argument(
+        "--points-per-zone",
+        type=int,
+        default=DEFAULT_POINTS_PER_ZONE,
+        help=(
+            "Access points per zone with --zones (default "
+            f"{DEFAULT_POINTS_PER_ZONE}). This is the cost dial: it multiplies "
+            "the number of shortest-path searches. 1 reproduces a single "
+            "weighted centroid. Accuracy saturates quickly, so raising it far "
+            "above the default buys little."
+        ),
+    )
+    parser.add_argument(
+        "--access-speed-kmh",
+        type=float,
+        help=(
+            "Speed for the leg between an access point and the network node it "
+            "snaps to (default: the mode's base speed). Snapping otherwise "
+            "teleports a trip end up to --max-snap-distance for free."
+        ),
+    )
+    parser.add_argument(
+        "--no-access-time",
+        action="store_true",
+        help="Don't charge for the snap distance; snapping is free, as with --centroids.",
+    )
+    parser.add_argument(
+        "--zone-points-gpkg",
+        type=Path,
+        help=(
+            "Also write the generated access points here as a GeoPackage. Worth "
+            "doing once for any new zone or weight layer -- bad placement shows "
+            "up here and nowhere else."
+        ),
+    )
     parser.add_argument("--max-snap-distance", type=float, default=DEFAULT_MAX_SNAP_M)
     parser.add_argument("--workers", type=int, default=default_workers())
     parser.add_argument("--chunk-size", type=int)
@@ -571,6 +735,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Cut off the search here. The single biggest speed-up available.",
     )
     matrix.add_argument(
+        "--near-minutes",
+        type=float,
+        help=(
+            "With --zones, route all access points only within this cutoff and "
+            "fall back to one representative point per zone beyond it. The "
+            "single-point error falls as (R/d)^2 in zone radius over separation "
+            "-- about 2 %% at five zone radii -- while a bounded search costs "
+            "roughly the square of its cutoff, so this recovers nearly all of "
+            "the accuracy for a fraction of the multi-point cost. Aim for "
+            "five or so zone radii."
+        ),
+    )
+    matrix.add_argument(
         "--omx",
         nargs="?",
         const=_OMX_DEFAULT_PATH,
@@ -656,6 +833,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         help="Don't search a source beyond this travel time. OD pairs further "
         "apart than this are dropped, unassigned.",
+    )
+    assign.add_argument(
+        "--near-minutes",
+        type=float,
+        help=(
+            "With --zones, route all access points only within this cutoff and "
+            "assign whatever they could not reach from one representative point "
+            "per zone. Spreading trip ends over a zone only changes the route "
+            "materially at short range, and a bounded search is far cheaper "
+            "than an open one, so this brings a --points-per-zone run back "
+            "towards the cost of a single-centroid one. Nothing is lost between "
+            "the tiers: the second one is given exactly what the first "
+            "reported it could not place."
+        ),
     )
     assign.set_defaults(func=cmd_assign)
 

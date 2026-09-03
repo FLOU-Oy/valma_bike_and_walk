@@ -93,46 +93,51 @@ def test_editing_the_highway_tag_changes_the_speed():
     assert slow["travel_time_s"].iloc[0] > fast["travel_time_s"].iloc[0]
 
 
+SIGNALLED_CYCLEWAY = {"highway": "cycleway", "crossing": "traffic_signals"}
+
+
 def test_traffic_light_penalty_applies_in_both_bike_directions():
-    links = normalise(
-        links_frame(
-            [
-                {
-                    **CHAIN[0],
-                    "crossing": "traffic_signals",
-                }
-            ],
-        ),
-        "bike",
+    """A red light is paid whichever way you ride through it."""
+    signalled = normalise(links_frame([{**CHAIN[0], **SIGNALLED_CYCLEWAY}]), "bike")
+    plain = normalise(links_frame([{**CHAIN[0], "highway": "cycleway"}]), "bike")
+    expected = (
+        plain["travel_time_s"].iloc[0] + links_module.TRAFFIC_LIGHT_PENALTY_SECONDS
     )
-    base = links["travel_time_reverse_s"].iloc[0]
-    assert links["travel_time_s"].iloc[0] == pytest.approx(
-        base + links_module.TRAFFIC_LIGHT_PENALTY_SECONDS
-    )
-    edges = directed_edges(links, "bike")
+
+    assert signalled["travel_time_s"].iloc[0] == pytest.approx(expected)
+    assert signalled["travel_time_reverse_s"].iloc[0] == pytest.approx(expected)
+
+    edges = directed_edges(signalled, "bike")
     assert edges.loc[edges["direction"] == 1, "travel_time_s"].iloc[0] == pytest.approx(
-        base + links_module.TRAFFIC_LIGHT_PENALTY_SECONDS
+        expected
     )
-    assert edges.loc[edges["direction"] == -1, "travel_time_s"].iloc[0] == pytest.approx(
-        base + links_module.TRAFFIC_LIGHT_PENALTY_SECONDS
+    assert edges.loc[edges["direction"] == -1, "travel_time_s"].iloc[
+        0
+    ] == pytest.approx(expected)
+
+
+def test_walking_pays_no_traffic_light_penalty():
+    """Pedestrian crossings are already in the walk speeds; charging again double-counts."""
+    signalled = normalise(links_frame([{**CHAIN[0], **SIGNALLED_CYCLEWAY}]), "walk")
+    plain = normalise(links_frame([{**CHAIN[0], "highway": "cycleway"}]), "walk")
+
+    assert signalled["travel_time_s"].iloc[0] == pytest.approx(
+        plain["travel_time_s"].iloc[0]
     )
-    walk_edges = directed_edges(
-        normalise(links_frame([{**CHAIN[0], "crossing": "traffic_signals"}]), "walk"),
-        "walk",
-    )
-    walk_base = walk_edges["travel_time_s"].iloc[0]
-    assert walk_edges["travel_time_s"].tolist() == pytest.approx(
-        [walk_base, walk_base]
+    edges = directed_edges(signalled, "walk")
+    assert edges["travel_time_s"].tolist() == pytest.approx(
+        [plain["travel_time_s"].iloc[0]] * 2
     )
 
 
 def test_non_signal_crossing_has_no_bike_penalty():
-    links = normalise(
-        links_frame([{**CHAIN[0], "crossing": "uncontrolled"}]),
+    signalled = normalise(
+        links_frame([{**CHAIN[0], "highway": "cycleway", "crossing": "uncontrolled"}]),
         "bike",
     )
-    assert links["travel_time_s"].iloc[0] == pytest.approx(
-        links["travel_time_reverse_s"].iloc[0]
+    plain = normalise(links_frame([{**CHAIN[0], "highway": "cycleway"}]), "bike")
+    assert signalled["travel_time_s"].iloc[0] == pytest.approx(
+        plain["travel_time_s"].iloc[0]
     )
 
 
@@ -194,71 +199,72 @@ def test_car_lane_crossing_tag_without_adjacent_signal_has_no_penalty():
     )
 
 
-def test_elevation_penalty_uses_ascent_thresholds_and_not_descent():
-    base_row = {**CHAIN[0], "length_m": 1_000.0}
-    links = links_frame(
-        [
-            {**base_row, "ascent_m": 20.0, "descent_m": 20.0},
-            {**base_row, "ascent_m": 30.0, "descent_m": 30.0, "link_id": 1},
-            {**base_row, "ascent_m": 60.0, "descent_m": 60.0, "link_id": 2},
-        ]
-    )
-    normalised = normalise(links, "bike")
-    base_seconds = 1_000.0 / (normalised["speed_kmh"].iloc[0] / 3.6)
+def _graded_links(profiles) -> gpd.GeoDataFrame:
+    """One roughly kilometre-long link per ``(up, down)`` pair of gradients.
 
-    assert normalised["travel_time_s"].to_numpy() == pytest.approx(
+    ``normalise`` recomputes ``length_m`` from the geometry rather than trusting
+    the column, so a test that wants a known gradient has to derive the ascent
+    from the real length instead of writing both down.
+    """
+    frame = links_frame(
         [
-            base_seconds,
-            base_seconds + 2.32 * 0.03 * 1_000,
-            base_seconds + 2.50 * 0.06 * 1_000,
+            {
+                "link_id": i,
+                "u": 2 * i + 1,
+                "v": 2 * i + 2,
+                "coords": [(24.000, 60.0 + 0.01 * i), (24.020, 60.0 + 0.01 * i)],
+            }
+            for i in range(len(profiles))
         ]
     )
-    assert normalised["travel_time_reverse_s"].to_numpy() == pytest.approx(
-        [
-            base_seconds,
-            base_seconds + 2.32 * 0.03 * 1_000,
-            base_seconds + 2.50 * 0.06 * 1_000,
-        ]
+    length = links_module.geometry_lengths(frame)
+    frame["ascent_m"] = length * np.array([up for up, _ in profiles])
+    frame["descent_m"] = length * np.array([down for _, down in profiles])
+    return frame
+
+
+def _flat_seconds(links: gpd.GeoDataFrame) -> np.ndarray:
+    """What each link would cost with no penalty at all."""
+    return links["length_m"].to_numpy() / (links["speed_kmh"].to_numpy() / 3.6)
+
+
+def test_elevation_penalty_uses_ascent_thresholds_and_not_descent():
+    """Below 2.5 % costs nothing; past 5 % the steeper factor takes over."""
+    normalised = normalise(
+        _graded_links([(0.02, 0.02), (0.03, 0.03), (0.06, 0.06)]), "bike"
     )
+    length = normalised["length_m"].to_numpy()
+    expected = (
+        _flat_seconds(normalised) + np.array([0.0, 2.32 * 0.03, 2.50 * 0.06]) * length
+    )
+
+    assert normalised["travel_time_s"].to_numpy() == pytest.approx(expected)
+    assert normalised["travel_time_reverse_s"].to_numpy() == pytest.approx(expected)
 
 
 def test_elevation_penalty_is_directional_for_an_asymmetric_profile():
-    links = links_frame(
-        [
-            {
-                **CHAIN[0],
-                "length_m": 1_000.0,
-                "ascent_m": 30.0,
-                "descent_m": 10.0,
-            }
-        ]
-    )
-    normalised = normalise(links, "bike")
-    base_seconds = 1_000.0 / (normalised["speed_kmh"].iloc[0] / 3.6)
+    normalised = normalise(_graded_links([(0.03, 0.01)]), "bike")
+    flat = _flat_seconds(normalised)[0]
+    length = normalised["length_m"].iloc[0]
 
     assert normalised["travel_time_s"].iloc[0] == pytest.approx(
-        base_seconds + 2.32 * 0.03 * 1_000
+        flat + 2.32 * 0.03 * length
     )
-    assert normalised["travel_time_reverse_s"].iloc[0] == pytest.approx(base_seconds)
+    # 1 % downhill is below the threshold, so the way back is just the flat time.
+    assert normalised["travel_time_reverse_s"].iloc[0] == pytest.approx(flat)
 
 
 def test_unrealistic_twenty_percent_grade_is_ignored():
-    links = links_frame(
-        [
-            {
-                **CHAIN[0],
-                "length_m": 1_000.0,
-                "ascent_m": 200.0,
-                "descent_m": 199.0,
-            }
-        ]
-    )
-    normalised = normalise(links, "bike")
-    base_seconds = 1_000.0 / (normalised["speed_kmh"].iloc[0] / 3.6)
+    """A grade that steep is a bad elevation sample, not a hill worth pricing."""
+    too_steep = links_module.GRADE_MAX_VALID + 0.02
+    steep = links_module.GRADE_MAX_VALID - 0.01
+    normalised = normalise(_graded_links([(too_steep, steep)]), "bike")
+    flat = _flat_seconds(normalised)[0]
+    length = normalised["length_m"].iloc[0]
 
-    assert normalised["travel_time_s"].iloc[0] == pytest.approx(base_seconds)
+    assert normalised["travel_time_s"].iloc[0] == pytest.approx(flat)
     assert normalised["travel_time_reverse_s"].iloc[0] == pytest.approx(
-        base_seconds + 2.50 * 0.199 * 1_000
+        flat + 2.50 * steep * length
     )
 
 

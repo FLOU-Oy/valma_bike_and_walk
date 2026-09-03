@@ -9,6 +9,7 @@ from valma_bike_and_walk.network import (
     network_from_links,
 )
 from valma_bike_and_walk.speeds import BIKE_PROFILE, WALK_PROFILE, SpeedProfile
+from valma_bike_and_walk.zones import Zones, load_zones
 
 __all__ = [
     "BIKE_PROFILE",
@@ -19,9 +20,11 @@ __all__ = [
     "SpeedProfile",
     "WALK_PROFILE",
     "WGS84",
+    "Zones",
     "build_links",
     "build_network",
     "load_network",
+    "load_zones",
     "network_from_links",
 ]
 

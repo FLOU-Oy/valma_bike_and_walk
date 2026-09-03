@@ -420,6 +420,150 @@ def test_cli_assign_draws_volumes_back_onto_the_link_layer(chain_pbf, tmp_path):
     assert (loaded["volume"] == 7).all()
 
 
+def zone_layer(path):
+    """Two boxes over the chain: nodes 1-2 in 'a', nodes 3-4 in 'b'."""
+    import shapely
+
+    frame = gpd.GeoDataFrame(
+        {"zone_id": ["a", "b"]},
+        geometry=[
+            shapely.box(23.9990, 59.9990, 24.0030, 60.0010),
+            shapely.box(24.0030, 59.9990, 24.0070, 60.0010),
+        ],
+        crs="EPSG:4326",
+    )
+    frame.to_file(path, layer="zones", driver="GPKG")
+    return path
+
+
+def extract_chain(chain_pbf, tmp_path):
+    out_dir, cache = tmp_path / "out", tmp_path / "cache"
+    main(
+        [
+            "extract",
+            "--pbf",
+            chain_pbf,
+            "--mode",
+            "walk",
+            "--output-dir",
+            str(out_dir),
+            "--cache-dir",
+            str(cache),
+        ]
+    )
+    return out_dir, cache, out_dir / "walk_links.gpkg"
+
+
+def test_cli_matrix_from_zone_polygons_has_a_nonzero_diagonal(chain_pbf, tmp_path):
+    out_dir, cache, links_path = extract_chain(chain_pbf, tmp_path)
+    zones = zone_layer(tmp_path / "zones.gpkg")
+    points_out = tmp_path / "zone_points.gpkg"
+
+    assert (
+        main(
+            [
+                "matrix",
+                "--links",
+                str(links_path),
+                "--mode",
+                "walk",
+                "--zones",
+                str(zones),
+                "--id-column",
+                "zone_id",
+                "--points-per-zone",
+                "2",
+                "--zone-points-gpkg",
+                str(points_out),
+                "--output-dir",
+                str(out_dir),
+                "--cache-dir",
+                str(cache),
+                "--workers",
+                "1",
+            ]
+        )
+        == 0
+    )
+
+    with np.load(out_dir / "travel_times_walk.npz") as data:
+        ids, seconds = data["ids"], data["seconds"]
+
+    np.testing.assert_array_equal(ids, ["a", "b"])
+    # The whole point of polygon zones: a trip inside one costs something.
+    assert seconds[0, 0] > 0
+    assert seconds[1, 1] > 0
+    assert seconds[0, 1] > seconds[0, 0]
+
+    assert len(gpd.read_file(points_out)) == 4
+
+
+def test_cli_assign_from_zone_polygons_loads_intrazonal_demand(chain_pbf, tmp_path):
+    out_dir, cache, links_path = extract_chain(chain_pbf, tmp_path)
+    zones = zone_layer(tmp_path / "zones.gpkg")
+
+    demand = tmp_path / "od.csv"
+    demand.write_text("origin_id,destination_id,demand\na,a,10\n")
+
+    assert (
+        main(
+            [
+                "assign",
+                "--links",
+                str(links_path),
+                "--mode",
+                "walk",
+                "--zones",
+                str(zones),
+                "--id-column",
+                "zone_id",
+                "--points-per-zone",
+                "2",
+                "--demand",
+                str(demand),
+                "--gpkg",
+                "--output-dir",
+                str(out_dir),
+                "--cache-dir",
+                str(cache),
+                "--workers",
+                "1",
+            ]
+        )
+        == 0
+    )
+
+    volumes = gpd.read_file(out_dir / "walk_volumes.gpkg", layer=LINKS_LAYER)
+    loaded = volumes[volumes["volume"] > 0]
+    # Demand wholly inside zone 'a' loads the link between its two nodes, and
+    # nothing else. A --centroids run would have dropped it entirely.
+    assert set(loaded["link_id"]) == {0}
+    assert loaded["volume"].sum() == pytest.approx(10.0)
+
+
+def test_cli_rejects_both_centroids_and_zones(chain_pbf, tmp_path):
+    _, cache, links_path = extract_chain(chain_pbf, tmp_path)
+    centroids = tmp_path / "points.csv"
+    centroids.write_text("id,lon,lat\na,24.000,60.000\n")
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "matrix",
+                "--links",
+                str(links_path),
+                "--mode",
+                "walk",
+                "--centroids",
+                str(centroids),
+                "--zones",
+                str(zone_layer(tmp_path / "zones.gpkg")),
+                "--cache-dir",
+                str(cache),
+            ]
+        )
+
+
 def test_cli_assign_gpkg_without_a_link_layer_explains_itself(chain_pbf, tmp_path):
     out_dir = tmp_path / "out"
     cache = tmp_path / "cache"
