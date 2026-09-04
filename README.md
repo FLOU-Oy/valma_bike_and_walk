@@ -121,6 +121,10 @@ export MML_API_KEY=...          # free, see "Elevation" below
 valma dem --links output/bike_links.gpkg
 #   -> z_u, z_v, ascent_m, descent_m added in place; tiles kept in .cache/dem/
 
+# Optional: carry car traffic volumes over from another network's links
+valma traffic --links output/bike_links.gpkg --volumes data/link_volumes.gpkg
+#   -> car_volume added in place, on the roads that carry cars
+
 # Route against the link layer directly -- the routable graph is built and
 # cached under .cache/ the first time, and reused after that
 valma matrix --links output/bike_links.gpkg --mode bike \
@@ -191,6 +195,7 @@ inside it (defaults: `--mode`, `zone_number`).
 | `oneway`, `oneway_bicycle`, `junction` | what sets the direction |
 | `length_m`, `speed_kmh`, `travel_time_s` | derived — recomputed on every build |
 | `speed_override_kmh` | **empty, for you**: a number here wins over the tags |
+| `car_volume` | cars a day sharing this link, after `valma traffic` — see below |
 
 What the build does with your edits:
 
@@ -746,6 +751,90 @@ one in the environment is too old, logging one line when it does; a newer PROJ,
 which may carry grid shifts we do not ship, is left alone. Whatever GDAL still
 has to say is logged once rather than once per tile.
 
+## Car traffic volumes
+
+How much traffic shares a road changes what it is like to cycle on, and a
+cyclist who would rather not ride beside four lanes of it goes another way. That
+number does not come from OSM. It comes from a traffic model, as a set of lines
+with a volume on each — and those lines are not our lines. They are a coarser
+network, digitised separately, agreeing with OSM to within a few metres.
+`valma traffic` is the map-matching step that carries the volume across.
+
+```bash
+valma traffic --links output/bike_links.gpkg --volumes data/link_volumes.gpkg
+valma traffic --links output/bike_links.gpkg --volumes model.gpkg \
+              --volume-column aadt --unmatched-out output/no_match.gpkg
+```
+
+Run it after `extract` and before anything routes: it is a link-layer stage, for
+the same reason elevation is. The columns then survive a QGIS edit, are re-read
+on every build, and can be corrected by hand where the match went wrong.
+
+**Columns added:**
+
+| column | meaning |
+|---|---|
+| `car_volume` | vehicles a day sharing this link; empty where nothing matched |
+| `car_volume_offset_m` | how far the model's line sat from ours — the number to style by when checking a match |
+| `car_volume_override` | **empty, for you**: a number here is the last word |
+
+Three things make it more than a nearest-neighbour join, and each is a real
+failure this data produces without it.
+
+**Only a road that carries cars may be given a volume.** A cycleway beside a main
+road is often *closer* to the model's centreline than the carriageway is, so
+proximity alone loads the traffic onto exactly the link it does not belong on.
+Candidates are drawn only from the car-carrying `highway` values; the cycle track
+next to a road is never one, whatever the distance.
+
+**A model link need not exist here at all.** Motorways are filtered out of the
+bicycle network, so a motorway's volume has nothing legitimate to land on — and
+a service road twenty metres away is a very tempting wrong answer. The defence is
+*coverage*: a source link is matched as a whole or not at all. Its length is
+sampled every 20 m, and unless half those samples find a road, every claim it
+made is thrown away. On the Espoo test area this is what separates the two
+populations cleanly: 75% of source links score exactly 1.0 and 19% exactly 0.0,
+so the threshold has a wide valley to sit in. Without it, Länsiväylä's 37 000
+vehicles a day land on the residential street beside it.
+
+**A divided road is two links here and one there.** The two carriageways are
+digitised in opposite directions, which is what lets them be recognised: a sample
+claims its best road, and then the best road running the *other* way, if both are
+one-way. When a source is claimed from both directions, the volume it carries is
+the two carriageways' total, so each gets half — otherwise a cyclist on one side
+of the central reservation is charged for the traffic on the other.
+
+The check that the whole thing is right is conservation, and it is what the run
+prints: **vehicle-kilometres carried across**, matched links against the sources
+they came from. On the whole of Finland — 126 139 source links onto 4.3 M bike
+links — it is 98%, with 522 313 links given a volume in 67 seconds. Without the
+divided-road split it would read 117%: the same traffic counted twice down every
+dual carriageway.
+
+```
+Volumes attached to 522,313 link(s), 89,799 km of 328,414 km that carry cars (27%);
+99,909 of 126,139 source link(s) used, 49,561 link(s) on a divided road took half a
+source's volume; vehicle-km carried across 98%, 25,684,696 veh-km on source links
+with no road here
+```
+
+That last figure is the traffic with nowhere to go — nearly all of it motorways,
+which is the correct answer rather than a shortfall. `--unmatched-out` writes
+those source links out with the share of each that found a road, so the ones
+worth a second look (a busy road at 0.4 coverage, not a motorway at 0.0) are one
+sort away.
+
+**The knobs**, if the source network is digitised differently from this one:
+`--max-distance` (12 m; genuine matches here sit at a median of 0.9 m and wrong
+ones start around 5), `--max-angle` (45°), `--min-coverage` (0.5),
+`--sample-spacing` (20 m). `--no-split-divided` turns off the halving, which is
+right only if your source layer already holds one directed link per carriageway.
+
+Nothing routes on `car_volume` yet — it is a column on the layer, not a term in
+the cost. Making a busy road cost a cyclist more is a change to
+`links._set_travel_times`, alongside the gradient penalty, and wants a
+coefficient from the same literature the speeds come from.
+
 ## Layout
 
 ```
@@ -761,9 +850,10 @@ src/valma_bike_and_walk/
 ├── demand.py      reading OD demand (long / .npz / OMX) as a sparse matrix, writing OMX
 ├── assignment.py  all-or-nothing assignment: demand -> per-link volumes
 ├── elevation.py   DEM tiles from the NLS: fetch, cache, height profiles
+├── traffic.py     another network's car volumes, matched onto our links
 ├── progress.py    a progress line with an ETA, for the slow loops
 ├── gpkg.py        draw a per-edge result back onto the link layer
-└── cli.py         dem / extract / build / matrix / assign
+└── cli.py         extract / dem / traffic / build / matrix / assign
 ```
 
 Data flows one way: `osm` → `links` → `network` → (`centroids` or `zones` +)
@@ -795,6 +885,7 @@ hand-built link layers and demand matrices, so the whole suite runs in seconds.
 | `test_routing.py` | SciPy routing, checked against NetworkX as an oracle |
 | `test_zones.py` | where access points land, and how they are weighted |
 | `test_zone_matrix.py` | the point-pair-to-zone-pair aggregation arithmetic |
+| `test_traffic.py` | which link a car volume lands on, and which it must not |
 
 Five invariants hold the design together. Breaking one is what the tests are
 mostly there to catch:

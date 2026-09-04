@@ -8,6 +8,9 @@ The pipeline is two stages, and the GeoPackage between them is the point:
   valma dem     --links output/bike_links.gpkg
      -> the same file, + z_u/z_v/ascent_m/descent_m  (optional; needs a key)
 
+  valma traffic --links output/bike_links.gpkg --volumes model_links.gpkg
+     -> the same file, + car_volume on the roads that carry cars   (optional)
+
   valma matrix  --links output/bike_links.gpkg --mode bike --centroids points.csv
   valma assign  --links output/bike_links.gpkg --mode bike --centroids points.csv \\
                 --demand od.csv --gpkg
@@ -98,6 +101,19 @@ from valma_bike_and_walk.network import (
     network_from_links,
 )
 from valma_bike_and_walk.osm import resolve_clip
+from valma_bike_and_walk.traffic import (
+    DEFAULT_MAX_ANGLE_DEG,
+    DEFAULT_MAX_DISTANCE_M,
+    DEFAULT_MIN_COVERAGE,
+    DEFAULT_SPACING_M,
+    DEFAULT_VOLUME_COLUMN,
+    VOLUME_COLUMN,
+    MatchSettings,
+    add_volumes,
+    read_volumes,
+    summarise as summarise_volumes,
+    unmatched_sources,
+)
 from valma_bike_and_walk.zones import (
     DEFAULT_POINTS_PER_ZONE,
     Zones,
@@ -322,6 +338,42 @@ def cmd_dem(args: argparse.Namespace) -> int:
         print(f"{len(tiles):,} tile(s) cached in {cache.directory}")
 
     print("\nElevation data (c) National Land Survey of Finland, CC BY 4.0.")
+    return 0
+
+
+def cmd_traffic(args: argparse.Namespace) -> int:
+    logger.info("Reading link layer from %s", args.links)
+    links = links_module.read_links(args.links)
+    volumes = read_volumes(
+        args.volumes, layer=args.volume_layer, column=args.volume_column
+    )
+    settings = MatchSettings(
+        max_distance_m=args.max_distance,
+        max_angle_deg=args.max_angle,
+        min_coverage=args.min_coverage,
+        spacing_m=args.sample_spacing,
+        split_divided=not args.no_split_divided,
+    )
+
+    links, match = add_volumes(links, volumes, settings)
+
+    out = args.out or args.links
+    logger.info("Writing link layer to %s", out)
+    links_module.write_links(links, out)
+    print(f"Car volumes written to {out} ({len(links):,} links)")
+    print(f"  {summarise_volumes(links, volumes, match)}")
+
+    if args.unmatched_out is not None:
+        missed = unmatched_sources(volumes, match)
+        missed.to_file(args.unmatched_out, driver="GPKG", layer="unmatched")
+        print(
+            f"  {len(missed):,} unmatched source link(s) -> {args.unmatched_out} "
+            "(mostly roads the bike network drops, such as motorways)"
+        )
+
+    matched = links[VOLUME_COLUMN].notna()
+    if matched.any():
+        print(f"  busiest matched link: {links.loc[matched, VOLUME_COLUMN].max():,.0f}")
     return 0
 
 
@@ -724,6 +776,102 @@ def build_parser() -> argparse.ArgumentParser:
         help="Where to write the elevated link layer (default: in place).",
     )
     dem.set_defaults(func=cmd_dem)
+
+    traffic = sub.add_parser(
+        "traffic",
+        help=(
+            "Attach car traffic volumes from another network's links to a link "
+            "layer, matching the two geometries."
+        ),
+    )
+    # Deliberately no --mode: the cars are on the road whichever way you are
+    # travelling over it, and the same match serves both link layers.
+    traffic.add_argument(
+        "--links",
+        type=Path,
+        required=True,
+        help="Link GeoPackage to attach the volumes to.",
+    )
+    traffic.add_argument(
+        "--volumes",
+        type=Path,
+        required=True,
+        help=(
+            "Vector layer of the other network's links, each carrying a car "
+            "volume. Any CRS; any format GDAL reads."
+        ),
+    )
+    traffic.add_argument(
+        "--volume-layer", help="Layer inside --volumes (default: the only one)."
+    )
+    traffic.add_argument(
+        "--volume-column",
+        default=DEFAULT_VOLUME_COLUMN,
+        help=f"Column holding the volume (default: {DEFAULT_VOLUME_COLUMN!r}).",
+    )
+    traffic.add_argument(
+        "--out",
+        type=Path,
+        help="Where to write the link layer with volumes (default: in place).",
+    )
+    traffic.add_argument(
+        "--unmatched-out",
+        type=Path,
+        help=(
+            "Also write the source links whose volume went nowhere, with the "
+            "share of each that found a road. Most of them are the roads the "
+            "bike network drops; the rest are what to check."
+        ),
+    )
+    traffic.add_argument(
+        "--max-distance",
+        type=float,
+        default=DEFAULT_MAX_DISTANCE_M,
+        help=(
+            "How far apart the two networks' lines may be and still be the same "
+            "road, in metres (default: %(default)s). Raise it for a source "
+            "network digitised more loosely, but not past the width of the gap "
+            "to the next road along."
+        ),
+    )
+    traffic.add_argument(
+        "--max-angle",
+        type=float,
+        default=DEFAULT_MAX_ANGLE_DEG,
+        help=(
+            "How far apart in bearing they may be, in degrees "
+            "(default: %(default)s). Keeps a crossing road from taking a "
+            "volume just because it passes close."
+        ),
+    )
+    traffic.add_argument(
+        "--min-coverage",
+        type=float,
+        default=DEFAULT_MIN_COVERAGE,
+        help=(
+            "Share of a source link that has to find a road before any of its "
+            "volume is used (default: %(default)s). This is what keeps a "
+            "motorway's volume off the service road beside it: the motorway is "
+            "not in the bike network, so most of the link finds nothing, so "
+            "none of it counts."
+        ),
+    )
+    traffic.add_argument(
+        "--sample-spacing",
+        type=float,
+        default=DEFAULT_SPACING_M,
+        help="How often a source link is sampled, in metres (default: %(default)s).",
+    )
+    traffic.add_argument(
+        "--no-split-divided",
+        action="store_true",
+        help=(
+            "Give both carriageways of a divided road the source's full volume "
+            "instead of half each. Right only if the source layer already holds "
+            "one directed link per carriageway."
+        ),
+    )
+    traffic.set_defaults(func=cmd_traffic)
 
     matrix = sub.add_parser("matrix", help="Compute an OD travel-time matrix.")
     _add_common(matrix)
