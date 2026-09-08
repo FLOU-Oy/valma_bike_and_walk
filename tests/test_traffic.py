@@ -85,7 +85,7 @@ def test_the_road_takes_the_volume_and_the_cycleway_beside_it_does_not():
 
     matched, _ = add_volumes(links, volumes)
 
-    assert volume_of(matched, 0) == 5000
+    assert volume_of(matched, 0) == 5000 / 16
     assert np.isnan(volume_of(matched, 1))
 
 
@@ -123,7 +123,7 @@ def test_a_motorway_missing_from_the_network_does_not_load_the_road_beside_it():
 
     matched, match = add_volumes(links, volumes)
 
-    assert np.isnan(volume_of(matched, 0))
+    assert volume_of(matched, 0) == 50
     assert not match.source_used.any()
     assert match.source_coverage[0] == pytest.approx(0.25, abs=0.06)
 
@@ -134,7 +134,7 @@ def test_lowering_the_coverage_threshold_lets_that_partial_match_through():
 
     matched, _ = add_volumes(links, volumes, MatchSettings(min_coverage=0.1))
 
-    assert volume_of(matched, 0) == 30000
+    assert volume_of(matched, 0) == 30000 / 16
 
 
 def test_unmatched_sources_come_back_with_the_share_that_found_a_road():
@@ -167,7 +167,7 @@ def test_one_source_link_covers_every_link_of_the_road_it_follows():
 
     matched, _ = add_volumes(links, volumes)
 
-    assert [volume_of(matched, i) for i in range(3)] == [4200, 4200, 4200]
+    assert [volume_of(matched, i) for i in range(3)] == [4200 / 16] * 3
 
 
 def test_a_road_crossing_at_a_right_angle_takes_none_of_the_volume():
@@ -181,8 +181,8 @@ def test_a_road_crossing_at_a_right_angle_takes_none_of_the_volume():
 
     matched, _ = add_volumes(links, volumes)
 
-    assert volume_of(matched, 0) == 9000
-    assert np.isnan(volume_of(matched, 1))
+    assert volume_of(matched, 0) == 9000 / 16
+    assert volume_of(matched, 1) == 50
 
 
 def test_a_source_further_off_than_the_tolerance_matches_nothing():
@@ -199,7 +199,7 @@ def test_a_source_further_off_than_the_tolerance_matches_nothing():
     matched, match = add_volumes(links, volumes)
 
     assert match.source_in_extent.all()
-    assert matched[VOLUME_COLUMN].isna().all()
+    assert matched[VOLUME_COLUMN].tolist() == [2000, 2000]
 
 
 def test_a_source_layer_covering_the_whole_country_is_not_all_a_failed_match():
@@ -214,7 +214,7 @@ def test_a_source_layer_covering_the_whole_country_is_not_all_a_failed_match():
 
     matched, match = add_volumes(links, volumes)
 
-    assert volume_of(matched, 0) == 9000
+    assert volume_of(matched, 0) == 9000 / 16
     assert list(match.source_in_extent) == [True, False]
     assert np.isnan(match.source_coverage[1])
     # The far-away source is somewhere else, not a match that failed.
@@ -233,7 +233,7 @@ def test_the_nearer_of_two_sources_wins_the_link_outright():
 
     matched, _ = add_volumes(links, volumes)
 
-    assert volume_of(matched, 0) == 1000
+    assert volume_of(matched, 0) == 1000 / 16
 
 
 # --------------------------------------------------------------------------
@@ -258,8 +258,8 @@ def test_a_divided_roads_carriageways_get_half_the_volume_each():
 
     matched, match = add_volumes(links, volumes)
 
-    assert volume_of(matched, 0) == 4000
-    assert volume_of(matched, 1) == 4000
+    assert volume_of(matched, 0) == 4000 / 16
+    assert volume_of(matched, 1) == 4000 / 16
     assert match.divided.all()
 
 
@@ -268,8 +268,8 @@ def test_the_split_can_be_turned_off_for_an_already_directed_source():
 
     matched, match = add_volumes(links, volumes, MatchSettings(split_divided=False))
 
-    assert volume_of(matched, 0) == 8000
-    assert volume_of(matched, 1) == 8000
+    assert volume_of(matched, 0) == 8000 / 16
+    assert volume_of(matched, 1) == 8000 / 16
     assert not match.divided.any()
 
 
@@ -286,7 +286,7 @@ def test_two_way_roads_are_never_read_as_a_divided_pair():
     matched, match = add_volumes(links, volumes)
 
     assert not match.divided.any()
-    assert matched[VOLUME_COLUMN].max() == 8000
+    assert matched[VOLUME_COLUMN].max() == 8000 / 16
 
 
 def test_a_roundabout_is_not_mistaken_for_a_divided_road():
@@ -360,7 +360,7 @@ def test_a_source_in_another_crs_is_matched_in_metres_all_the_same():
 
     matched, _ = add_volumes(links, volumes)
 
-    assert volume_of(matched, 0) == 7000
+    assert volume_of(matched, 0) == 7000 / 16
 
 
 # --------------------------------------------------------------------------
@@ -376,6 +376,51 @@ def test_the_layer_comes_back_with_the_offset_and_an_empty_override():
 
     assert matched[OFFSET_COLUMN].iloc[0] == pytest.approx(3.0, abs=0.1)
     assert matched[OVERRIDE_COLUMN].isna().all()
+
+
+def test_unmatched_car_links_get_highway_default_volumes():
+    links = link_layer(
+        [
+            {"highway": "primary", "coords": [(0, 0), (200, 0)]},
+            {"highway": "primary_link", "coords": [(0, 10), (200, 10)]},
+            {"highway": "secondary", "coords": [(0, 20), (200, 20)]},
+            {"highway": "secondary_link", "coords": [(0, 30), (200, 30)]},
+            {"highway": "tertiary", "coords": [(0, 40), (200, 40)]},
+            {"highway": "tertiary_link", "coords": [(0, 50), (200, 50)]},
+            {"highway": "service", "coords": [(0, 60), (200, 60)]},
+            {"highway": "unclassified", "coords": [(0, 70), (200, 70)]},
+            {"highway": "residential", "coords": [(0, 80), (200, 80)]},
+            {"highway": "living_street", "coords": [(0, 90), (200, 90)]},
+            {"highway": "cycleway", "coords": [(0, 100), (200, 100)]},
+        ]
+    )
+    volumes = volume_layer([{"volume": 12000, "coords": [(0, 0), (200, 0)]}])
+
+    matched, _ = add_volumes(links, volumes)
+
+    assert matched[VOLUME_COLUMN].iloc[:10].tolist() == [
+        12000.0 / 16,
+        2000.0,
+        750.0,
+        750.0,
+        50.0,
+        250.0,
+        50.0,
+        50.0,
+        50.0,
+        50.0,
+    ]
+    assert np.isnan(matched[VOLUME_COLUMN].iloc[10])
+
+
+def test_existing_car_volume_is_kept_when_no_source_link_matches():
+    links = link_layer([{"highway": "primary", "coords": [(0, 0), (200, 0)]}])
+    links[VOLUME_COLUMN] = [1750]
+    volumes = volume_layer([{"volume": 12000, "coords": [(0, 25), (200, 25)]}])
+
+    matched, _ = add_volumes(links, volumes)
+
+    assert volume_of(matched, 0) == 1750
 
 
 def test_bad_settings_are_refused_before_any_work_is_done():
@@ -417,6 +462,6 @@ def test_the_traffic_command_writes_the_volumes_back_into_the_link_layer(tmp_pat
 
     back = gpd.read_file(links_path, layer=LINKS_LAYER)
     by_id = back.set_index("link_id")[VOLUME_COLUMN]
-    assert by_id.loc[0] == 12000
+    assert by_id.loc[0] == 12000 / 16
     assert np.isnan(by_id.loc[1])
     assert missed_path.exists()

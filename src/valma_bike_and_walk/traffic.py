@@ -34,10 +34,9 @@ the source layer's own on the Espoo test area, against 117% without the split.
 
 Columns added
 -------------
-``car_volume``            vehicles a day sharing this link, empty where nothing
-                          matched -- which means either the link carries no cars
-                          or the model has no link here, and ``highway`` says
-                          which.
+``car_volume``            representative hourly vehicles sharing this link when
+                          matched from the source layer; unmatched links use the
+                          highway fallback values below.
 ``car_volume_offset_m``   how far the model's line sat from ours, averaged over
                           the samples that matched. The one number to style the
                           layer by when checking a match by eye.
@@ -142,6 +141,23 @@ OVERRIDE_COLUMN = "car_volume_override"
 
 #: Column read from the source layer unless another is named.
 DEFAULT_VOLUME_COLUMN = "volume"
+
+# Source volumes are daily totals; store their representative hourly equivalent.
+SOURCE_VOLUME_TO_HOUR = 16.0
+
+# Fallback volumes for car-carrying links that did not match a source link.
+DEFAULT_CAR_VOLUMES = {
+    "primary": 1000 /2,
+    "primary_link": 1000 /2,
+    "secondary": 200 /2,
+    "secondary_link": 200 /2,
+    "tertiary": 50 /2,
+    "tertiary_link": 50 /2,
+    "service": 50 /2,
+    "unclassified": 50 /2,
+    "residential": 50 /2,
+    "living_street": 50 /2,
+}
 
 
 @dataclass(frozen=True)
@@ -676,11 +692,18 @@ def add_volumes(
     match = match_volumes(links, volumes, settings)
 
     links = links.copy()
-    volume = np.full(len(links), np.nan)
+    if VOLUME_COLUMN in links.columns:
+        volume = pd.to_numeric(links[VOLUME_COLUMN], errors="coerce").to_numpy(
+            dtype=float
+        )
+    else:
+        volume = np.full(len(links), np.nan)
     offset = np.full(len(links), np.nan)
-    volume[match.link_row] = match.volume
+    volume[match.link_row] = match.volume / SOURCE_VOLUME_TO_HOUR
     offset[match.link_row] = match.offset_m
     links[VOLUME_COLUMN] = volume
+    defaults = links["highway"].map(DEFAULT_CAR_VOLUMES)
+    links[VOLUME_COLUMN] = links[VOLUME_COLUMN].fillna(defaults)
     links[OFFSET_COLUMN] = offset
     if OVERRIDE_COLUMN not in links.columns:
         links[OVERRIDE_COLUMN] = np.nan
