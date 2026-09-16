@@ -385,6 +385,7 @@ def link_speeds(links: gpd.GeoDataFrame, mode: str) -> np.ndarray:
         links["surface"] if "surface" in links.columns else None,
         links["segregated"] if "segregated" in links.columns else None,
         cycleway,
+        links["car_volume"] if "car_volume" in links.columns else None,
     )
     if OVERRIDE_COLUMN in links.columns:
         override = pd.to_numeric(links[OVERRIDE_COLUMN], errors="coerce").to_numpy(

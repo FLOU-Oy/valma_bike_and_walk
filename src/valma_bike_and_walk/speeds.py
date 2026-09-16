@@ -18,6 +18,8 @@ import numpy as np
 import pandas as pd
 
 SECONDS_PER_HOUR = 3600.0
+AVG_BASE_DISUTIL = 7.5
+TRAFFIC_COEFFICIENT = 0.008
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,7 @@ class SpeedProfile:
         surface: pd.Series | None = None,
         segregated: pd.Series | None = None,
         cycleway: pd.Series | None = None,
+        car_volume: pd.Series | None = None,
     ) -> np.ndarray:
         """
         Vectorised speed lookup for a whole edge table.
@@ -78,6 +81,17 @@ class SpeedProfile:
         if segregated is not None and self.name == "bike":
             factor = factor * segregated.eq("yes").astype(float).mul(0.10).add(1.0)
 
+        if car_volume is not None and self.name == "bike":
+            volume = pd.to_numeric(car_volume, errors="coerce")
+            finite_volume = volume.notna().to_numpy(dtype=bool)
+            traffic_factor = np.where(
+                finite_volume,
+                AVG_BASE_DISUTIL
+                / (AVG_BASE_DISUTIL + TRAFFIC_COEFFICIENT * volume),
+                1.0,
+            )
+            factor = factor * pd.Series(traffic_factor, index=highway.index)
+
         return np.clip(base * factor, self.min_kph, self.max_kph).to_numpy(dtype=float)
 
     def travel_times_seconds(
@@ -86,9 +100,10 @@ class SpeedProfile:
         highway: pd.Series,
         surface: pd.Series | None = None,
         segregated: pd.Series | None = None,
+        car_volume: pd.Series | None = None,
     ) -> np.ndarray:
         """Seconds to traverse each edge, given its length in metres."""
-        speed_ms = self.speeds_kph(highway, surface, segregated) * (
+        speed_ms = self.speeds_kph(highway, surface, segregated, car_volume=car_volume) * (
             1000.0 / SECONDS_PER_HOUR
         )
         return np.asarray(length_m, dtype=float) / speed_ms
@@ -188,16 +203,16 @@ BIKE_PROFILE = SpeedProfile(
             "footway": 4.0,
             "pedestrian": 6.0,
             "corridor": 5.0,
-            "living_street": 13.0 /1.927,
-            "residential": 18.0 /1.927,
-            "service": 13.0 /1.927,
-            "unclassified": 18.0 /1.927,
-            "tertiary": 18.0 /1.927,
-            "tertiary_link": 16.0 /1.927,
+            "living_street": 13.0 /1.927 /1.198,
+            "residential": 18.0 /1.927 /1.198,
+            "service": 13.0 /1.927 /1.198,
+            "unclassified": 18.0 /1.927 /1.198,
+            "tertiary": 18.0 /1.927 /1.198,
+            "tertiary_link": 16.0 /1.927 /1.198,
             "secondary": 18.0 /1.927,
             "secondary_link": 16.0 /1.927,
-            "primary": 18.0 /1.927,
-            "primary_link": 16.0 /1.927,
+            "primary": 18.0 /1.927 /0.978,
+            "primary_link": 16.0 /1.927 /0.978,
             "trunk": 18.0, 
             "trunk_link": 16.0,
         },

@@ -50,6 +50,38 @@ def test_segregated_cycleway_is_preferred_to_shared_cycleway():
     assert speeds[0] > speeds[1]
 
 
+def test_car_volume_uses_one_speed_multiplier_for_all_volumes():
+    highway = pd.Series(["cycleway"] * 4)
+    surface = pd.Series(["asphalt"] * 4)
+    volume = pd.Series([0.0, 100.0, 1000.0, 1001.0])
+    base_speed = BIKE_PROFILE.speeds_kph(highway, surface)
+
+    speeds = BIKE_PROFILE.speeds_kph(
+        highway, surface, car_volume=volume
+    )
+    expected = base_speed * np.array(
+        [
+            7.5 / (7.5 + 0.008 * 0.0),
+            7.5 / (7.5 + 0.008 * 100.0),
+            7.5 / (7.5 + 0.008 * 1000.0),
+            7.5 / (7.5 + 0.008 * 1001.0),
+        ]
+    )
+
+    assert speeds == pytest.approx(expected)
+
+
+def test_missing_car_volume_does_not_penalize_bike_speed():
+    highway = pd.Series(["primary", "cycleway"])
+    surface = pd.Series(["asphalt", "asphalt"])
+
+    speeds = BIKE_PROFILE.speeds_kph(
+        highway, surface, car_volume=pd.Series([None, np.nan])
+    )
+
+    assert speeds == pytest.approx(BIKE_PROFILE.speeds_kph(highway, surface))
+
+
 def test_speeds_are_clamped_to_profile_range():
     highway = pd.Series(["steps", "cycleway"])
     speeds = BIKE_PROFILE.speeds_kph(highway)
