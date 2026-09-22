@@ -54,8 +54,8 @@ def _find_sheet(sheets: list[str], token: str) -> str:
 
 
 def _city_name(path: Path) -> str:
-    """Return the city prefix from a counter workbook filename."""
-    return re.split(r"\s+(?:käpy|pyöräilijät)\b", path.stem, maxsplit=1, flags=re.IGNORECASE)[0]
+    """Return the first whitespace-delimited word from the workbook filename."""
+    return path.stem.split()[0]
 
 
 def _read_locations(path: Path, sheet: str) -> dict[str, tuple[float, float]]:
