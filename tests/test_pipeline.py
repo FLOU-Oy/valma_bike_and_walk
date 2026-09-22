@@ -246,7 +246,7 @@ def test_cli_matrix_omx_round_trips_through_read_demand_omx(chain_pbf, tmp_path)
     pytest.importorskip("openmatrix")
     out_dir = tmp_path / "out"
     cache = tmp_path / "cache"
-    links_path = out_dir / "walk_links.gpkg"
+    links_path = out_dir / "bike_links.gpkg"
     assert (
         main(
             [
@@ -254,7 +254,7 @@ def test_cli_matrix_omx_round_trips_through_read_demand_omx(chain_pbf, tmp_path)
                 "--pbf",
                 chain_pbf,
                 "--mode",
-                "walk",
+                "bike",
                 "--output-dir",
                 str(out_dir),
                 "--cache-dir",
@@ -275,7 +275,7 @@ def test_cli_matrix_omx_round_trips_through_read_demand_omx(chain_pbf, tmp_path)
                 "--links",
                 str(links_path),
                 "--mode",
-                "walk",
+                "bike",
                 "--centroids",
                 str(centroids),
                 "--id-column",
@@ -286,17 +286,16 @@ def test_cli_matrix_omx_round_trips_through_read_demand_omx(chain_pbf, tmp_path)
                 str(cache),
                 "--workers",
                 "1",
-                "--omx",
             ]
         )
         == 0
     )
 
-    omx_path = out_dir / "travel_times_walk.omx"
+    omx_path = out_dir / "travel_times_bike.omx"
     assert omx_path.exists()
 
-    npz_result = np.load(out_dir / "travel_times_walk.npz")
-    ids, matrix = read_demand_omx(omx_path, matrix_name="walk")
+    npz_result = np.load(out_dir / "travel_times_bike.npz")
+    ids, matrix = read_demand_omx(omx_path, matrix_name="bike")
     np.testing.assert_array_equal(ids, npz_result["ids"])
     np.testing.assert_allclose(
         matrix.toarray(), npz_result["seconds"], rtol=1e-5, atol=1e-2

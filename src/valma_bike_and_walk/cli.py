@@ -462,10 +462,10 @@ def cmd_matrix(args: argparse.Namespace) -> int:
         f"{out.stat().st_size / 1e6:.1f} MB)"
     )
 
-    if args.omx is not None:
+    if args.omx is not None or args.mode == "bike":
         omx_out = (
             args.output_dir / f"travel_times_{args.mode}.omx"
-            if args.omx is _OMX_DEFAULT_PATH
+            if args.omx is None or args.omx is _OMX_DEFAULT_PATH
             else args.omx
         )
         omx_out.parent.mkdir(parents=True, exist_ok=True)
@@ -907,7 +907,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Also write an OMX matrix, in the same matrix+lookup layout "
             "'valma assign' reads with --demand-matrix (needs integer "
             "centroid ids). Defaults to <output-dir>/travel_times_<mode>.omx; "
-            "give a path to write somewhere else."
+            "give a path to write somewhere else. Bike matrices are always "
+            "written as OMX as well."
         ),
     )
     matrix.add_argument(
