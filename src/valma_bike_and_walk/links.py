@@ -455,10 +455,20 @@ def directed_edges(links: gpd.GeoDataFrame, mode: str) -> pd.DataFrame:
         }
     )
 
+    # The way back can cost more than the way there -- uphill is the
+    # descent read backwards -- so it has its own time wherever there is one.
+    reverse_time = (
+        links["travel_time_reverse_s"].to_numpy(dtype=float)
+        if "travel_time_reverse_s" in links.columns
+        else base["travel_time_s"].to_numpy(dtype=float)
+    )
+
     if mode == "walk":
         forward = base.assign(direction=np.int8(1))
-        backward = base.rename(columns={"u": "v", "v": "u"}).assign(
-            direction=np.int8(-1)
+        backward = (
+            base.assign(travel_time_s=reverse_time)
+            .rename(columns={"u": "v", "v": "u"})
+            .assign(direction=np.int8(-1))
         )
         return pd.concat([forward, backward], ignore_index=True)
 
@@ -473,11 +483,6 @@ def directed_edges(links: gpd.GeoDataFrame, mode: str) -> pd.DataFrame:
     reverse_only = is_oneway & against
 
     forward = base.loc[along | two_way].assign(direction=np.int8(1))
-    reverse_time = (
-        links["travel_time_reverse_s"].to_numpy(dtype=float)
-        if "travel_time_reverse_s" in links.columns
-        else base["travel_time_s"].to_numpy(dtype=float)
-    )
     backward = (
         base.assign(travel_time_s=reverse_time)
         .loc[reverse_only | two_way]

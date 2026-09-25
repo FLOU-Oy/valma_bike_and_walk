@@ -30,13 +30,19 @@ def test_a_way_without_highway_is_never_a_link():
     assert not BIKE_FILTER.keeps({"waterway": "river"})
 
 
-def test_modes_disagree_about_corridors_and_cycleways():
+def test_modes_disagree_about_corridors():
     """The whole point of having two filters."""
     assert WALK_FILTER.keeps({"highway": "corridor"})
     assert not BIKE_FILTER.keeps({"highway": "corridor"})
 
+
+def test_walking_keeps_shared_cycleways_unless_told_otherwise():
+    """In Finland the shared foot and cycle path is tagged highway=cycleway."""
     assert BIKE_FILTER.keeps({"highway": "cycleway"})
-    assert not WALK_FILTER.keeps({"highway": "cycleway"})
+    assert WALK_FILTER.keeps({"highway": "cycleway"})
+    assert WALK_FILTER.keeps({"highway": "cycleway", "foot": "designated"})
+    assert not WALK_FILTER.keeps({"highway": "cycleway", "foot": "no"})
+    assert not WALK_FILTER.keeps({"highway": "cycleway", "foot": "use_sidepath"})
 
 
 def test_the_bike_filter_allows_dismount_and_push_ways():

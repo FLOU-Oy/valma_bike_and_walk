@@ -114,14 +114,19 @@ _MOTOR_HIGHWAY = ["motor", "motorway", "motorway_link"]
 #: Walkable ways. Service roads stay: a parking aisle is walkable even if it is
 #: not a pleasant walk. Ways whose sidewalk is mapped separately are dropped, so
 #: the sidewalk is not counted twice.
+#:
+#: Cycleways stay too, unlike OSMnx's filter. In Finland the shared foot and
+#: cycle path is tagged ``highway=cycleway`` (with ``foot=designated``), and it
+#: is very often the separately mapped sidewalk a road's ``sidewalk=separate``
+#: points at -- dropping both would leave the street with no walkable way at
+#: all. A cycleway walkers may not use says so with ``foot=no``, and one with
+#: its own footway alongside with ``foot=use_sidepath``.
 WALK_FILTER = WayFilter(
     {
         "area": ["yes"],
         "access": ["private"],
-        "highway": _ALWAYS_EXCLUDED_HIGHWAY
-        + ["bus_guideway", "cycleway"]
-        + _MOTOR_HIGHWAY,
-        "foot": ["no"],
+        "highway": _ALWAYS_EXCLUDED_HIGHWAY + ["bus_guideway"] + _MOTOR_HIGHWAY,
+        "foot": ["no", "use_sidepath"],
         "service": ["private"],
         "sidewalk": ["separate"],
         "sidewalk:both": ["separate"],

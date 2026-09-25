@@ -419,6 +419,67 @@ def test_cli_assign_draws_volumes_back_onto_the_link_layer(chain_pbf, tmp_path):
     assert (loaded["volume"] == 7).all()
 
 
+def test_cli_walk_model_writes_the_same_outputs_as_the_bike_model(chain_pbf, tmp_path):
+    """Travel-time .npz + .omx from `matrix`, volumes .npz + .gpkg from `assign`
+    with the 'walk' matrix of a multi-mode demand OMX -- as the bike model does."""
+    omx = pytest.importorskip("openmatrix")
+    out_dir, cache, links_path = extract_chain(chain_pbf, tmp_path)
+    centroids = tmp_path / "points.csv"
+    centroids.write_text("id,lon,lat\n1,24.000,60.000\n2,24.006,60.000\n")
+    routing = [
+        "--links",
+        str(links_path),
+        "--mode",
+        "walk",
+        "--centroids",
+        str(centroids),
+        "--id-column",
+        "id",
+        "--output-dir",
+        str(out_dir),
+        "--cache-dir",
+        str(cache),
+        "--workers",
+        "1",
+    ]
+
+    assert main(["matrix", *routing]) == 0
+    npz_result = np.load(out_dir / "travel_times_walk.npz")
+    ids, matrix = read_demand_omx(out_dir / "travel_times_walk.omx", matrix_name="walk")
+    np.testing.assert_array_equal(ids, npz_result["ids"])
+    np.testing.assert_allclose(
+        matrix.toarray(), npz_result["seconds"], rtol=1e-5, atol=1e-2
+    )
+
+    demand = tmp_path / "demand_vrk.omx"
+    with omx.open_file(str(demand), "w") as f:
+        f["bike"] = np.array([[0.0, 100.0], [100.0, 0.0]])
+        f["walk"] = np.array([[0.0, 7.0], [3.0, 0.0]])
+        f.create_mapping("zone_number", np.array([1, 2]))
+
+    assert (
+        main(
+            [
+                "assign",
+                *routing,
+                "--demand",
+                str(demand),
+                "--demand-matrix",
+                "walk",
+                "--gpkg",
+            ]
+        )
+        == 0
+    )
+    assert (out_dir / "link_volumes_walk.npz").exists()
+    volumes = gpd.read_file(out_dir / "walk_volumes.gpkg", layer=LINKS_LAYER)
+    forward = volumes[volumes["direction"] == 1]
+    backward = volumes[volumes["direction"] == -1]
+    # Seven trips one way and three back, the whole length of the chain.
+    assert (forward["volume"] == 7).all() and len(forward) == 3
+    assert (backward["volume"] == 3).all() and len(backward) == 3
+
+
 def zone_layer(path):
     """Two boxes over the chain: nodes 1-2 in 'a', nodes 3-4 in 'b'."""
     import shapely

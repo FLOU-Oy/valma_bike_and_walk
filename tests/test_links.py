@@ -254,6 +254,19 @@ def test_elevation_penalty_is_directional_for_an_asymmetric_profile():
     assert normalised["travel_time_reverse_s"].iloc[0] == pytest.approx(flat)
 
 
+def test_walking_pays_for_the_climb_only_in_the_uphill_direction():
+    """Walking is two-way everywhere, but a hill is still only uphill one way."""
+    normalised = normalise(_graded_links([(0.03, 0.01)]), "walk")
+    flat = _flat_seconds(normalised)[0]
+    length = normalised["length_m"].iloc[0]
+
+    edges = directed_edges(normalised, "walk")
+    uphill = edges.loc[edges["direction"] == 1, "travel_time_s"].iloc[0]
+    downhill = edges.loc[edges["direction"] == -1, "travel_time_s"].iloc[0]
+    assert uphill == pytest.approx(flat + 2.32 * 0.03 * length)
+    assert downhill == pytest.approx(flat)
+
+
 def test_unrealistic_twenty_percent_grade_is_ignored():
     """A grade that steep is a bad elevation sample, not a hill worth pricing."""
     too_steep = links_module.GRADE_MAX_VALID + 0.02
