@@ -28,6 +28,7 @@ def edges_to_geodataframe(
     network: RoutableNetwork,
     links: gpd.GeoDataFrame,
     extra_columns: dict[str, np.ndarray] | None = None,
+    edge_mask: np.ndarray | None = None,
 ) -> gpd.GeoDataFrame:
     """
     One row per directed edge: the link's geometry, its endpoints and its costs.
@@ -42,27 +43,37 @@ def edges_to_geodataframe(
     volume array from :func:`valma_bike_and_walk.assignment.link_volume_frame`
     is aligned with the network's edges exactly as this function's own columns
     are.
+
+    ``edge_mask``, if given, is a boolean per edge: only the edges it marks get
+    a row, and ``links`` need only hold theirs. This is how island connectors
+    are left off a map without being left out of the graph.
     """
     rows = np.repeat(np.arange(network.n_nodes), np.diff(network.indptr))
     cols = network.indices
+    keep = (
+        np.ones(network.n_edges, dtype=bool)
+        if edge_mask is None
+        else np.asarray(edge_mask, dtype=bool)
+    )
+    rows, cols, link_id = rows[keep], cols[keep], network.link_id[keep]
 
     geometry_by_link = links.set_index("link_id").geometry
-    missing = ~np.isin(network.link_id, geometry_by_link.index.to_numpy())
+    missing = ~np.isin(link_id, geometry_by_link.index.to_numpy())
     if missing.any():
         raise ValueError(
-            f"{int(missing.sum())} of {network.n_edges} edges reference a link_id that "
+            f"{int(missing.sum())} of {link_id.size} edges reference a link_id that "
             "is not in this link layer. It is not the layer this network was built "
             "from, or it has been edited since."
         )
 
-    length_m = network.length.astype(np.float64)
-    travel_time_s = network.travel_time
+    length_m = network.length[keep].astype(np.float64)
+    travel_time_s = network.travel_time[keep]
     with np.errstate(invalid="ignore", divide="ignore"):
         speed_kmh = np.where(travel_time_s > 0, length_m / travel_time_s * 3.6, np.nan)
 
     columns = {
-        "link_id": network.link_id,
-        "direction": network.direction,
+        "link_id": link_id,
+        "direction": network.direction[keep],
         "u": network.node_ids[rows],
         "v": network.node_ids[cols],
         "length_m": length_m,
@@ -70,11 +81,11 @@ def edges_to_geodataframe(
         "speed_kmh": speed_kmh,
     }
     if extra_columns:
-        columns.update(extra_columns)
+        columns.update({k: np.asarray(v)[keep] for k, v in extra_columns.items()})
 
     return gpd.GeoDataFrame(
         columns,
-        geometry=geometry_by_link.loc[network.link_id].to_numpy(),
+        geometry=geometry_by_link.loc[link_id].to_numpy(),
         crs=links.crs,
     )
 
@@ -85,6 +96,7 @@ def write_edges_gpkg(
     path: Path,
     layer: str = LINKS_LAYER,
     extra_columns: dict[str, np.ndarray] | None = None,
+    edge_mask: np.ndarray | None = None,
 ) -> Path:
     """
     Write the network's edges, with their link geometry, to a GeoPackage.
@@ -94,7 +106,9 @@ def write_edges_gpkg(
     """
     if isinstance(links, (str, Path)):
         links = read_links_gpkg(Path(links))
-    gdf = edges_to_geodataframe(network, links, extra_columns=extra_columns)
+    gdf = edges_to_geodataframe(
+        network, links, extra_columns=extra_columns, edge_mask=edge_mask
+    )
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -212,6 +212,7 @@ def write_omx_matrix(
     matrix_name: str,
     mapping_name: str = "zone_number",
     title: str = "",
+    units: str | None = None,
 ) -> None:
     """
     Write a dense matrix to OMX, in the same layout :func:`read_demand_omx` reads.
@@ -226,6 +227,9 @@ def write_omx_matrix(
     OD demand with ``valma assign --demand-matrix``, though a travel-time
     matrix is a strange thing to assign). Requires the optional
     ``openmatrix`` package.
+
+    ``units``, if given, is stored as the matrix's ``units`` attribute, so a
+    reader need not guess what the numbers mean.
     """
     try:
         import openmatrix as omx
@@ -261,6 +265,7 @@ def write_omx_matrix(
             matrix_name,
             obj=np.ascontiguousarray(matrix, dtype=np.float32),
             title=title,
+            attrs={"units": units} if units is not None else None,
         )
         f.create_mapping(mapping_name, id_entries)
 

@@ -556,12 +556,15 @@ def cmd_matrix(args: argparse.Namespace) -> int:
     )
     omx_out.parent.mkdir(parents=True, exist_ok=True)
     try:
+        # Minutes, unlike the .npz: the OMX goes to other modelling tools,
+        # and minutes is what they expect of a travel-time matrix.
         write_omx_matrix(
             omx_out,
             points.ids,
-            matrix,
+            matrix / 60.0,
             matrix_name=args.omx_matrix_name or args.mode,
             mapping_name=args.omx_mapping_name,
+            units="minutes",
         )
     except ValueError as exc:
         # Written by default, so ids OMX cannot hold only fail a run that asked.
@@ -648,11 +651,22 @@ def cmd_assign(args: argparse.Namespace) -> int:
     if args.gpkg:
         assert links_path is not None
         gpkg_path = args.output_dir / f"{args.mode}_volumes.gpkg"
-        layer = _link_layer(args) if args.links is not None else links_path
+        layer = links_module.read_links(args.links) if args.links else links_path
+        # Connectors carry no real traffic -- nobody rows across -- so they
+        # stay in link_volumes_<mode>.npz but are left off the map.
+        edge_mask = None
+        if args.connectors is not None:
+            connector_ids = links_module.read_links(args.connectors)["link_id"]
+            edge_mask = ~np.isin(network.link_id, connector_ids.to_numpy())
         write_edges_gpkg(
-            network, layer, gpkg_path, extra_columns={"volume": link_volume}
+            network,
+            layer,
+            gpkg_path,
+            extra_columns={"volume": link_volume},
+            edge_mask=edge_mask,
         )
-        print(f"Wrote {gpkg_path} ({network.n_edges:,} rows)")
+        rows = network.n_edges if edge_mask is None else int(edge_mask.sum())
+        print(f"Wrote {gpkg_path} ({rows:,} rows)")
 
     for key, value in summarise_assignment(link_volume).items():
         print(f"  {key}: {value:,.3f}")
@@ -1042,7 +1056,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         metavar="PATH",
         help=(
-            "Also write an OMX matrix, in the same matrix+lookup layout "
+            "Also write an OMX matrix of travel times in minutes, in the same "
+            "matrix+lookup layout "
             "'valma assign' reads with --demand-matrix (needs integer "
             "centroid ids). Always written, to "
             "<output-dir>/travel_times_<mode>.omx unless a path is given here."

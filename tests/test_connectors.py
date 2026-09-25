@@ -1,5 +1,6 @@
 """Island connectors: disconnected parts joined, not dropped."""
 
+import geopandas as gpd
 import numpy as np
 import pytest
 from scipy.sparse.csgraph import dijkstra
@@ -126,3 +127,40 @@ def test_connect_then_route_from_the_command_line(archipelago, tmp_path):
     assert list(with_islands["ids"]) == [1, 2]
     # Kept apart in its own cache file, not mistaken for the plain graph.
     assert (tmp_path / "cache" / "walk+walk_connectors.npz").exists()
+
+
+def test_assign_leaves_connectors_off_the_volume_map(archipelago, tmp_path):
+    links_path = write_links(archipelago, tmp_path / "walk_links.gpkg")
+    assert main(["connect", "--links", str(links_path), "--min-nodes", "3"]) == 0
+    connectors_path = tmp_path / "walk_connectors.gpkg"
+
+    centroids = tmp_path / "points.csv"
+    centroids.write_text("id,lon,lat\n1,24.0005,60.0\n2,24.0405,60.0\n")
+    demand = tmp_path / "od.csv"
+    demand.write_text("origin_id,destination_id,demand\n1,2,5\n2,1,5\n")
+
+    assert (
+        main(
+            [
+                "assign",
+                "--mode", "walk",
+                "--links", str(links_path),
+                "--connectors", str(connectors_path),
+                "--centroids", str(centroids),
+                "--id-column", "id",
+                "--demand", str(demand),
+                "--max-snap-distance", "100",
+                "--cache-dir", str(tmp_path / "cache"),
+                "--output-dir", str(tmp_path / "out"),
+                "--workers", "1",
+                "--gpkg",
+            ]  # fmt: skip
+        )
+        == 0
+    )
+    volumes = gpd.read_file(tmp_path / "out" / "walk_volumes.gpkg")
+    assert (volumes.link_id >= 0).all()
+    # Every link of the mainland and both islands is still drawn, both ways.
+    assert len(volumes) == 2 * len(archipelago.query("u < 30"))
+    # Without a cutoff the trips do cross, so the connectors did carry them.
+    assert volumes.volume.max() == pytest.approx(5.0)

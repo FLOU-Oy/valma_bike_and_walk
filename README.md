@@ -125,6 +125,10 @@ valma dem --links output/bike_links.gpkg
 valma traffic --links output/bike_links.gpkg --volumes data/link_volumes.gpkg
 #   -> car_volume added in place, on the roads that carry cars
 
+# Optional: keep islands in the graph -- see "Islands" below
+valma connect --links output/bike_links.gpkg
+#   -> output/bike_connectors.gpkg; add --connectors it to matrix/assign/build
+
 # Route against the link layer directly -- the routable graph is built and
 # cached under .cache/ the first time, and reused after that
 valma matrix --links output/bike_links.gpkg --mode bike \
@@ -152,8 +156,9 @@ Everything a command names in its output — the link layer, the matrix, the
 volumes — goes to `--output-dir` (default `output/`). Everything a command
 builds for itself along the way and would rebuild identically next time — the
 graph built from `--links`, and anything a `--pbf` run extracts — is cached
-under `--cache-dir` (default `.cache/`) instead, keyed on its inputs, and that
-directory is always safe to delete. If a graph is worth keeping as a named
+under `--cache-dir` (default `.cache/`) instead, keyed on its inputs and rebuilt
+when the link layer is newer than it, and that directory is always safe to
+delete. If a graph is worth keeping as a named
 file — routing against it many times over, or sharing it — run
 `valma build --links output/bike_links.gpkg --mode bike` explicitly; that
 writes `output/bike.npz`, which any later command can load directly with
@@ -176,9 +181,11 @@ and `--centroid-crs` if not). Any vector format GeoPandas reads works too.
 Points that snap no closer than `--max-snap-distance` (default 1000 m) are
 dropped, not silently routed from somewhere else. `valma matrix` writes an
 `.npz` holding `ids` and a float32 `seconds` matrix, rows and columns in `ids`
-order. Add `--omx` to also write `<output-dir>/travel_times_<mode>.omx` (or
-`--omx path/to/file.omx` to name it yourself), in the same matrix+lookup
-layout `valma assign --demand-matrix` reads (needs integer centroid ids); use
+order. It also writes `<output-dir>/travel_times_<mode>.omx` (or
+`--omx path/to/file.omx` to name it yourself) — in **minutes**, not seconds,
+with a `units` attribute on the matrix saying so — in the same matrix+lookup
+layout `valma assign --demand-matrix` reads — skipped with a log line if the
+centroid ids are not integers, which OMX cannot hold; use
 `--omx-matrix-name`/`--omx-mapping-name` to change the matrix/lookup names
 inside it (defaults: `--mode`, `zone_number`).
 
@@ -210,6 +217,42 @@ What the build does with your edits:
 
 Reprojecting the layer is fine — lengths are measured in `EPSG:3067` metres
 whatever CRS the file is in.
+
+### Islands
+
+The build keeps only the largest connected part of the network, which drops
+stray fragments but also every island's roads — and with them the zones on
+those islands, or it snaps them across the water to the mainland. `valma
+connect` writes a separate link layer with one straight connector per island,
+from its nearest node to the nearest node of another part of the network:
+
+```bash
+valma connect --links output/bike_links.gpkg
+#   -> output/bike_connectors.gpkg
+valma matrix --links output/bike_links.gpkg --connectors output/bike_connectors.gpkg              --mode bike --centroids centroids.csv --id-column id
+```
+
+`--connectors` works the same on `build` and `assign`. `assign --gpkg` leaves
+the connectors off the map; their volumes (normally none) are still in
+`link_volumes_<mode>.npz`. The graph built with it is cached apart
+from the plain one, as `.cache/bike+bike_connectors.npz`.
+
+- Connectors run at `--speed-kmh` (default 0.1 km/h, so 100 m costs an hour).
+  They are there to keep islands routable *within* themselves, not to make the
+  water crossable: a trip that needs one lands beyond any `--max-minutes`
+  cutoff and stays `inf` or unassigned.
+- Only parts of at least `--min-nodes` nodes (default 20) are connected. The
+  smaller ones are mostly mainland data gaps, and keeping them would pull
+  zones off a real street onto a fragment behind a connector.
+- Each island reaches for its *nearest* other part, and groups that touch then
+  reach again, so a chain of islands is joined island to island, not each one
+  straight to the mainland.
+- It is an ordinary link layer (`highway = connector`, negative `link_id`s,
+  `speed_override_kmh` set, `u_part_nodes`/`v_part_nodes` giving the size of
+  the part at each end). Open it in QGIS, delete or redraw connectors as you
+  like, and the next build uses your version.
+- An island with no roads at all in the PBF has nothing to connect; zones on it
+  are still dropped by `--max-snap-distance`.
 
 ### Assignment
 
@@ -774,7 +817,7 @@ on every build, and can be corrected by hand where the match went wrong.
 
 | column | meaning |
 |---|---|
-| `car_volume` | vehicles a day sharing this link; empty where nothing matched |
+| `car_volume` | representative hourly vehicles sharing this link; fallback values are used where no source link matched |
 | `car_volume_offset_m` | how far the model's line sat from ours — the number to style by when checking a match |
 | `car_volume_override` | **empty, for you**: a number here is the last word |
 
@@ -830,10 +873,51 @@ ones start around 5), `--max-angle` (45°), `--min-coverage` (0.5),
 `--sample-spacing` (20 m). `--no-split-divided` turns off the halving, which is
 right only if your source layer already holds one directed link per carriageway.
 
-Nothing routes on `car_volume` yet — it is a column on the layer, not a term in
-the cost. Making a busy road cost a cyclist more is a change to
-`links._set_travel_times`, alongside the gradient penalty, and wants a
-coefficient from the same literature the speeds come from.
+For cycling, every finite `car_volume` changes the speed on links carrying motor
+traffic using the multiplier `7.5 / (7.5 + 0.008 * car_volume)`. Missing volumes
+are not penalised.
+
+## The walking model
+
+Walking runs through exactly the same commands as cycling, with `--mode walk`,
+and writes the same four outputs: `travel_times_walk.npz` and `.omx` from
+`matrix`, `link_volumes_walk.npz` and `walk_volumes.gpkg` from `assign`. The
+Valma demand files carry both modes, so the only change on `assign` is
+`--demand-matrix walk`:
+
+```bash
+valma extract --pbf finland-highways.osm.pbf --mode walk
+valma dem     --links output/walk_links.gpkg              # optional
+valma matrix  --links output/walk_links.gpkg --mode walk \
+              --centroids centroids.csv --id-column id --max-minutes 60
+valma assign  --links output/walk_links.gpkg --mode walk \
+              --centroids centroids.csv --id-column id \
+              --demand demand_vrk.omx --demand-matrix walk \
+              --min-demand 0.1 --max-minutes 45 --gpkg
+```
+
+Where it differs from cycling, and why:
+
+- **Every way is two-way.** People ignore one-way signs; modelling them would
+  invent detours nobody walks.
+- **Shared foot and cycle paths are in.** In Finland these are tagged
+  `highway=cycleway`, and they are often the separately mapped sidewalk of the
+  road beside them, so the walk network keeps cycleways unless they say
+  `foot=no` or `foot=use_sidepath`.
+- **No car traffic or traffic-light term.** `car_volume` only affects cycling,
+  and pedestrian crossing waits are taken as part of the walking speeds.
+- **Hills cost the same as for cycling**, and only uphill: after `valma dem`
+  the climb is charged in whichever direction climbs, even though every way is
+  two-way.
+
+`valma traffic` is not needed for walking. `valma dem` works out the mode from
+a `<mode>_links.gpkg` file name (or give it `--mode`); that only affects the
+layer's `speed_kmh` column shown in QGIS, not the routing.
+
+Walking demand is dominated by short trips — in `demand_vrk.omx` a third of
+all walk trips are intrazonal. With `--centroids` those are dropped (there is
+no path from a node to itself); give `assign` zone polygons with `--zones` to
+load them onto local streets — see [Zones as polygons](#zones-as-polygons).
 
 ## Layout
 

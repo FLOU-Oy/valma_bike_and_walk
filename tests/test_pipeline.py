@@ -293,12 +293,16 @@ def test_cli_matrix_omx_round_trips_through_read_demand_omx(chain_pbf, tmp_path)
 
     omx_path = out_dir / "travel_times_bike.omx"
     assert omx_path.exists()
+    import openmatrix as omx
+
+    with omx.open_file(str(omx_path)) as f:
+        assert f["bike"].attrs["units"] == "minutes"
 
     npz_result = np.load(out_dir / "travel_times_bike.npz")
     ids, matrix = read_demand_omx(omx_path, matrix_name="bike")
     np.testing.assert_array_equal(ids, npz_result["ids"])
     np.testing.assert_allclose(
-        matrix.toarray(), npz_result["seconds"], rtol=1e-5, atol=1e-2
+        matrix.toarray(), npz_result["seconds"] / 60.0, rtol=1e-5, atol=1e-3
     )
 
 
@@ -448,7 +452,7 @@ def test_cli_walk_model_writes_the_same_outputs_as_the_bike_model(chain_pbf, tmp
     ids, matrix = read_demand_omx(out_dir / "travel_times_walk.omx", matrix_name="walk")
     np.testing.assert_array_equal(ids, npz_result["ids"])
     np.testing.assert_allclose(
-        matrix.toarray(), npz_result["seconds"], rtol=1e-5, atol=1e-2
+        matrix.toarray(), npz_result["seconds"] / 60.0, rtol=1e-5, atol=1e-3
     )
 
     demand = tmp_path / "demand_vrk.omx"
