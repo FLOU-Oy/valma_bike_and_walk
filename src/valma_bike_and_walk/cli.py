@@ -11,6 +11,10 @@ The pipeline is two stages, and the GeoPackage between them is the point:
   valma traffic --links output/bike_links.gpkg --volumes model_links.gpkg
      -> the same file, + car_volume on the roads that carry cars   (optional)
 
+  valma connect --links output/bike_links.gpkg
+     -> output/bike_connectors.gpkg: islands joined to the rest (optional;
+        pass it on with --connectors, or islands are dropped from the graph)
+
   valma matrix  --links output/bike_links.gpkg --mode bike --centroids points.csv
   valma assign  --links output/bike_links.gpkg --mode bike --centroids points.csv \\
                 --demand od.csv --gpkg
@@ -59,6 +63,12 @@ from valma_bike_and_walk.centroids import (
     DEFAULT_MAX_SNAP_M,
     Centroids,
     load_centroids,
+)
+from valma_bike_and_walk.connectors import (
+    DEFAULT_CONNECTOR_SPEED_KMH,
+    DEFAULT_MIN_COMPONENT_NODES,
+    island_connectors,
+    merge_connectors,
 )
 from valma_bike_and_walk.config import (
     DEFAULT_INDEX_STORAGE,
@@ -178,6 +188,15 @@ def _add_source(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--connectors",
+        type=Path,
+        help=(
+            "Connector link layer to add to --links, as written by 'valma "
+            "connect'. Keeps islands in the graph instead of dropping them "
+            "with the other disconnected parts."
+        ),
+    )
+    parser.add_argument(
         "--pbf",
         type=Path,
         help="Path to the .osm.pbf extract. Runs the extract stage itself.",
@@ -197,7 +216,29 @@ def _settings(args: argparse.Namespace) -> Settings:
 def _network_out(args: argparse.Namespace, settings: Settings) -> Path:
     """Where `valma build` writes the graph, and looks for it again."""
     out = getattr(args, "out", None)
-    return Path(out) if out else settings.network_path(args.mode, args.links)
+    if out:
+        return Path(out)
+    return settings.network_path(args.mode, args.links, args.connectors)
+
+
+def _link_layer(args: argparse.Namespace) -> gpd.GeoDataFrame:
+    """``--links``, with ``--connectors`` appended when given."""
+    links = links_module.read_links(args.links)
+    if args.connectors is not None:
+        links = merge_connectors(links, links_module.read_links(args.connectors))
+    return links
+
+
+def _is_stale(path: Path, *sources: Path | None) -> bool:
+    """
+    Whether a cached graph is older than anything it was built from.
+
+    The cache is named after its sources, not their contents, so a link layer
+    re-extracted under the same name would otherwise keep serving the graph of
+    the old one.
+    """
+    built = path.stat().st_mtime
+    return any(s is not None and Path(s).stat().st_mtime > built for s in sources)
 
 
 def _network_and_links(
@@ -229,11 +270,15 @@ def _network_and_links(
             # `matrix`/`assign` building it themselves, with no `valma build`
             # in between: a cache, not a deliverable, so callers need not know
             # it exists.
-            path = settings.network_cache_path_for_links(args.mode, args.links)
+            path = settings.network_cache_path_for_links(
+                args.mode, args.links, args.connectors
+            )
         if path.exists() and not args.force_reload:
-            logger.info("Loading network from %s", path)
-            return load_network(path), args.links
-        network = network_from_links(links_module.read_links(args.links), args.mode)
+            if not _is_stale(path, args.links, args.connectors):
+                logger.info("Loading network from %s", path)
+                return load_network(path), args.links
+            logger.info("%s is older than its link layer; rebuilding", path)
+        network = network_from_links(_link_layer(args), args.mode)
         network.save(path)
         return network, args.links
 
@@ -241,6 +286,11 @@ def _network_and_links(
         raise SystemExit(
             "Give one of --network (a built graph), --links (a link GeoPackage) "
             "or --pbf (to run both stages)."
+        )
+    if args.connectors is not None:
+        raise SystemExit(
+            "--connectors joins a link layer; run 'valma extract' and pass "
+            "--links instead of --pbf."
         )
 
     network = build_network(
@@ -277,6 +327,29 @@ def cmd_extract(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_connect(args: argparse.Namespace) -> int:
+    links = links_module.read_links(args.links)
+    connectors = island_connectors(
+        links, min_nodes=args.min_nodes, speed_kmh=args.speed_kmh
+    )
+    out = args.out or args.links.with_name(
+        f"{args.links.stem.removesuffix('_links')}_connectors.gpkg"
+    )
+    if connectors.empty:
+        print("The network is already in one piece; no connectors needed.")
+        return 0
+    links_module.write_links(connectors, out)
+    print(f"{len(connectors):,} connectors -> {out}")
+    print(
+        f"  longest {connectors['length_m'].max():,.0f} m, "
+        f"median {connectors['length_m'].median():,.0f} m, "
+        f"at {args.speed_kmh:g} km/h"
+    )
+    print("\nRoute with it by adding it to the link layer:")
+    print(f"  valma matrix --links {args.links} --connectors {out} --mode <mode> ...")
+    return 0
+
+
 def cmd_build(args: argparse.Namespace) -> int:
     network, links_path = _network_and_links(args, explicit_build=True)
     print(f"{args.mode}: {network.n_nodes:,} nodes, {network.n_edges:,} edges")
@@ -309,6 +382,20 @@ def _dem_cache(args: argparse.Namespace, settings: Settings) -> DemCache:
     )
 
 
+def _links_mode(args: argparse.Namespace) -> str:
+    """
+    The mode a link layer was extracted for, to refresh its derived columns.
+
+    ``--mode`` if given, else the ``<mode>_links.gpkg`` name ``valma extract``
+    writes by default, else bike. Only the styling columns depend on it; the
+    graph recomputes speeds and times from the tags on every build anyway.
+    """
+    if args.mode is not None:
+        return str(args.mode)
+    prefix = Path(args.links).stem.split("_", 1)[0]
+    return prefix if prefix in MODES else "bike"
+
+
 def cmd_dem(args: argparse.Namespace) -> int:
     settings = _settings(args)
     cache = _dem_cache(args, settings)
@@ -317,7 +404,7 @@ def cmd_dem(args: argparse.Namespace) -> int:
         logger.info("Reading link layer from %s", args.links)
         links = links_module.read_links(args.links)
         links = add_elevation(links, cache, workers=args.dem_workers)
-        links = links_module.normalise(links, "bike")
+        links = links_module.normalise(links, _links_mode(args))
         out = args.out or args.links
         logger.info("Writing link layer to %s", out)
         links_module.write_links(links, out)
@@ -462,13 +549,13 @@ def cmd_matrix(args: argparse.Namespace) -> int:
         f"{out.stat().st_size / 1e6:.1f} MB)"
     )
 
-    if args.omx is not None or args.mode == "bike":
-        omx_out = (
-            args.output_dir / f"travel_times_{args.mode}.omx"
-            if args.omx is None or args.omx is _OMX_DEFAULT_PATH
-            else args.omx
-        )
-        omx_out.parent.mkdir(parents=True, exist_ok=True)
+    omx_out = (
+        args.output_dir / f"travel_times_{args.mode}.omx"
+        if args.omx is None or args.omx is _OMX_DEFAULT_PATH
+        else args.omx
+    )
+    omx_out.parent.mkdir(parents=True, exist_ok=True)
+    try:
         write_omx_matrix(
             omx_out,
             points.ids,
@@ -476,6 +563,12 @@ def cmd_matrix(args: argparse.Namespace) -> int:
             matrix_name=args.omx_matrix_name or args.mode,
             mapping_name=args.omx_mapping_name,
         )
+    except ValueError as exc:
+        # Written by default, so ids OMX cannot hold only fail a run that asked.
+        if args.omx is not None:
+            raise
+        logger.info("Not writing %s: %s", omx_out, exc)
+    else:
         print(
             f"Wrote {omx_out} ({matrix.shape[0]}x{matrix.shape[1]}, "
             f"{omx_out.stat().st_size / 1e6:.1f} MB)"
@@ -555,8 +648,9 @@ def cmd_assign(args: argparse.Namespace) -> int:
     if args.gpkg:
         assert links_path is not None
         gpkg_path = args.output_dir / f"{args.mode}_volumes.gpkg"
+        layer = _link_layer(args) if args.links is not None else links_path
         write_edges_gpkg(
-            network, links_path, gpkg_path, extra_columns={"volume": link_volume}
+            network, layer, gpkg_path, extra_columns={"volume": link_volume}
         )
         print(f"Wrote {gpkg_path} ({network.n_edges:,} rows)")
 
@@ -726,6 +820,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     extract.set_defaults(func=cmd_extract)
 
+    connect = sub.add_parser(
+        "connect",
+        help=(
+            "Write connector links joining islands and other disconnected "
+            "parts to the rest of the network, so the build keeps them."
+        ),
+    )
+    connect.add_argument("--links", type=Path, required=True)
+    connect.add_argument(
+        "--out",
+        type=Path,
+        help="Where to write them (default: <links stem>_connectors.gpkg beside --links).",
+    )
+    connect.add_argument(
+        "--min-nodes",
+        type=int,
+        default=DEFAULT_MIN_COMPONENT_NODES,
+        help=(
+            "Only connect parts with at least this many nodes (default: "
+            "%(default)s). Smaller ones are mostly data gaps on the mainland, "
+            "better dropped as before so zones snap to a real street."
+        ),
+    )
+    connect.add_argument(
+        "--speed-kmh",
+        type=float,
+        default=DEFAULT_CONNECTOR_SPEED_KMH,
+        help=(
+            "Speed on a connector (default: %(default)s km/h -- 100 m costs "
+            "an hour). Deliberately prohibitive: the connectors keep islands "
+            "routable within themselves, not reachable across the water."
+        ),
+    )
+    connect.set_defaults(func=cmd_connect)
+
     build = sub.add_parser(
         "build",
         help=(
@@ -750,8 +879,17 @@ def build_parser() -> argparse.ArgumentParser:
         "dem",
         help="Fetch elevation tiles into the cache, and attach them to a link layer.",
     )
-    # Deliberately no --mode: the ground is the same height whichever way you
-    # travel over it, and one cache serves both modes.
+    # --mode is optional: the ground is the same height whichever way you travel
+    # over it, and one cache serves both modes. It only picks the speeds that
+    # refresh the layer's derived styling columns.
+    dem.add_argument(
+        "--mode",
+        choices=MODES,
+        help=(
+            "Mode the --links layer was extracted for (default: read from a "
+            "<mode>_links.gpkg file name, else bike)."
+        ),
+    )
     dem.add_argument("--cache-dir", type=Path, default=Path(".cache"))
     dem.add_argument("--output-dir", type=Path, default=Path("output"))
     dem.add_argument("--force-reload", action="store_true")
@@ -906,9 +1044,8 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Also write an OMX matrix, in the same matrix+lookup layout "
             "'valma assign' reads with --demand-matrix (needs integer "
-            "centroid ids). Defaults to <output-dir>/travel_times_<mode>.omx; "
-            "give a path to write somewhere else. Bike matrices are always "
-            "written as OMX as well."
+            "centroid ids). Always written, to "
+            "<output-dir>/travel_times_<mode>.omx unless a path is given here."
         ),
     )
     matrix.add_argument(

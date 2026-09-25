@@ -54,13 +54,27 @@ class Settings:
             raise ValueError("This step needs a .osm.pbf; none was configured.")
         return self.pbf_path
 
-    def _network_stem(self, mode: str, links_path: Path | str) -> str:
+    def _network_stem(
+        self,
+        mode: str,
+        links_path: Path | str,
+        connectors_path: Path | str | None = None,
+    ) -> str:
         stem = Path(links_path).stem.removesuffix("_links")
         if mode not in stem:
             stem = f"{stem}_{mode}"
+        if connectors_path is not None:
+            # A graph with connectors is a different graph: it must not be
+            # mistaken for the one built from the link layer alone.
+            stem = f"{stem}+{Path(connectors_path).stem}"
         return stem
 
-    def network_path(self, mode: str, links_path: Path | str) -> Path:
+    def network_path(
+        self,
+        mode: str,
+        links_path: Path | str,
+        connectors_path: Path | str | None = None,
+    ) -> Path:
         """
         Where `valma build` writes the graph for a link layer: a deliverable.
 
@@ -68,9 +82,15 @@ class Settings:
         `output/walk.npz`. The mode is added when the name does not already
         carry it, so two modes off one hand-named layer cannot collide.
         """
-        return self.output_dir / f"{self._network_stem(mode, links_path)}.npz"
+        stem = self._network_stem(mode, links_path, connectors_path)
+        return self.output_dir / f"{stem}.npz"
 
-    def network_cache_path_for_links(self, mode: str, links_path: Path | str) -> Path:
+    def network_cache_path_for_links(
+        self,
+        mode: str,
+        links_path: Path | str,
+        connectors_path: Path | str | None = None,
+    ) -> Path:
         """
         Where `matrix`/`assign` park a graph they built themselves from
         `--links`, without an explicit `valma build` in between.
@@ -79,7 +99,8 @@ class Settings:
         asked for this file by name, so it should not show up next to the
         results.
         """
-        return self.cache_dir / f"{self._network_stem(mode, links_path)}.npz"
+        stem = self._network_stem(mode, links_path, connectors_path)
+        return self.cache_dir / f"{stem}.npz"
 
     def links_cache_path(self, mode: str, extent_key: str) -> Path:
         """Where a `--pbf` run parks the link layer nobody asked for by name."""
