@@ -66,8 +66,12 @@ from valma_bike_and_walk.centroids import (
 )
 from valma_bike_and_walk.connectors import (
     DEFAULT_CONNECTOR_SPEED_KMH,
+    DEFAULT_GAP_M,
     DEFAULT_MIN_COMPONENT_NODES,
+    GAP,
+    KIND_COLUMN,
     island_connectors,
+    island_link_ids,
     merge_connectors,
 )
 from valma_bike_and_walk.config import (
@@ -111,6 +115,7 @@ from valma_bike_and_walk.network import (
     network_from_links,
 )
 from valma_bike_and_walk.osm import resolve_clip
+from valma_bike_and_walk.overlay import overlay, read_model_minutes, read_omx_dense
 from valma_bike_and_walk.traffic import (
     DEFAULT_MAX_ANGLE_DEG,
     DEFAULT_MAX_DISTANCE_M,
@@ -330,7 +335,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
 def cmd_connect(args: argparse.Namespace) -> int:
     links = links_module.read_links(args.links)
     connectors = island_connectors(
-        links, min_nodes=args.min_nodes, speed_kmh=args.speed_kmh
+        links, min_nodes=args.min_nodes, speed_kmh=args.speed_kmh, gap_m=args.gap_m
     )
     out = args.out or args.links.with_name(
         f"{args.links.stem.removesuffix('_links')}_connectors.gpkg"
@@ -339,14 +344,53 @@ def cmd_connect(args: argparse.Namespace) -> int:
         print("The network is already in one piece; no connectors needed.")
         return 0
     links_module.write_links(connectors, out)
+    gaps = connectors[KIND_COLUMN] == GAP
+    islands = connectors.loc[~gaps, "length_m"]
     print(f"{len(connectors):,} connectors -> {out}")
     print(
-        f"  longest {connectors['length_m'].max():,.0f} m, "
-        f"median {connectors['length_m'].median():,.0f} m, "
-        f"at {args.speed_kmh:g} km/h"
+        f"  {int(gaps.sum()):,} gap(s) under {args.gap_m:g} m, at the mode's "
+        "normal speed"
     )
+    if not islands.empty:
+        print(
+            f"  {len(islands):,} island crossing(s), median {islands.median():,.0f} m, "
+            f"longest {islands.max():,.0f} m, at {args.speed_kmh:g} km/h"
+        )
     print("\nRoute with it by adding it to the link layer:")
     print(f"  valma matrix --links {args.links} --connectors {out} --mode <mode> ...")
+    return 0
+
+
+def cmd_overlay(args: argparse.Namespace) -> int:
+    model_path = args.model or args.output_dir / f"travel_times_{args.mode}.npz"
+    base_ids, base = read_omx_dense(
+        args.baseline, args.baseline_matrix, args.baseline_mapping
+    )
+    if args.baseline_speed_kmh is not None:
+        # A distance matrix, in km: turn it into minutes at a fixed speed.
+        base *= np.float32(60.0 / args.baseline_speed_kmh)
+    model_ids, model = read_model_minutes(model_path)
+
+    result, replaced = overlay(
+        base_ids, base, model_ids, model, max_minutes=args.max_minutes
+    )
+    name = args.matrix_name or args.mode
+    write_omx_matrix(
+        args.out,
+        base_ids,
+        result,
+        matrix_name=name,
+        mapping_name=args.baseline_mapping,
+        units="minutes",
+        append=True,
+    )
+    print(
+        f"Wrote {name!r} to {args.out} ({result.shape[0]}x{result.shape[1]}, minutes)"
+    )
+    print(
+        f"  {replaced:,} of {result.size:,} cells ({replaced / result.size:.1%}) "
+        f"from {model_path}, the rest from {args.baseline} {args.baseline_matrix!r}"
+    )
     return 0
 
 
@@ -652,12 +696,15 @@ def cmd_assign(args: argparse.Namespace) -> int:
         assert links_path is not None
         gpkg_path = args.output_dir / f"{args.mode}_volumes.gpkg"
         layer = links_module.read_links(args.links) if args.links else links_path
-        # Connectors carry no real traffic -- nobody rows across -- so they
-        # stay in link_volumes_<mode>.npz but are left off the map.
         edge_mask = None
         if args.connectors is not None:
-            connector_ids = links_module.read_links(args.connectors)["link_id"]
-            edge_mask = ~np.isin(network.link_id, connector_ids.to_numpy())
+            # Gap connectors stand in for real paths, so they are drawn, from
+            # the connector layer's geometry. Island crossings carry no real
+            # traffic -- nobody rows across -- so they stay in
+            # link_volumes_<mode>.npz but are left off the map.
+            layer = _link_layer(args)
+            crossings = island_link_ids(links_module.read_links(args.connectors))
+            edge_mask = ~np.isin(network.link_id, crossings)
         write_edges_gpkg(
             network,
             layer,
@@ -867,7 +914,75 @@ def build_parser() -> argparse.ArgumentParser:
             "routable within themselves, not reachable across the water."
         ),
     )
+    connect.add_argument(
+        "--gap-m",
+        type=float,
+        default=DEFAULT_GAP_M,
+        help=(
+            "Connectors shorter than this (default: %(default)s m) bridge a gap "
+            "in the data, not water, and run at the mode's normal speed "
+            "instead of --speed-kmh. 0 makes every connector an island crossing."
+        ),
+    )
     connect.set_defaults(func=cmd_connect)
+
+    overlay_parser = sub.add_parser(
+        "overlay",
+        help=(
+            "Write this model's travel times over a baseline OMX matrix, so the "
+            "result has the baseline's full zone system."
+        ),
+    )
+    overlay_parser.add_argument("--mode", choices=MODES, required=True)
+    overlay_parser.add_argument("--output-dir", type=Path, default=Path("output"))
+    overlay_parser.add_argument(
+        "--model",
+        type=Path,
+        help=(
+            "Routed matrix, as written by 'valma matrix' (default: "
+            "<output-dir>/travel_times_<mode>.npz)."
+        ),
+    )
+    overlay_parser.add_argument(
+        "--baseline",
+        type=Path,
+        required=True,
+        help="OMX file whose matrix sets the zones and fills every cell the model does not.",
+    )
+    overlay_parser.add_argument(
+        "--baseline-matrix", required=True, help="Matrix inside --baseline, e.g. 'bike'."
+    )
+    overlay_parser.add_argument("--baseline-mapping", default="zone_number")
+    overlay_parser.add_argument(
+        "--baseline-speed-kmh",
+        type=float,
+        help=(
+            "Treat --baseline as distances in km and turn them into minutes at "
+            "this speed, e.g. 5 for walking. Without it, --baseline is taken "
+            "to be minutes already."
+        ),
+    )
+    overlay_parser.add_argument(
+        "--max-minutes",
+        type=float,
+        help=(
+            "Keep the baseline where the model's time is longer than this -- "
+            "e.g. trips that only route across a slow island connector."
+        ),
+    )
+    overlay_parser.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help=(
+            "OMX file to write. Added to if it exists, so bike and walk runs "
+            "can share one file; a matrix of the same name is replaced."
+        ),
+    )
+    overlay_parser.add_argument(
+        "--matrix-name", help="Name of the matrix to write (default: --mode)."
+    )
+    overlay_parser.set_defaults(func=cmd_overlay)
 
     build = sub.add_parser(
         "build",

@@ -14,6 +14,14 @@ absurd speed, so a route across one costs hours: trips *within* an island route
 normally, and trips across the water are effectively impossible -- beyond any
 ``--max-minutes`` cutoff, and never a shortcut for anyone else.
 
+Not every disconnected part is an island. A connector only a few metres long is
+bridging a gap in the data -- a courtyard path whose junction with the street
+was never drawn -- and a zone snapped onto that path would pay the absurd speed
+for no reason. Connectors shorter than ``gap_m`` are therefore *gaps*: they get
+no speed override, so the build gives them the mode's base speed like any
+other untagged link, and they are routed and drawn as the path they stand in
+for. Only the longer ones are *islands*. The ``kind`` column says which.
+
 The layer is an ordinary link layer (same columns, same ``links`` layer name),
 so it opens in QGIS next to the one it was built from, and any connector can be
 deleted or redrawn by hand. Connectors have ``highway = "connector"``, negative
@@ -51,6 +59,16 @@ CONNECTOR_HIGHWAY = "connector"
 #: trip: 100 m of connector is an hour. Trips that would need one fall outside
 #: the search cutoff instead of loading onto a route that does not exist.
 DEFAULT_CONNECTOR_SPEED_KMH = 0.1
+
+#: Connectors shorter than this are taken to bridge a gap in the data rather
+#: than water, and are routed at normal speed. Of the bike network's
+#: connectors, about a quarter are under 50 m, and those are mostly paths a few
+#: metres short of the street they obviously meet.
+DEFAULT_GAP_M = 50.0
+
+KIND_COLUMN = "kind"
+GAP = "gap"
+ISLAND = "island"
 
 #: Parts smaller than this are left out, and dropped by the build as before.
 #: The fragments below it are almost all data gaps on the mainland -- a
@@ -165,12 +183,14 @@ def island_connectors(
     links: gpd.GeoDataFrame,
     min_nodes: int = DEFAULT_MIN_COMPONENT_NODES,
     speed_kmh: float = DEFAULT_CONNECTOR_SPEED_KMH,
+    gap_m: float = DEFAULT_GAP_M,
 ) -> gpd.GeoDataFrame:
     """
     Connector links joining every part of at least ``min_nodes`` to the rest.
 
-    Returns a link layer in ``links``' CRS, empty if the network is already in
-    one piece.
+    Connectors of at least ``gap_m`` run at ``speed_kmh``; shorter ones are
+    gaps, at the routed mode's own base speed. Returns a link layer in
+    ``links``' CRS, empty if the network is already in one piece.
     """
     if speed_kmh <= 0:
         raise ValueError("Connector speed must be positive.")
@@ -232,7 +252,9 @@ def island_connectors(
             "  %d group(s) searched, %d connector(s) so far", searching.size, len(edges)
         )
 
-    return _connector_frame(ids, xy, edges, speed_kmh, links.crs, labels, counts)
+    return _connector_frame(
+        ids, xy, edges, speed_kmh, gap_m, links.crs, labels, counts
+    )
 
 
 def _connector_frame(
@@ -240,12 +262,15 @@ def _connector_frame(
     xy: np.ndarray,
     edges: list[tuple[int, int, float]],
     speed_kmh: float,
+    gap_m: float,
     crs,
     labels: np.ndarray,
     counts: np.ndarray,
 ) -> gpd.GeoDataFrame:
     source = np.array([e[0] for e in edges], dtype=np.int64)
     target = np.array([e[1] for e in edges], dtype=np.int64)
+    length = np.array([e[2] for e in edges], dtype=float)
+    gap = length < gap_m
     geometry = gpd.GeoSeries(
         shapely.linestrings(
             np.stack([xy[source], xy[target]], axis=1).reshape(-1, 2),
@@ -261,8 +286,11 @@ def _connector_frame(
             "u": ids[source],
             "v": ids[target],
             "highway": pd.Series([CONNECTOR_HIGHWAY] * source.shape[0], dtype=object),
-            OVERRIDE_COLUMN: np.full(source.shape[0], float(speed_kmh)),
-            "length_m": np.array([e[2] for e in edges], dtype=float),
+            KIND_COLUMN: pd.Series(np.where(gap, GAP, ISLAND), dtype=object),
+            # No override on a gap: the profile's fallback for an unknown
+            # highway is the mode's base speed, which is what a gap should be.
+            OVERRIDE_COLUMN: np.where(gap, np.nan, float(speed_kmh)),
+            "length_m": length,
             # How big the part on each end is -- the thing to sort by in QGIS
             # when checking whether a connector should be there at all.
             "u_part_nodes": counts[labels[source]].astype(np.int64),
@@ -271,6 +299,19 @@ def _connector_frame(
         geometry=geometry.to_crs(crs).to_numpy(),
         crs=crs,
     )
+
+
+def island_link_ids(connectors: gpd.GeoDataFrame) -> np.ndarray:
+    """
+    ``link_id``s of the connectors that cross water rather than a data gap.
+
+    A layer written before gaps were told apart has no ``kind`` column; all of
+    its connectors are islands.
+    """
+    ids = connectors["link_id"].to_numpy()
+    if KIND_COLUMN not in connectors.columns:
+        return ids
+    return ids[(connectors[KIND_COLUMN] != GAP).to_numpy()]
 
 
 def merge_connectors(
