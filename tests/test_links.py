@@ -116,17 +116,34 @@ def test_traffic_light_penalty_applies_in_both_bike_directions():
     ] == pytest.approx(expected)
 
 
-def test_walking_pays_no_traffic_light_penalty():
-    """Pedestrian crossings are already in the walk speeds; charging again double-counts."""
-    signalled = normalise(links_frame([{**CHAIN[0], **SIGNALLED_CYCLEWAY}]), "walk")
-    plain = normalise(links_frame([{**CHAIN[0], "highway": "cycleway"}]), "walk")
+def test_walking_pays_the_traffic_light_penalty_both_ways():
+    """The walk speeds are pace in motion; the wait at a red light is extra."""
+    signalled = normalise(
+        links_frame([{**CHAIN[0], "highway": "footway", "crossing": "traffic_signals"}]),
+        "walk",
+    )
+    plain = normalise(links_frame([{**CHAIN[0], "highway": "footway"}]), "walk")
+    expected = (
+        plain["travel_time_s"].iloc[0]
+        + links_module.WALK_TRAFFIC_LIGHT_PENALTY_SECONDS
+    )
 
+    assert signalled["travel_time_s"].iloc[0] == pytest.approx(expected)
+    edges = directed_edges(signalled, "walk")
+    assert edges["travel_time_s"].tolist() == pytest.approx([expected] * 2)
+
+
+def test_walking_along_a_road_pays_at_a_signalled_junction():
+    signalled = normalise(
+        links_frame(
+            [{**CHAIN[0], "highway": "primary", "traffic_signal_at_end": True}]
+        ),
+        "walk",
+    )
+    plain = normalise(links_frame([{**CHAIN[0], "highway": "primary"}]), "walk")
     assert signalled["travel_time_s"].iloc[0] == pytest.approx(
         plain["travel_time_s"].iloc[0]
-    )
-    edges = directed_edges(signalled, "walk")
-    assert edges["travel_time_s"].tolist() == pytest.approx(
-        [plain["travel_time_s"].iloc[0]] * 2
+        + links_module.WALK_TRAFFIC_LIGHT_PENALTY_SECONDS
     )
 
 

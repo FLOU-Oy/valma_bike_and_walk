@@ -74,6 +74,10 @@ OVERRIDE_COLUMN = "speed_override_kmh"
 
 TRAFFIC_LIGHT_PENALTY_SECONDS = 15.0
 
+#: The same wait on foot. The walk speeds are walking pace in motion, so the
+#: time spent standing at a red light is not in them and is charged here.
+WALK_TRAFFIC_LIGHT_PENALTY_SECONDS = 15.0
+
 GRADE_MODERATE_THRESHOLD = 0.025
 GRADE_STEEP_THRESHOLD = 0.05
 GRADE_MAX_VALID = 0.20
@@ -267,7 +271,11 @@ def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
     base = links["length_m"] / (links["speed_kmh"] / 3.6)
     forward_penalty = np.zeros(len(links), dtype=float)
     reverse_penalty = np.zeros(len(links), dtype=float)
-    if mode == "bike":
+    wait = {
+        "bike": TRAFFIC_LIGHT_PENALTY_SECONDS,
+        "walk": WALK_TRAFFIC_LIGHT_PENALTY_SECONDS,
+    }.get(mode, 0.0)
+    if wait:
         signal_crossing = (
             links["crossing"].eq("traffic_signals")
             if "crossing" in links.columns
@@ -276,17 +284,16 @@ def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
         adjacent_signal = _signal_flag(links, "traffic_signal_at_start") | _signal_flag(
             links, "traffic_signal_at_end"
         )
-        # On a cycleway the crossing tag is the whole story; on a car lane the tag
-        # may be a crossing the cyclist rides past, so only a signal node counts.
+        # On a cycleway or footway the crossing tag is the whole story; on a car
+        # lane the tag may be a crossing the cyclist or walker passes by, so
+        # only a signal node counts.
         bicycle_signal = signal_crossing & links["highway"].isin(
             _BICYCLE_CROSSING_HIGHWAYS
         )
         car_signal = adjacent_signal & links["highway"].isin(
             _CAR_LANE_CROSSING_HIGHWAYS
         )
-        signal_penalty = (bicycle_signal | car_signal).to_numpy(
-            dtype=bool
-        ) * TRAFFIC_LIGHT_PENALTY_SECONDS
+        signal_penalty = (bicycle_signal | car_signal).to_numpy(dtype=bool) * wait
         forward_penalty += signal_penalty
         reverse_penalty += signal_penalty
 
