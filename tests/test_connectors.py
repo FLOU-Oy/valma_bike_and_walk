@@ -164,3 +164,67 @@ def test_assign_leaves_connectors_off_the_volume_map(archipelago, tmp_path):
     assert len(volumes) == 2 * len(archipelago.query("u < 30"))
     # Without a cutoff the trips do cross, so the connectors did carry them.
     assert volumes.volume.max() == pytest.approx(5.0)
+
+
+def test_short_connectors_are_gaps_at_normal_speed():
+    # A courtyard path about 22 m off the end of the street, and an island 1 km out.
+    links = links_frame(
+        chain(1, 24.000, first_link_id=0)
+        + chain(41, 24.0034, first_link_id=40)
+        + chain(11, 24.020, first_link_id=10)
+    )
+    connectors = island_connectors(links, min_nodes=3, speed_kmh=0.1, gap_m=50)
+    kinds = dict(zip(map(frozenset, zip(connectors.u, connectors.v)), connectors.kind))
+    assert kinds[frozenset((4, 41))] == "gap"
+    assert kinds[frozenset((44, 11))] == "island"
+
+    gap = connectors[connectors.kind == "gap"]
+    assert gap.speed_override_kmh.isna().all()
+
+    network = network_from_links(merge_connectors(links, connectors), "bike")
+    edge = np.flatnonzero(network.link_id == gap.link_id.iloc[0])[0]
+    # The bike profile's base speed, not the island crossing's crawl.
+    assert network.length[edge] / network.travel_time[edge] * 3.6 == pytest.approx(
+        14.0
+    )
+
+
+def test_gap_m_zero_makes_every_connector_an_island(archipelago):
+    connectors = island_connectors(archipelago, min_nodes=1, gap_m=0)
+    assert (connectors.kind == "island").all()
+    assert (connectors.speed_override_kmh == 0.1).all()
+
+
+def test_gaps_are_drawn_on_the_volume_map(tmp_path):
+    links = links_frame(
+        chain(1, 24.000, first_link_id=0) + chain(41, 24.0034, first_link_id=40)
+    )
+    links_path = write_links(links, tmp_path / "walk_links.gpkg")
+    assert main(["connect", "--links", str(links_path), "--min-nodes", "3"]) == 0
+
+    centroids = tmp_path / "points.csv"
+    centroids.write_text("id,lon,lat\n1,24.0000,60.0\n2,24.0064,60.0\n")
+    demand = tmp_path / "od.csv"
+    demand.write_text("origin_id,destination_id,demand\n1,2,5\n")
+    assert (
+        main(
+            [
+                "assign",
+                "--mode", "walk",
+                "--links", str(links_path),
+                "--connectors", str(tmp_path / "walk_connectors.gpkg"),
+                "--centroids", str(centroids),
+                "--id-column", "id",
+                "--demand", str(demand),
+                "--cache-dir", str(tmp_path / "cache"),
+                "--output-dir", str(tmp_path / "out"),
+                "--workers", "1",
+                "--gpkg",
+            ]  # fmt: skip
+        )
+        == 0
+    )
+    volumes = gpd.read_file(tmp_path / "out" / "walk_volumes.gpkg")
+    gap_rows = volumes[volumes.link_id < 0]
+    assert len(gap_rows) == 2  # both directions
+    assert gap_rows.volume.max() == pytest.approx(5.0)
