@@ -213,6 +213,7 @@ def write_omx_matrix(
     mapping_name: str = "zone_number",
     title: str = "",
     units: str | None = None,
+    append: bool = False,
 ) -> None:
     """
     Write a dense matrix to OMX, in the same layout :func:`read_demand_omx` reads.
@@ -230,6 +231,10 @@ def write_omx_matrix(
 
     ``units``, if given, is stored as the matrix's ``units`` attribute, so a
     reader need not guess what the numbers mean.
+
+    ``append`` adds the matrix to an existing file instead of replacing the
+    file, so one OMX can hold several modes. A matrix of the same name is
+    replaced; the file's lookup must hold the same ids in the same order.
     """
     try:
         import openmatrix as omx
@@ -260,14 +265,25 @@ def write_omx_matrix(
     if any(v < 0 for v in id_entries):
         raise ValueError("OMX zone mappings need non-negative ids.")
 
-    with omx.open_file(str(path), "w") as f:
+    append = append and path.exists()
+    with omx.open_file(str(path), "a" if append else "w") as f:
+        if append and mapping_name in f.list_mappings():
+            existing = np.asarray(f.map_entries(mapping_name))
+            if not np.array_equal(existing, np.asarray(id_entries)):
+                raise ValueError(
+                    f"{path} already has a {mapping_name!r} lookup with different "
+                    "zones; write to a new file instead."
+                )
+        if append and matrix_name in f.list_matrices():
+            f.remove_node(f.root.data, matrix_name)
         f.create_matrix(
             matrix_name,
             obj=np.ascontiguousarray(matrix, dtype=np.float32),
             title=title,
             attrs={"units": units} if units is not None else None,
         )
-        f.create_mapping(mapping_name, id_entries)
+        if mapping_name not in f.list_mappings():
+            f.create_mapping(mapping_name, id_entries)
 
     logger.info("Wrote %r to %s: %dx%d", matrix_name, path, n, n)
 
