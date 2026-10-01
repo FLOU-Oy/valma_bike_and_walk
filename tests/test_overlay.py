@@ -61,7 +61,7 @@ def test_cli_writes_bike_and_walk_into_one_file(tmp_path):
     assert main(["overlay", "--mode", "bike", "--baseline", str(times),
                  "--baseline-matrix", "bike", *common]) == 0  # fmt: skip
     assert main(["overlay", "--mode", "walk", "--baseline", str(dists),
-                 "--baseline-matrix", "bike", "--baseline-speed-kmh", "5",
+                 "--baseline-matrix", "bike", "--baseline-speed-kmh",
                  *common]) == 0  # fmt: skip
 
     ids, bike = read_omx_dense(out, "bike")
@@ -70,7 +70,7 @@ def test_cli_writes_bike_and_walk_into_one_file(tmp_path):
     assert bike[1, 2] == pytest.approx(10.0)  # routed: 600 s
     assert bike[0, 3] == pytest.approx(40.0)  # baseline minutes
     assert walk[2, 1] == pytest.approx(11.0)  # routed: 660 s
-    assert walk[0, 3] == pytest.approx(24.0)  # 2 km at 5 km/h
+    assert walk[0, 3] == pytest.approx(25.0)  # 2 km at the walk profile's 4.8 km/h
     with omx.open_file(str(out)) as f:
         assert sorted(f.list_matrices()) == ["bike", "walk"]
         assert f["walk"].attrs["units"] == "minutes"

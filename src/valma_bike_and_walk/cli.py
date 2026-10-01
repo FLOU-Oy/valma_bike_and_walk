@@ -115,6 +115,7 @@ from valma_bike_and_walk.network import (
     network_from_links,
 )
 from valma_bike_and_walk.osm import resolve_clip
+from valma_bike_and_walk.speeds import profile_for
 from valma_bike_and_walk.overlay import overlay, read_model_minutes, read_omx_dense
 from valma_bike_and_walk.traffic import (
     DEFAULT_MAX_ANGLE_DEG,
@@ -142,6 +143,10 @@ logger = logging.getLogger("valma_bike_and_walk")
 #: distinguishable from "not given at all" (args.omx is None) and from an
 #: explicit path (a Path instance).
 _OMX_DEFAULT_PATH = object()
+
+#: Sentinel for `overlay --baseline-speed-kmh` given bare: use the mode's base
+#: speed from its speed profile.
+_MODE_BASE_SPEED = object()
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -366,9 +371,15 @@ def cmd_overlay(args: argparse.Namespace) -> int:
     base_ids, base = read_omx_dense(
         args.baseline, args.baseline_matrix, args.baseline_mapping
     )
-    if args.baseline_speed_kmh is not None:
+    speed_kmh = args.baseline_speed_kmh
+    if speed_kmh is _MODE_BASE_SPEED:
+        # Converted at the same pace the model walks or rides at, so a cell
+        # does not change just for having come from the baseline.
+        speed_kmh = profile_for(args.mode).base_kph
+    if speed_kmh is not None:
         # A distance matrix, in km: turn it into minutes at a fixed speed.
-        base *= np.float32(60.0 / args.baseline_speed_kmh)
+        logger.info("Baseline taken as km, at %g km/h", speed_kmh)
+        base *= np.float32(60.0 / speed_kmh)
     model_ids, model = read_model_minutes(model_path)
 
     result, replaced = overlay(
@@ -956,10 +967,14 @@ def build_parser() -> argparse.ArgumentParser:
     overlay_parser.add_argument(
         "--baseline-speed-kmh",
         type=float,
+        nargs="?",
+        const=_MODE_BASE_SPEED,
+        metavar="KMH",
         help=(
             "Treat --baseline as distances in km and turn them into minutes at "
-            "this speed, e.g. 5 for walking. Without it, --baseline is taken "
-            "to be minutes already."
+            "this speed. Given bare, the mode's own base speed from its speed "
+            "profile (4.8 km/h walking, 14 km/h cycling). Without it, "
+            "--baseline is taken to be minutes already."
         ),
     )
     overlay_parser.add_argument(
