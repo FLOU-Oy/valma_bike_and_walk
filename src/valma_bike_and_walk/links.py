@@ -81,8 +81,9 @@ WALK_TRAFFIC_LIGHT_PENALTY_SECONDS = 15.0
 GRADE_MODERATE_THRESHOLD = 0.025
 GRADE_STEEP_THRESHOLD = 0.05
 GRADE_MAX_VALID = 0.20
-GRADE_MODERATE_FACTOR = 2.32
-GRADE_STEEP_FACTOR = 2.50
+GRADE_LOW_FACTOR = 4.587
+GRADE_MODERATE_FACTOR = 4.587
+GRADE_STEEP_FACTOR = 3.744
 
 _BICYCLE_CROSSING_HIGHWAYS = frozenset(
     {
@@ -344,7 +345,11 @@ def _grade_penalty(ascent_m: np.ndarray, length_m: np.ndarray) -> np.ndarray:
         np.where(
             gradient > GRADE_STEEP_THRESHOLD,
             GRADE_STEEP_FACTOR,
-            np.where(gradient >= GRADE_MODERATE_THRESHOLD, GRADE_MODERATE_FACTOR, 0.0),
+            np.where(
+                gradient >= GRADE_MODERATE_THRESHOLD,
+                GRADE_MODERATE_FACTOR,
+                GRADE_LOW_FACTOR,
+            ),
         ),
     )
     return factor * gradient * length_m

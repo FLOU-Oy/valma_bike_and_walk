@@ -246,13 +246,19 @@ def _flat_seconds(links: gpd.GeoDataFrame) -> np.ndarray:
 
 
 def test_elevation_penalty_uses_ascent_thresholds_and_not_descent():
-    """Below 2.5 % costs nothing; past 5 % the steeper factor takes over."""
+    """Each grade band has its own factor; past 5 % the steepest takes over."""
     normalised = normalise(
         _graded_links([(0.02, 0.02), (0.03, 0.03), (0.06, 0.06)]), "bike"
     )
     length = normalised["length_m"].to_numpy()
     expected = (
-        _flat_seconds(normalised) + np.array([0.0, 2.32 * 0.03, 2.50 * 0.06]) * length
+        _flat_seconds(normalised) + np.array(
+            [
+                links_module.GRADE_LOW_FACTOR * 0.02,
+                links_module.GRADE_MODERATE_FACTOR * 0.03,
+                links_module.GRADE_STEEP_FACTOR * 0.06,
+            ]
+        ) * length
     )
 
     assert normalised["travel_time_s"].to_numpy() == pytest.approx(expected)
@@ -265,10 +271,12 @@ def test_elevation_penalty_is_directional_for_an_asymmetric_profile():
     length = normalised["length_m"].iloc[0]
 
     assert normalised["travel_time_s"].iloc[0] == pytest.approx(
-        flat + 2.32 * 0.03 * length
+        flat + links_module.GRADE_MODERATE_FACTOR * 0.03 * length
     )
-    # 1 % downhill is below the threshold, so the way back is just the flat time.
-    assert normalised["travel_time_reverse_s"].iloc[0] == pytest.approx(flat)
+    # The way back climbs the 1 % the forward direction descends.
+    assert normalised["travel_time_reverse_s"].iloc[0] == pytest.approx(
+        flat + links_module.GRADE_LOW_FACTOR * 0.01 * length
+    )
 
 
 def test_walking_pays_for_the_climb_only_in_the_uphill_direction():
@@ -280,8 +288,10 @@ def test_walking_pays_for_the_climb_only_in_the_uphill_direction():
     edges = directed_edges(normalised, "walk")
     uphill = edges.loc[edges["direction"] == 1, "travel_time_s"].iloc[0]
     downhill = edges.loc[edges["direction"] == -1, "travel_time_s"].iloc[0]
-    assert uphill == pytest.approx(flat + 2.32 * 0.03 * length)
-    assert downhill == pytest.approx(flat)
+    assert uphill == pytest.approx(flat + links_module.GRADE_MODERATE_FACTOR * 0.03 * length)
+    assert downhill == pytest.approx(
+        flat + links_module.GRADE_LOW_FACTOR * 0.01 * length
+    )
 
 
 def test_unrealistic_twenty_percent_grade_is_ignored():
@@ -294,7 +304,7 @@ def test_unrealistic_twenty_percent_grade_is_ignored():
 
     assert normalised["travel_time_s"].iloc[0] == pytest.approx(flat)
     assert normalised["travel_time_reverse_s"].iloc[0] == pytest.approx(
-        flat + 2.50 * steep * length
+        flat + links_module.GRADE_STEEP_FACTOR * steep * length
     )
 
 
