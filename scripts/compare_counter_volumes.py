@@ -150,6 +150,27 @@ def plot_comparison(data: pd.DataFrame, path: Path, title: str | None = None) ->
         )
     )
     axis.plot([0, maximum], [0, maximum], color="black", linestyle="--", linewidth=1)
+    # +/-50 % error band around the 1:1 line.
+    for ratio, label in ((1.5, "+50 %"), (0.5, "-50 %")):
+        axis.plot(
+            [0, maximum],
+            [0, ratio * maximum],
+            color="grey",
+            linestyle=":",
+            linewidth=1,
+        )
+        end_x = min(maximum, maximum / ratio)
+        axis.annotate(
+            label,
+            (end_x, ratio * end_x),
+            xytext=(-4, 2),
+            textcoords="offset points",
+            ha="right",
+            fontsize=6,
+            color="grey",
+        )
+    axis.set_xlim(0, maximum * 1.02)
+    axis.set_ylim(0, maximum * 1.02)
     axis.set_xlabel("Observed average bicycles per day", fontsize=8)
     axis.set_ylabel("Modeled bicycles per day (expanded)", fontsize=8)
     axis.set_title(
