@@ -189,6 +189,27 @@ centroid ids are not integers, which OMX cannot hold; use
 `--omx-matrix-name`/`--omx-mapping-name` to change the matrix/lookup names
 inside it (defaults: `--mode`, `zone_number`).
 
+### Filling a full zone system from a baseline
+
+`valma matrix` only has times for zones that snapped to the network and pairs
+within `--max-minutes`. `valma overlay` writes those over a baseline OMX
+matrix, so the result has the baseline's zones and a time in every cell:
+
+```bash
+# Bike: Valma's own bike times (minutes) as the baseline
+valma overlay --mode bike --baseline data/time_aht.omx --baseline-matrix bike               --max-minutes 120 --out output/kapy_time_vrk.omx
+# Walk: Valma's bike distances (km) at the model's walking pace, 4.8 km/h
+valma overlay --mode walk --baseline data/dist_aht.omx --baseline-matrix bike               --baseline-speed-kmh --max-minutes 120 --out output/kapy_time_vrk.omx
+```
+
+`--baseline-speed-kmh` given bare converts at the mode's own base speed, so a
+baseline cell and a routed one are at the same pace; give a number to override.
+Both write into one file, a matrix per mode, in minutes. A cell takes the
+model's time when both zones were routed and the time is finite (and, with
+`--max-minutes`, no longer than that); otherwise it keeps the baseline. The
+model's times are read from `<output-dir>/travel_times_<mode>.npz` (`--model`
+to name another). Zones only in the model are ignored.
+
 ### Editing the link layer
 
 `output/<mode>_links.gpkg` has one layer, `links`, with one row per link:
@@ -200,7 +221,9 @@ inside it (defaults: `--mode`, `zone_number`).
 | `osm_way_id` | the way it came from, for tracing back to OSM |
 | `highway`, `surface` | what sets the speed |
 | `oneway`, `oneway_bicycle`, `junction` | what sets the direction |
+| `under_construction` | the way is under roadworks in OSM (`highway=construction`) and was read as what it is being built into, e.g. `construction=cycleway` as a cycleway. On by default; `valma extract --no-include-construction` drops roadworks instead. Ways with no `construction=` type are always dropped. The tag also covers new ways not yet open. |
 | `length_m`, `speed_kmh`, `travel_time_s` | derived — recomputed on every build |
+| `speed_reverse_kmh`, `travel_time_reverse_s` | the same against the digitised direction; for bikes a cycle lane or track on one side (`cycleway:right` along, `cycleway:left` against) only speeds up its own direction |
 | `speed_override_kmh` | **empty, for you**: a number here wins over the tags |
 | `car_volume` | cars a day sharing this link, after `valma traffic` — see below |
 
@@ -233,7 +256,7 @@ valma matrix --links output/bike_links.gpkg --connectors output/bike_connectors.
 ```
 
 `--connectors` works the same on `build` and `assign`. `assign --gpkg` leaves
-the connectors off the map; their volumes (normally none) are still in
+the island crossings off the map; their volumes (normally none) are still in
 `link_volumes_<mode>.npz`. The graph built with it is cached apart
 from the plain one, as `.cache/bike+bike_connectors.npz`.
 
@@ -241,6 +264,12 @@ from the plain one, as `.cache/bike+bike_connectors.npz`.
   They are there to keep islands routable *within* themselves, not to make the
   water crossable: a trip that needs one lands beyond any `--max-minutes`
   cutoff and stays `inf` or unassigned.
+- Connectors shorter than `--gap-m` (default 50 m) are *gaps*, not
+  crossings: a path a few metres short of the street it obviously meets. They
+  get no speed override, so they run at the mode's normal base speed (14 km/h
+  bike, 4.8 km/h walk) and are drawn on the `assign --gpkg` map like any other
+  link. The `kind` column says `gap` or `island`. `--gap-m 0` treats every
+  connector as a crossing.
 - Only parts of at least `--min-nodes` nodes (default 20) are connected. The
   smaller ones are mostly mainland data gaps, and keeping them would pull
   zones off a real street onto a fragment behind a connector.
@@ -757,13 +786,12 @@ Ascent and descent are kept apart rather than netted off: a link that climbs ten
 metres and drops them again costs nothing like a flat one, and the two swap
 places when it is traversed backwards.
 
-For routing, uphill grades below 2.5% receive no penalty. Grades from 2.5% to
-5% add `2.32 * gradient * length_m` seconds, and grades above 5% add
-`2.50 * gradient * length_m` seconds, where `gradient` is the decimal grade
-(`ascent_m / length_m`). Downhill travel receives no surcharge. In the reverse
-direction, the original `descent_m` is treated as ascent because that direction
-is uphill on the same link.
-is uphill on the same link. Grades of 20% or more are treated as unrealistic DEM
+For routing, uphill grades below 2.5% add `4.587 * gradient * length_m`
+seconds, grades from 2.5% to 5% add `17.20 * gradient * length_m` seconds, and
+grades above 5% add `23.40 * gradient * length_m` seconds, where `gradient` is
+the decimal grade (`ascent_m / length_m`). Downhill travel receives no
+surcharge. In the reverse direction, the original `descent_m` is treated as
+ascent because that direction is uphill on the same link. Grades of 20% or more are treated as unrealistic DEM
 artefacts and receive no elevation surcharge in that direction.
 
 Two things are deliberate and worth knowing. Profiles are read at a fixed 25 m
@@ -874,7 +902,7 @@ ones start around 5), `--max-angle` (45°), `--min-coverage` (0.5),
 right only if your source layer already holds one directed link per carriageway.
 
 For cycling, every finite `car_volume` changes the speed on links carrying motor
-traffic using the multiplier `7.5 / (7.5 + 0.008 * car_volume)`. Missing volumes
+traffic using the multiplier `7.5 / (7.5 + 0.008 * car_volume / 5.6)`: Tarkkala et al. (2024) estimate the volume term once per route, so it is spread over their average 5.6 km route. Missing volumes
 are not penalised.
 
 ## The walking model
@@ -904,8 +932,14 @@ Where it differs from cycling, and why:
   `highway=cycleway`, and they are often the separately mapped sidewalk of the
   road beside them, so the walk network keeps cycleways unless they say
   `foot=no` or `foot=use_sidepath`.
-- **No car traffic or traffic-light term.** `car_volume` only affects cycling,
-  and pedestrian crossing waits are taken as part of the walking speeds.
+- **No car traffic term, but traffic lights count.** `car_volume` only
+  affects cycling. A red light costs a walker the same 15 s wait as a cyclist
+  (`WALK_TRAFFIC_LIGHT_PENALTY_SECONDS` in `links.py`), on the same links: a
+  footway or path tagged `crossing=traffic_signals`, or a road with a signal
+  node at either end. The walking speeds are pace in motion and leave it out.
+  Crossings without lights cost only cyclists: 10 s
+  (`UNSIGNALLED_CROSSING_PENALTY_SECONDS`) on a cycleway, footway or path
+  carrying any other `crossing` value except `no`.
 - **Hills cost the same as for cycling**, and only uphill: after `valma dem`
   the climb is charged in whichever direction climbs, even though every way is
   two-way.
