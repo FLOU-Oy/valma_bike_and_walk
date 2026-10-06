@@ -14,6 +14,9 @@ What the columns mean
 ``oneway``,        direction. ``oneway_bicycle`` overrides ``oneway`` for bikes,
 ``oneway_bicycle`` so a contraflow cycle lane is modelled.
 ``junction``       ``roundabout`` implies oneway even without the tag.
+``under_construction``  true where the way is under roadworks in OSM and was
+                   read as what it is being built into (``extract
+                   --include-construction``, the default).
 ``length_m``       metres. **Recomputed from the geometry on every read**, so
                    moving a vertex in QGIS is enough to change the cost.
 ``speed_kmh``      derived, informational -- for styling the layer.

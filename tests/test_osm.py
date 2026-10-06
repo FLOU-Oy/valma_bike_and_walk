@@ -288,3 +288,71 @@ def test_resolve_clip_prefers_bbox_and_keys_the_cache_on_it(grid_pbf, tmp_path):
 
     clip, key = resolve_clip(settings, area=None, bbox=None)
     assert clip is None and key == "full"
+
+
+# --------------------------------------------------------------------------
+# Roadworks
+# --------------------------------------------------------------------------
+
+
+def _roadworks_pbf(tmp_path, way_tags, name="roadworks"):
+    nodes = {1: (24.000, 60.000), 2: (24.002, 60.000), 3: (24.004, 60.000)}
+    return write_pbf(
+        tmp_path / f"{name}.osm.pbf",
+        nodes,
+        [
+            (1, [1, 2], {"highway": "cycleway"}),
+            (2, [2, 3], way_tags),
+        ],
+    )
+
+
+def test_a_cycleway_under_roadworks_is_read_as_a_cycleway(tmp_path):
+    pbf = _roadworks_pbf(
+        tmp_path,
+        {"highway": "construction", "construction": "cycleway", "surface": "asphalt"},
+    )
+    links = read_links(settings_for(pbf, tmp_path), "bike")
+    works = links[links["osm_way_id"] == 2].iloc[0]
+    assert works["highway"] == "cycleway"
+    assert works["surface"] == "asphalt"
+    assert works["under_construction"]
+    assert not links[links["osm_way_id"] == 1].iloc[0]["under_construction"]
+
+
+def test_roadworks_can_be_left_out(tmp_path):
+    pbf = _roadworks_pbf(tmp_path, {"highway": "construction", "construction": "cycleway"})
+    settings = Settings(
+        pbf_path=pbf, cache_dir=tmp_path / "cache", include_construction=False
+    )
+    links = read_links(settings, "bike")
+    assert list(links["osm_way_id"]) == [1]
+
+
+def test_roadworks_without_a_type_or_onto_a_motorway_stay_out(tmp_path):
+    for i, tags in enumerate(
+        (
+            {"highway": "construction"},
+            {"highway": "construction", "construction": "yes"},
+            {"highway": "construction", "construction": "motorway"},
+        )
+    ):
+        pbf = _roadworks_pbf(tmp_path, tags, name=f"roadworks{i}")
+        links = read_links(settings_for(pbf, tmp_path), "bike")
+        assert list(links["osm_way_id"]) == [1], tags
+
+
+def test_roadworks_still_obey_the_mode_filter(tmp_path):
+    pbf = _roadworks_pbf(
+        tmp_path,
+        {"highway": "construction", "construction": "footway", "foot": "no"},
+    )
+    links = read_links(settings_for(pbf, tmp_path), "walk")
+    assert list(links["osm_way_id"]) == [1]
+
+
+def test_cache_names_say_whether_roadworks_were_read():
+    on = Settings(pbf_path="fi.osm.pbf")
+    off = Settings(pbf_path="fi.osm.pbf", include_construction=False)
+    assert on.links_cache_path("bike", "full") != off.links_cache_path("bike", "full")
+    assert on.network_cache_path("bike", "full") != off.network_cache_path("bike", "full")

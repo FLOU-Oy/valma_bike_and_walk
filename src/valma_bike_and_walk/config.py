@@ -38,6 +38,11 @@ class Settings:
     #: osmium node-location index, see :data:`DEFAULT_INDEX_STORAGE`.
     index_storage: str = DEFAULT_INDEX_STORAGE
 
+    #: Read ``highway=construction`` ways as the way they are being built into
+    #: (``construction=cycleway`` -> a cycleway), instead of dropping them.
+    #: Roadworks are temporary; leaving them out punches holes in the network.
+    include_construction: bool = True
+
     def __post_init__(self) -> None:
         if self.pbf_path is not None:
             object.__setattr__(self, "pbf_path", Path(self.pbf_path))
@@ -102,13 +107,23 @@ class Settings:
         stem = self._network_stem(mode, links_path, connectors_path)
         return self.cache_dir / f"{stem}.npz"
 
+    @property
+    def _read_key(self) -> str:
+        """How the PBF was read, for cache names: roadworks in or out."""
+        return "_construction" if self.include_construction else ""
+
     def links_cache_path(self, mode: str, extent_key: str) -> Path:
         """Where a `--pbf` run parks the link layer nobody asked for by name."""
-        return self.cache_dir / f"{self.source_stem}_{extent_key}_{mode}_links.gpkg"
+        return (
+            self.cache_dir
+            / f"{self.source_stem}_{extent_key}{self._read_key}_{mode}_links.gpkg"
+        )
 
     def network_cache_path(self, mode: str, extent_key: str) -> Path:
         """The same, for the graph built from it."""
-        return self.cache_dir / f"{self.source_stem}_{extent_key}_{mode}.npz"
+        return (
+            self.cache_dir / f"{self.source_stem}_{extent_key}{self._read_key}_{mode}.npz"
+        )
 
     @property
     def dem_cache_dir(self) -> Path:

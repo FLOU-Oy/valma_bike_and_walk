@@ -178,6 +178,18 @@ def _add_extent(parser: argparse.ArgumentParser) -> None:
             "file-backed one, e.g. 'sparse_file_array,nodes.idx'."
         ),
     )
+    parser.add_argument(
+        "--include-construction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Read ways under roadworks (highway=construction) as what they are "
+            "being built into, e.g. construction=cycleway as a cycleway, and "
+            "mark them under_construction (default: on). Roadworks are "
+            "temporary; dropping them leaves holes in the network. Note that "
+            "the tag also covers new ways that have not opened yet."
+        ),
+    )
 
 
 def _add_source(parser: argparse.ArgumentParser) -> None:
@@ -220,6 +232,7 @@ def _settings(args: argparse.Namespace) -> Settings:
         cache_dir=args.cache_dir,
         output_dir=args.output_dir,
         index_storage=getattr(args, "index_storage", DEFAULT_INDEX_STORAGE),
+        include_construction=getattr(args, "include_construction", True),
     )
 
 

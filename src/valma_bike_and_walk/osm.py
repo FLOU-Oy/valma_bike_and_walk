@@ -152,6 +152,43 @@ BIKE_FILTER = WayFilter(
 
 WAY_FILTERS: dict[str, WayFilter] = {"walk": WALK_FILTER, "bike": BIKE_FILTER}
 
+#: Column marking links read from ``highway=construction``.
+CONSTRUCTION_COLUMN = "under_construction"
+
+
+class _AsBuilt:
+    """A way's tags with ``highway`` swapped for what it is being built into.
+
+    ``highway=construction`` + ``construction=cycleway`` is a cycleway under
+    roadworks -- usually an existing one being renovated, sometimes a new one
+    about to open. Read as the cycleway, it goes through the mode's filter and
+    speed profile like any other.
+    """
+
+    def __init__(self, tags: Tags, highway: str) -> None:
+        self._tags = tags
+        self._highway = highway
+
+    def get(self, key: str, default: str | None = None) -> str | None:
+        if key == "highway":
+            return self._highway
+        return self._tags.get(key, default)
+
+    def __contains__(self, key: str, /) -> bool:
+        return key == "highway" or key in self._tags
+
+
+def _as_built(tags: Tags) -> _AsBuilt | None:
+    """The as-built view of a ``highway=construction`` way, if it says what it
+    is becoming. One without a type (or ``construction=yes``) has no speed to
+    give it, so it stays out."""
+    if tags.get("highway") != "construction":
+        return None
+    kind = (tags.get("construction") or "").strip()
+    if not kind or kind in ("yes", "no", "construction") or ";" in kind:
+        return None
+    return _AsBuilt(tags, kind)
+
 
 def filter_for(mode: str) -> WayFilter:
     validate_mode(mode)
@@ -178,18 +215,27 @@ class _WayBuffer:
         self.y = array.array("i")
         self.counts = array.array("q")  # nodes per way
         self.tags: list[list[str | None]] = [[] for _ in WAY_TAGS]
+        self.under_construction = array.array("b")
         self.signal_nodes = signal_nodes or set()
 
     def add(
-        self, way: osmium.osm.Way, refs: list[int], xs: list[int], ys: list[int]
+        self,
+        way: osmium.osm.Way,
+        refs: list[int],
+        xs: list[int],
+        ys: list[int],
+        tags: Tags | None = None,
+        under_construction: bool = False,
     ) -> None:
+        tags = way.tags if tags is None else tags
         self.way_ids.append(way.id)
         self.refs.extend(refs)
         self.x.extend(xs)
         self.y.extend(ys)
         self.counts.append(len(refs))
+        self.under_construction.append(under_construction)
         for column, key in zip(self.tags, WAY_TAGS):
-            column.append(way.tags.get(key))
+            column.append(tags.get(key))
 
     def __len__(self) -> int:
         return len(self.way_ids)
@@ -252,7 +298,11 @@ def _read_ways(
 
     for way in _iter_ways(settings.require_pbf(), settings.index_storage):
         seen += 1
-        if not way_filter.keeps(way.tags):
+        tags: Tags = way.tags
+        as_built = _as_built(tags) if settings.include_construction else None
+        if as_built is not None:
+            tags = as_built
+        if not way_filter.keeps(tags):
             continue
 
         refs: list[int] = []
@@ -279,9 +329,14 @@ def _read_ways(
 
         if len(refs) < 2 or not inside:
             continue
-        buffer.add(way, refs, xs, ys)
+        buffer.add(way, refs, xs, ys, tags=tags, under_construction=as_built is not None)
 
     logger.info("Scanned %d highway ways, kept %d for mode %r", seen, len(buffer), mode)
+    if settings.include_construction:
+        logger.info(
+            "  %d of them read through roadworks (highway=construction)",
+            sum(buffer.under_construction),
+        )
     if len(buffer) == 0:
         raise ValueError(
             f"No {mode} network found in {settings.pbf_path} for this extent."
@@ -418,6 +473,10 @@ def read_links(
     columns["traffic_signal_at_end"] = signal_end
     columns["crossing"] = np.where(
         signal_start | signal_end, "traffic_signals", columns["crossing"]
+    )
+    columns[CONSTRUCTION_COLUMN] = np.repeat(
+        np.frombuffer(buffer.under_construction, dtype=np.int8).astype(bool),
+        links_per_way,
     )
     columns["length_m"] = length_m
 
