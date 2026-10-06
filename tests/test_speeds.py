@@ -2,7 +2,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from valma_bike_and_walk.speeds import BIKE_PROFILE, WALK_PROFILE, profile_for
+from valma_bike_and_walk.speeds import (
+    BIKE_PROFILE,
+    CYCLE_LANE_FACTOR,
+    MIXED_TRAFFIC_FACTOR,
+    WALK_PROFILE,
+    profile_for,
+)
 
 
 def test_unknown_tags_fall_back_to_base_speed():
@@ -59,12 +65,13 @@ def test_car_volume_uses_one_speed_multiplier_for_all_volumes():
     speeds = BIKE_PROFILE.speeds_kph(
         highway, surface, car_volume=volume
     )
+    # The per-route volume term, spread over the average 5.6 km route.
     expected = base_speed * np.array(
         [
-            7.5 / (7.5 + 0.008 * 0.0),
-            7.5 / (7.5 + 0.008 * 100.0),
-            7.5 / (7.5 + 0.008 * 1000.0),
-            7.5 / (7.5 + 0.008 * 1001.0),
+            7.5 / (7.5 + 0.008 * 0.0 / 5.6),
+            7.5 / (7.5 + 0.008 * 100.0 / 5.6),
+            7.5 / (7.5 + 0.008 * 1000.0 / 5.6),
+            7.5 / (7.5 + 0.008 * 1001.0 / 5.6),
         ]
     )
 
@@ -112,3 +119,26 @@ def test_travel_time_matches_hand_calculation():
 def test_profile_lookup_rejects_unknown_mode():
     with pytest.raises(ValueError, match="No speed profile"):
         profile_for("hovercraft")
+
+
+def test_cycle_lane_replaces_the_mixed_traffic_factor():
+    highway = pd.Series(["secondary", "secondary"])
+    speeds = BIKE_PROFILE.speeds_kph(highway, cycleway=pd.Series(["lane", None]))
+    assert speeds[0] == pytest.approx(18.0 / CYCLE_LANE_FACTOR)
+    assert speeds[1] == pytest.approx(18.0 / MIXED_TRAFFIC_FACTOR)
+
+
+def test_cycle_lane_does_not_speed_up_roads_without_a_carriageway_factor():
+    highway = pd.Series(["service", "unclassified", "trunk"])
+    lane = BIKE_PROFILE.speeds_kph(highway, cycleway=pd.Series(["lane"] * 3))
+    none = BIKE_PROFILE.speeds_kph(highway, cycleway=pd.Series([None] * 3))
+    assert lane == pytest.approx(none)
+
+
+def test_cycle_track_counts_as_a_separate_cycleway():
+    highway = pd.Series(["secondary", "secondary", "secondary"])
+    speeds = BIKE_PROFILE.speeds_kph(
+        highway, cycleway=pd.Series(["track", "lane", None])
+    )
+    assert speeds[0] == pytest.approx(18.0)
+    assert speeds[0] > speeds[1] > speeds[2]
