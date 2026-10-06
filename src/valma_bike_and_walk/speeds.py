@@ -21,6 +21,36 @@ SECONDS_PER_HOUR = 3600.0
 AVG_BASE_DISUTIL = 7.5
 TRAFFIC_COEFFICIENT = 0.008
 
+#: Tarkkala et al. (2024) estimate the traffic-volume term once per *route*
+#: (veh/h, not multiplied by length), unlike the per-km road-class and facility
+#: terms. Spreading it over their survey's average route length (Table 5) turns
+#: it into a per-km surcharge comparable with ``AVG_BASE_DISUTIL``.
+AVG_ROUTE_LENGTH_KM = 5.6
+
+#: Cycling on the carriageway, relative to a separate cycleway (1.0): the bike
+#: speed on a road is divided by exactly one of these -- the cycle-track factor
+#: where the road has a kerb-separated track (``cycleway=track``), the
+#: cycle-lane factor where it has a lane, the mixed-traffic factor otherwise.
+MIXED_TRAFFIC_FACTOR = 1.927
+CYCLE_LANE_FACTOR = 1.169
+CYCLE_TRACK_FACTOR = 1.0
+
+#: Roads that take the mixed-traffic / cycle-lane factor. ``service``,
+#: ``unclassified`` and ``trunk`` are left out: their bike speeds carry no
+#: carriageway factor at all, so a lane has nothing to replace there.
+MIXED_TRAFFIC_HIGHWAYS = frozenset(
+    {
+        "living_street",
+        "residential",
+        "tertiary",
+        "tertiary_link",
+        "secondary",
+        "secondary_link",
+        "primary",
+        "primary_link",
+    }
+)
+
 
 @dataclass(frozen=True)
 class SpeedProfile:
@@ -49,29 +79,29 @@ class SpeedProfile:
         """
         base = highway.map(self.highway_kph).astype(float).fillna(self.base_kph)
 
-        if self.name == "bike" and cycleway is not None:
-            lane_mask = (
-                cycleway.fillna("")
-                .astype(str)
-                .str.lower()
-                .str.split(";")
-                .map(lambda values: any(v.strip() == "lane" for v in values))
+        if self.name == "bike":
+            if cycleway is None:
+                track_mask = lane_mask = np.zeros(len(highway), dtype=bool)
+            else:
+                # ";"-separated values: the best one present wins.
+                values = cycleway.fillna("").astype(str).str.lower()
+                track_mask = values.str.contains(
+                    r"(?:^|;)\s*track\s*(?:;|$)", regex=True
+                ).to_numpy(dtype=bool)
+                lane_mask = values.str.contains(
+                    r"(?:^|;)\s*lane\s*(?:;|$)", regex=True
+                ).to_numpy(dtype=bool)
+            mixed_road = highway.isin(MIXED_TRAFFIC_HIGHWAYS).to_numpy(dtype=bool)
+            carriageway_factor = np.where(
+                mixed_road,
+                np.select(
+                    [track_mask, lane_mask],
+                    [CYCLE_TRACK_FACTOR, CYCLE_LANE_FACTOR],
+                    default=MIXED_TRAFFIC_FACTOR,
+                ),
+                1.0,
             )
-            major_road_mask = highway.isin(
-                {
-                    "living_street",
-                    "residential",
-                    "service",
-                    "unclassified",
-                    "tertiary",
-                    "tertiary_link",
-                    "secondary",
-                    "secondary_link",
-                    "primary",
-                    "primary_link",
-                }
-            )
-            base = base * np.where(major_road_mask & lane_mask, 1.927 / 1.142, 1.0)
+            base = base / carriageway_factor
 
         if surface is None:
             factor: pd.Series | float = 1.0
@@ -87,7 +117,10 @@ class SpeedProfile:
             traffic_factor = np.where(
                 finite_volume,
                 AVG_BASE_DISUTIL
-                / (AVG_BASE_DISUTIL + TRAFFIC_COEFFICIENT * volume),
+                / (
+                    AVG_BASE_DISUTIL
+                    + TRAFFIC_COEFFICIENT * volume / AVG_ROUTE_LENGTH_KM
+                ),
                 1.0,
             )
             factor = factor * pd.Series(traffic_factor, index=highway.index)
@@ -193,6 +226,8 @@ BIKE_PROFILE = SpeedProfile(
 #        "trunk_link": 16.0,
 #    },
     # without road-class based (i.e. with Valma road traffic assignment-based) traffic volume contribution, ref=main/secondary road
+    # Roads in MIXED_TRAFFIC_HIGHWAYS are further divided by MIXED_TRAFFIC_FACTOR,
+    # or by CYCLE_LANE_FACTOR where they have a cycle lane (see speeds_kph).
     highway_kph={
             "steps": 1.2,
             "elevator": 1.0,
@@ -203,16 +238,16 @@ BIKE_PROFILE = SpeedProfile(
             "footway": 4.0,
             "pedestrian": 6.0,
             "corridor": 5.0,
-            "living_street": 13.0 /1.927 /1.198,
-            "residential": 18.0 /1.927 /1.198,
+            "living_street": 13.0 /1.198,
+            "residential": 18.0 /1.198,
             "service": 18.0,
             "unclassified": 18.0,
-            "tertiary": 18.0 /1.927 /1.198,
-            "tertiary_link": 16.0 /1.927 /1.198,
-            "secondary": 18.0 /1.927,
-            "secondary_link": 16.0 /1.927,
-            "primary": 18.0 /1.927 /0.978,
-            "primary_link": 16.0 /1.927 /0.978,
+            "tertiary": 18.0 /1.198,
+            "tertiary_link": 16.0 /1.198,
+            "secondary": 18.0,
+            "secondary_link": 16.0,
+            "primary": 18.0 /0.978,
+            "primary_link": 16.0 /0.978,
             "trunk": 18.0, 
             "trunk_link": 16.0,
         },
