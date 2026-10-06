@@ -256,8 +256,10 @@ BIKE_PROFILE = SpeedProfile(
         "concrete": 1.0,
         "paved": 1.0,
         "paving_stones": 0.90,
-        "compacted": 0.9,
-        "fine_gravel": 0.9,
+        # Stone dust (kivituhka) rides close to asphalt in summer, but these
+        # paths get lighter winter maintenance; set for the whole year.
+        "compacted": 0.87,
+        "fine_gravel": 0.87,
         "wood": 0.80,
         "gravel": 0.70,
         "unpaved": 0.70,
