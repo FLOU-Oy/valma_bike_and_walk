@@ -17,6 +17,8 @@ What the columns mean
 ``length_m``       metres. **Recomputed from the geometry on every read**, so
                    moving a vertex in QGIS is enough to change the cost.
 ``speed_kmh``      derived, informational -- for styling the layer.
+``speed_reverse_kmh``  the same against the digitised direction. Differs only
+                   where a cycle lane or track serves one direction of a road.
 ``travel_time_s``  derived forward-direction travel time, including the
                    bicycle traffic-light penalty when applicable.
 ``travel_time_reverse_s``  derived reverse-direction travel time.
@@ -68,7 +70,13 @@ ONEWAY_REVERSED_VALUES = frozenset({"-1", "T"})
 REQUIRED_COLUMNS = ("link_id", "u", "v", "highway", "geometry")
 
 #: Columns the build derives itself; present in a written layer for styling.
-DERIVED_COLUMNS = ("length_m", "speed_kmh", "travel_time_s", "travel_time_reverse_s")
+DERIVED_COLUMNS = (
+    "length_m",
+    "speed_kmh",
+    "speed_reverse_kmh",
+    "travel_time_s",
+    "travel_time_reverse_s",
+)
 
 OVERRIDE_COLUMN = "speed_override_kmh"
 
@@ -269,7 +277,9 @@ def normalise(links: gpd.GeoDataFrame, mode: str) -> gpd.GeoDataFrame:
         logger.info("Dropping %d self-looping link(s)", int(self_loop.sum()))
         links = links.loc[~self_loop].reset_index(drop=True)
 
-    links["speed_kmh"] = link_speeds(links, mode)
+    links["speed_kmh"], links["speed_reverse_kmh"] = link_speeds_by_direction(
+        links, mode
+    )
     _set_travel_times(links, mode)
     return links
 
@@ -277,6 +287,12 @@ def normalise(links: gpd.GeoDataFrame, mode: str) -> gpd.GeoDataFrame:
 def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
     """Set forward and reverse travel times on a link layer."""
     base = links["length_m"] / (links["speed_kmh"] / 3.6)
+    reverse_speed = (
+        links["speed_reverse_kmh"]
+        if "speed_reverse_kmh" in links.columns
+        else links["speed_kmh"]
+    )
+    reverse_base = links["length_m"] / (reverse_speed / 3.6)
     forward_penalty = np.zeros(len(links), dtype=float)
     reverse_penalty = np.zeros(len(links), dtype=float)
     wait = {
@@ -327,7 +343,7 @@ def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
         reverse_penalty += _grade_penalty(descent, length)
 
     links["travel_time_s"] = base.to_numpy(dtype=float) + forward_penalty
-    links["travel_time_reverse_s"] = base.to_numpy(dtype=float) + reverse_penalty
+    links["travel_time_reverse_s"] = reverse_base.to_numpy(dtype=float) + reverse_penalty
 
 
 def _signal_flag(links: gpd.GeoDataFrame, column: str) -> pd.Series:
@@ -397,27 +413,39 @@ def geometry_lengths(links: gpd.GeoDataFrame) -> np.ndarray:
 
 
 def link_speeds(links: gpd.GeoDataFrame, mode: str) -> np.ndarray:
-    """Speed in km/h per link: the profile's answer, unless overridden."""
+    """Speed in km/h per link along its digitised direction."""
+    return link_speeds_by_direction(links, mode)[0]
+
+
+def link_speeds_by_direction(
+    links: gpd.GeoDataFrame, mode: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Speed in km/h per link, along and against its digitised direction.
+
+    The profile's answer, unless ``speed_override_kmh`` is set, which then
+    holds both ways. The two directions differ only for bikes, where a cycle
+    lane or track serves one side of a road; see :func:`_cycleway_by_direction`.
+    """
     profile = profile_for(mode)
-    cycleway = None
+    forward_cycleway = reverse_cycleway = None
     if mode == "bike":
-        bike_lane_columns = [
-            col for col in ("cycleway", "cycleway_left", "cycleway_right", "cycleway_both") if col in links.columns
-        ]
-        if bike_lane_columns:
-            lane_values = [
-                links[col].fillna("").astype(str).str.lower() for col in bike_lane_columns
-            ]
-            cycleway = lane_values[0].copy()
-            for values in lane_values[1:]:
-                cycleway = cycleway.where(cycleway != "", values)
-            cycleway = cycleway.mask(cycleway == "", pd.NA)
-    speed = profile.speeds_kph(
-        links["highway"],
-        links["surface"] if "surface" in links.columns else None,
-        links["segregated"] if "segregated" in links.columns else None,
-        cycleway,
-        links["car_volume"] if "car_volume" in links.columns else None,
+        forward_cycleway, reverse_cycleway = _cycleway_by_direction(links)
+
+    def speeds(cycleway: pd.Series | None) -> np.ndarray:
+        return profile.speeds_kph(
+            links["highway"],
+            links["surface"] if "surface" in links.columns else None,
+            links["segregated"] if "segregated" in links.columns else None,
+            cycleway,
+            links["car_volume"] if "car_volume" in links.columns else None,
+        )
+
+    forward = speeds(forward_cycleway)
+    reverse = (
+        forward
+        if forward_cycleway is None or forward_cycleway.equals(reverse_cycleway)
+        else speeds(reverse_cycleway)
     )
     if OVERRIDE_COLUMN in links.columns:
         override = pd.to_numeric(links[OVERRIDE_COLUMN], errors="coerce").to_numpy(
@@ -426,14 +454,74 @@ def link_speeds(links: gpd.GeoDataFrame, mode: str) -> np.ndarray:
         forced = np.isfinite(override) & (override > 0)
         if forced.any():
             logger.info("Using %s on %d link(s)", OVERRIDE_COLUMN, int(forced.sum()))
-            speed = np.where(forced, override, speed)
-    return speed
+            forward = np.where(forced, override, forward)
+            reverse = np.where(forced, override, reverse)
+    return forward, reverse
+
+
+_CYCLEWAY_COLUMNS = ("cycleway", "cycleway_left", "cycleway_right", "cycleway_both")
+
+
+def _cycleway_by_direction(
+    links: gpd.GeoDataFrame,
+) -> tuple[pd.Series | None, pd.Series | None]:
+    """
+    The ``cycleway`` values that apply to each direction of travel, per link.
+
+    Returned as ``;``-joined strings, one series along the digitised direction
+    and one against it, for :meth:`SpeedProfile.speeds_kph` to pick the best
+    infrastructure out of. Following OSM, and with traffic on the right:
+
+    * ``cycleway:right`` serves travel along the way, ``cycleway:left`` travel
+      against it, and ``cycleway:both`` serves both.
+    * Plain ``cycleway`` means both sides on a two-way road. On a one-way road
+      it is the lane in the direction of traffic, so a contraflow
+      (``oneway:bicycle=no``) rider does not get it.
+    * Where bikes may only go one way, every lane on the road serves that one
+      direction -- on a one-way street the lane may well be on the left.
+
+    ``cycleway:<side>:oneway`` is not read, so a two-way track on one side of
+    the road serves only the side's own direction here.
+    """
+    if not any(col in links.columns for col in _CYCLEWAY_COLUMNS):
+        return None, None
+
+    def column(name: str) -> pd.Series:
+        if name not in links.columns:
+            return pd.Series("", index=links.index, dtype=object)
+        return links[name].fillna("").astype(str).str.lower()
+
+    plain, left, right, both = (column(name) for name in _CYCLEWAY_COLUMNS)
+
+    car_oneway = (
+        links["oneway"].astype("object")
+        if "oneway" in links.columns
+        else pd.Series(None, index=links.index, dtype=object)
+    )
+    car_against = car_oneway.isin(ONEWAY_REVERSED_VALUES)
+    car_along = car_oneway.isin(ONEWAY_VALUES) & ~car_against
+
+    bike_oneway = pd.Series(
+        _effective_oneway(links, "bike").isin(ONEWAY_VALUES).to_numpy(dtype=bool),
+        index=links.index,
+    )
+    if "junction" in links.columns:
+        bike_oneway |= links["junction"].eq("roundabout")
+
+    forward = plain.where(~car_against, "").str.cat([both, right], sep=";")
+    reverse = plain.where(~car_along, "").str.cat([both, left], sep=";")
+    every_side = plain.str.cat([both, left, right], sep=";")
+    forward = forward.where(~bike_oneway, every_side)
+    reverse = reverse.where(~bike_oneway, every_side)
+    return forward, reverse
 
 
 def annotate(links: gpd.GeoDataFrame, mode: str) -> gpd.GeoDataFrame:
     """Add the derived columns to a freshly extracted layer, ready to write."""
     links = links.copy()
-    links["speed_kmh"] = link_speeds(links, mode)
+    links["speed_kmh"], links["speed_reverse_kmh"] = link_speeds_by_direction(
+        links, mode
+    )
     _set_travel_times(links, mode)
     # An empty column is an invitation: QGIS shows it, and filling one cell is
     # all it takes to pin a link's speed.

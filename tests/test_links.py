@@ -478,3 +478,78 @@ def test_every_edge_remembers_the_link_it_came_from():
     assert len(edges) == 4
     assert sorted(edges["link_id"]) == [0, 0, 1, 1]
     assert set(edges["direction"]) == {1, -1}
+
+
+def _directional_speeds(**tags):
+    """Forward and reverse bike speed on a secondary road with these tags."""
+    row = {**CHAIN[0], "highway": "secondary", **tags}
+    links = normalise(links_frame([row]), "bike")
+    return links["speed_kmh"].iloc[0], links["speed_reverse_kmh"].iloc[0]
+
+
+def test_a_right_side_lane_serves_only_the_digitised_direction():
+    from valma_bike_and_walk.speeds import CYCLE_LANE_FACTOR, MIXED_TRAFFIC_FACTOR
+
+    forward, reverse = _directional_speeds(cycleway_left="no", cycleway_right="lane")
+    assert forward == pytest.approx(18.0 / CYCLE_LANE_FACTOR)
+    assert reverse == pytest.approx(18.0 / MIXED_TRAFFIC_FACTOR)
+
+
+def test_a_left_side_track_serves_only_the_reverse_direction():
+    forward, reverse = _directional_speeds(cycleway_left="track")
+    assert reverse == pytest.approx(18.0)
+    assert forward < reverse
+
+
+def test_plain_and_both_side_tags_serve_both_directions():
+    assert _directional_speeds(cycleway="lane")[0] == pytest.approx(
+        _directional_speeds(cycleway="lane")[1]
+    )
+    forward, reverse = _directional_speeds(cycleway_both="track")
+    assert forward == pytest.approx(18.0)
+    assert reverse == pytest.approx(18.0)
+
+
+def test_cycleway_no_does_not_hide_a_side_lane():
+    from valma_bike_and_walk.speeds import CYCLE_LANE_FACTOR
+
+    forward, _ = _directional_speeds(cycleway="no", cycleway_right="lane")
+    assert forward == pytest.approx(18.0 / CYCLE_LANE_FACTOR)
+
+
+def test_on_a_oneway_street_a_left_lane_serves_the_only_direction():
+    forward, _ = _directional_speeds(oneway="yes", cycleway_left="track")
+    assert forward == pytest.approx(18.0)
+
+
+def test_a_contraflow_lane_serves_only_the_contraflow_rider():
+    from valma_bike_and_walk.speeds import CYCLE_LANE_FACTOR, MIXED_TRAFFIC_FACTOR
+
+    forward, reverse = _directional_speeds(
+        oneway="yes", oneway_bicycle="no", cycleway_left="lane"
+    )
+    assert forward == pytest.approx(18.0 / MIXED_TRAFFIC_FACTOR)
+    assert reverse == pytest.approx(18.0 / CYCLE_LANE_FACTOR)
+
+
+def test_plain_cycleway_on_a_oneway_street_is_not_given_to_contraflow():
+    from valma_bike_and_walk.speeds import CYCLE_LANE_FACTOR, MIXED_TRAFFIC_FACTOR
+
+    forward, reverse = _directional_speeds(
+        oneway="yes", oneway_bicycle="no", cycleway="lane"
+    )
+    assert forward == pytest.approx(18.0 / CYCLE_LANE_FACTOR)
+    assert reverse == pytest.approx(18.0 / MIXED_TRAFFIC_FACTOR)
+
+
+def test_directional_speed_reaches_the_reverse_travel_time():
+    row = {**CHAIN[0], "highway": "secondary", "cycleway_right": "lane"}
+    links = normalise(links_frame([row]), "bike")
+    length = links["length_m"].iloc[0]
+    assert links["travel_time_s"].iloc[0] == pytest.approx(
+        length / (links["speed_kmh"].iloc[0] / 3.6)
+    )
+    assert links["travel_time_reverse_s"].iloc[0] == pytest.approx(
+        length / (links["speed_reverse_kmh"].iloc[0] / 3.6)
+    )
+    assert links["travel_time_reverse_s"].iloc[0] > links["travel_time_s"].iloc[0]
