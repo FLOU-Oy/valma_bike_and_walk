@@ -147,13 +147,35 @@ def test_walking_along_a_road_pays_at_a_signalled_junction():
     )
 
 
-def test_non_signal_crossing_has_no_bike_penalty():
-    signalled = normalise(
+def test_unsignalled_crossing_has_its_own_bike_penalty():
+    crossing = normalise(
         links_frame([{**CHAIN[0], "highway": "cycleway", "crossing": "uncontrolled"}]),
         "bike",
     )
     plain = normalise(links_frame([{**CHAIN[0], "highway": "cycleway"}]), "bike")
-    assert signalled["travel_time_s"].iloc[0] == pytest.approx(
+    expected = (
+        plain["travel_time_s"].iloc[0]
+        + links_module.UNSIGNALLED_CROSSING_PENALTY_SECONDS
+    )
+    assert crossing["travel_time_s"].iloc[0] == pytest.approx(expected)
+    assert crossing["travel_time_reverse_s"].iloc[0] == pytest.approx(expected)
+
+
+def test_unsignalled_crossing_penalty_is_bike_only_and_skips_crossing_no():
+    walk = normalise(
+        links_frame([{**CHAIN[0], "highway": "footway", "crossing": "marked"}]),
+        "walk",
+    )
+    walk_plain = normalise(links_frame([{**CHAIN[0], "highway": "footway"}]), "walk")
+    assert walk["travel_time_s"].iloc[0] == pytest.approx(
+        walk_plain["travel_time_s"].iloc[0]
+    )
+
+    no_crossing = normalise(
+        links_frame([{**CHAIN[0], "highway": "cycleway", "crossing": "no"}]), "bike"
+    )
+    plain = normalise(links_frame([{**CHAIN[0], "highway": "cycleway"}]), "bike")
+    assert no_crossing["travel_time_s"].iloc[0] == pytest.approx(
         plain["travel_time_s"].iloc[0]
     )
 

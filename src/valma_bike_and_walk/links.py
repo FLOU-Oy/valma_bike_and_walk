@@ -78,6 +78,13 @@ TRAFFIC_LIGHT_PENALTY_SECONDS = 15.0
 #: time spent standing at a red light is not in them and is charged here.
 WALK_TRAFFIC_LIGHT_PENALTY_SECONDS = 15.0
 
+#: Slowing down and yielding at a crossing without lights, on a bike.
+UNSIGNALLED_CROSSING_PENALTY_SECONDS = 10.0
+
+#: ``crossing`` values that are not an unsignalled crossing: lights are charged
+#: separately, and ``no`` says there is no crossing at all.
+_NOT_UNSIGNALLED_CROSSING = frozenset({"", "traffic_signals", "no"})
+
 GRADE_MODERATE_THRESHOLD = 0.025
 GRADE_STEEP_THRESHOLD = 0.05
 GRADE_MAX_VALID = 0.20
@@ -297,6 +304,19 @@ def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
         signal_penalty = (bicycle_signal | car_signal).to_numpy(dtype=bool) * wait
         forward_penalty += signal_penalty
         reverse_penalty += signal_penalty
+
+    if mode == "bike" and "crossing" in links.columns:
+        # A crossing way (footway=crossing, cycleway=crossing) carries the
+        # crossing tag itself, so each one ridden over is charged once.
+        crossing = links["crossing"].fillna("").astype(str).str.strip()
+        unsignalled = ~crossing.isin(_NOT_UNSIGNALLED_CROSSING) & links[
+            "highway"
+        ].isin(_BICYCLE_CROSSING_HIGHWAYS)
+        crossing_penalty = (
+            unsignalled.to_numpy(dtype=bool) * UNSIGNALLED_CROSSING_PENALTY_SECONDS
+        )
+        forward_penalty += crossing_penalty
+        reverse_penalty += crossing_penalty
 
     if "ascent_m" in links.columns:
         length = links["length_m"].to_numpy(dtype=float)
