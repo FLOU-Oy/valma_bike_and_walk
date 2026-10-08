@@ -55,6 +55,7 @@ from valma_bike_and_walk.assignment import (
     link_volume_frame,
 )
 from valma_bike_and_walk.assignment import summarise as summarise_assignment
+from valma_bike_and_walk.cache import file_stamp, load_key
 from valma_bike_and_walk.centroids import (
     DEFAULT_MAX_SNAP_M,
     Centroids,
@@ -98,7 +99,7 @@ from valma_bike_and_walk.network import (
     build_links,
     build_network,
     load_network,
-    network_from_links,
+    network_for_links,
 )
 from valma_bike_and_walk.osm import resolve_clip
 from valma_bike_and_walk.traffic import (
@@ -134,7 +135,12 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cache-dir", type=Path, default=Path(".cache"))
     parser.add_argument("--output-dir", type=Path, default=Path("output"))
     parser.add_argument(
-        "--force-reload", action="store_true", help="Ignore cached results."
+        "--force-reload",
+        action="store_true",
+        help=(
+            "Rebuild cached results even if their inputs are unchanged. Not "
+            "needed after editing a link layer: that is detected."
+        ),
     )
 
 
@@ -200,6 +206,29 @@ def _network_out(args: argparse.Namespace, settings: Settings) -> Path:
     return Path(out) if out else settings.network_path(args.mode, args.links)
 
 
+def _warn_if_built_from_another_layer(
+    network: RoutableNetwork, network_path: Path, links_path: Path
+) -> None:
+    """
+    An explicit --network is used as given, but say so if --links has moved on.
+
+    Results are drawn onto --links by link_id, so a graph built from an older
+    version of the layer can put volumes on rows that have since changed.
+    """
+    stored = load_key(network.source_key)
+    if stored is None or stored.get("links") == file_stamp(links_path):
+        return
+    logger.warning(
+        "%s was not built from %s as it is now (edited since?). Results are "
+        "joined back on link_id and may land on the wrong rows; rebuild with "
+        "`valma build --links %s --mode %s`.",
+        network_path,
+        links_path,
+        links_path,
+        network.mode,
+    )
+
+
 def _network_and_links(
     args: argparse.Namespace, *, explicit_build: bool = False
 ) -> tuple[RoutableNetwork, Path | None]:
@@ -217,6 +246,8 @@ def _network_and_links(
             network.n_nodes,
             network.n_edges,
         )
+        if args.links is not None:
+            _warn_if_built_from_another_layer(network, args.network, args.links)
         return network, args.links
 
     settings = _settings(args)
@@ -230,11 +261,11 @@ def _network_and_links(
             # in between: a cache, not a deliverable, so callers need not know
             # it exists.
             path = settings.network_cache_path_for_links(args.mode, args.links)
-        if path.exists() and not args.force_reload:
-            logger.info("Loading network from %s", path)
-            return load_network(path), args.links
-        network = network_from_links(links_module.read_links(args.links), args.mode)
-        network.save(path)
+        # Reused only while it was built from this very version of the layer;
+        # an edit, `valma dem` or `valma traffic` since then rebuilds it.
+        network = network_for_links(
+            args.links, args.mode, path, force_reload=args.force_reload
+        )
         return network, args.links
 
     if args.pbf is None:

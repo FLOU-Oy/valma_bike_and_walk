@@ -126,7 +126,7 @@ valma traffic --links output/bike_links.gpkg --volumes data/link_volumes.gpkg
 #   -> car_volume added in place, on the roads that carry cars
 
 # Route against the link layer directly -- the routable graph is built and
-# cached under .cache/ the first time, and reused after that
+# cached under .cache/ the first time, and reused until the layer changes
 valma matrix --links output/bike_links.gpkg --mode bike \
              --centroids centroids.csv --id-column id \
              --workers 8 --max-minutes 120
@@ -158,6 +158,20 @@ file — routing against it many times over, or sharing it — run
 `valma build --links output/bike_links.gpkg --mode bike` explicitly; that
 writes `output/bike.npz`, which any later command can load directly with
 `--network output/bike.npz`, skipping the link layer entirely.
+
+**A cache is reused only while its inputs are unchanged.** Each graph records
+what it was built from — the link layer's path, size and modification time
+(its SQLite `-wal` file included, where QGIS keeps edits it has not yet
+checkpointed), the mode, and a digest of the code that builds it. A link layer
+cached from a `--pbf` records the PBF, the extent and the extract code. When
+any of that differs, the next run rebuilds and logs why. So saving an edit in
+QGIS, running `valma dem` or `valma traffic` (both write into the layer in
+place), or changing a speed profile all take effect on the next `matrix` or
+`assign`, with no `--force-reload` needed. `valma build` refreshes its named
+`.npz` the same way. Two things are left alone on purpose: a `--network` file
+is used as given, though a warning says so when `--links` has changed since it
+was built; and an existing `valma extract` output is never overwritten without
+`--force-reload`, because it may hold your edits.
 
 If there is nothing you want to edit, `build`, `matrix` and `assign` all take
 `--pbf` directly and run stage one themselves too:
@@ -840,6 +854,7 @@ coefficient from the same literature the speeds come from.
 ```
 src/valma_bike_and_walk/
 ├── config.py      coordinate systems, mode names, cache paths
+├── cache.py       cache keys: when a cached file is still current
 ├── speeds.py      walk/bike speed profiles
 ├── osm.py         the only module that talks to pyosmium   [stage 1]
 ├── links.py       the editable link layer: schema, repair, direction
@@ -886,6 +901,7 @@ hand-built link layers and demand matrices, so the whole suite runs in seconds.
 | `test_zones.py` | where access points land, and how they are weighted |
 | `test_zone_matrix.py` | the point-pair-to-zone-pair aggregation arithmetic |
 | `test_traffic.py` | which link a car volume lands on, and which it must not |
+| `test_cache.py` | that an edited layer, a new PBF or changed code is never served from cache |
 
 Five invariants hold the design together. Breaking one is what the tests are
 mostly there to catch:
