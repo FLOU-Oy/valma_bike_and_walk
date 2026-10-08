@@ -75,17 +75,22 @@ The profiles are plain dataclasses; edit the tables to match your own survey
 data. For a one-off exception there is no need to touch them at all — put a
 number in the link layer's `speed_override_kmh` column and that link uses it.
 
-### 3. Routing uses SciPy CSR, not NetworkX
+### 3. Routing is compiled kernels over flat arrays, not NetworkX
 
 A NetworkX `MultiDiGraph` stores a Python dict per node and per edge. That is
 fine for one city and hopeless for a country: Finland's walking network is
 millions of nodes, which costs tens of GB as dicts, and its Dijkstra is pure
 Python.
 
-The same information lives here in a handful of numpy arrays plus a SciPy CSR
-matrix, routed with compiled `scipy.sparse.csgraph.dijkstra`. The cached network
-is a compressed `.npz` rather than GraphML — for the Helsinki capital region
-that is 21 MB against 128 MB.
+The same information lives here in a handful of numpy arrays in CSR layout,
+searched by Dijkstra kernels compiled with [Numba](https://numba.pydata.org/)
+([`routing.py`](src/valma_bike_and_walk/routing.py)). A search costs what it
+explores rather than what the network holds, stops once it has found everything
+it was asked for, and does its follow-up work — aggregating a zone row, loading
+demand onto the shortest-path tree — in the same compiled loop. Nodes are
+numbered along a Hilbert curve so that map neighbours are memory neighbours.
+The graph is a plain `.npz` rather than GraphML — for the Helsinki capital
+region that is 21 MB against 128 MB.
 
 ---
 
@@ -320,13 +325,10 @@ downstream — the `.npz`, the OMX writer, the volumes GeoPackage — is unchang
 Inside, `zones.indptr` delimits each zone's block of access points the way a CSR
 matrix delimits its rows, and `zones.weight` sums to 1 within every zone.
 
-> **On Windows, put your script's work under `if __name__ == "__main__":`.**
-> Anything with `workers > 1` starts worker processes by *spawning* fresh
-> interpreters, which re-import your module — so unguarded top-level code runs
-> again in every worker. With a country-sized network that means each worker
-> loading its own copy of it before doing any work, and the run using several
-> times the memory it should for no benefit. The `valma` CLI is already guarded;
-> this only bites scripts that call the library directly.
+`workers` are threads sharing one copy of the network and the demand, so there
+is no `if __name__ == "__main__":` ceremony to observe. The first run on a
+machine spends a few seconds compiling the routing kernels; the compiled code is
+cached, so later runs start straight away.
 
 ## Zones as polygons
 
@@ -605,12 +607,25 @@ Levers, in order of effect:
    one. Walking between distant centroids is not a meaningful number — Helsinki
    to Utsjoki on foot is some 270 hours. In the capital-region benchmark below a
    60-minute cutoff left only 3.8 % of pairs reachable, and it is **20× faster**.
-2. **`--workers`** — origins are embarrassingly parallel. The network is shared
-   with the workers by memory-mapping, not pickling, so N workers do not cost N
-   copies of the graph.
-3. **`--chunk-size`** — SciPy returns a dense `(chunk, n_nodes)` float64 block,
-   so this is a memory dial, defaulting to a 256 MB block. Lower it if you are
-   tight on RAM.
+2. **`--workers`** — origins are embarrassingly parallel. Workers are threads
+   sharing one copy of the graph; each adds only its own scratch space (see
+   [Memory](#memory-and-which-dial-moves-which-part-of-it)).
+
+`--chunk-size` is how many origins a worker takes at a time. It is sized
+automatically and is not a memory dial; there is no reason to set it.
+
+Measured on the Finland bike network (3.4 M nodes, 9 273 zones with 8 access
+points each, 14 workers), against the SciPy routing this project used before:
+
+| | before | now | peak memory |
+|---|---|---|---|
+| 9 273 × 9 273 matrix, `--max-minutes 60` | 21.6 s | **8.3 s** | 8.4 → 2.8 GB |
+| `--zones` matrix, `--near-minutes 15 --max-minutes 60` | 155 s | **15.8 s** | 9.3 → 5.4 GB |
+| `assign`, 1.5 M zone pairs, `--max-minutes 60` | 65 s | **7.9 s** | 10.2 → 2.9 GB |
+| `assign --zones`, 579 k zone pairs, `--near-minutes 15` | 304 s | **12.4 s** | 11.1 → 3.7 GB |
+
+The answers are identical to the old ones. `scripts/bench_routing.py`
+reproduces the comparison; see `docs/design/routing-engines.md` for the rest.
 
 A 10 000 × 10 000 matrix is 100 million values; at float32 that is 400 MB in
 memory, which the `.npz` output compresses.
@@ -621,17 +636,14 @@ memory, which the `.npz` output compresses.
 levers above apply unchanged — `--max-minutes` first, then `--workers`. Two
 things differ:
 
-- **A source is routed whether or not it has demand.** The Dijkstra is per
-  origin, not per OD pair, so the run cost tracks the centroid count. On top of
-  it, each origin's nonzero destinations are walked back up the predecessor
-  tree — all of them in lockstep and vectorised, sharing the tail where their
-  paths converge — which is cheap next to the search itself. So `--min-demand`
-  trims the loading step, not the search; reach for `--max-minutes` first.
-- **Chunks hold fewer sources for the same memory.** Walking paths back needs
-  Dijkstra's int32 predecessor block on top of the float64 distances, so a
-  source costs 12 bytes per node instead of 8, and the same 256 MB
-  `--chunk-size` budget buys two-thirds as many sources per block. Nothing to
-  set — just don't expect the two commands to chunk identically.
+- **A search stops at its farthest destination.** An origin with no demand is
+  not searched at all, and one whose demand is all local stops as soon as its
+  last destination is settled, so `--min-demand` shortens searches as well as
+  trimming the loading step.
+- **Loading is one pass up the tree.** After the search, every destination's
+  demand is pushed up the shortest-path tree in a single pass over the settled
+  nodes, farthest first — the cost of the tree, not of the number of
+  destinations times the length of their paths.
 
 Unreachable pairs — including everything beyond `--max-minutes` — are dropped
 with a logged count rather than quietly assigned somewhere.
@@ -654,15 +666,17 @@ A parallel run has two independent costs, and they respond to different flags.
 **Per worker**, and nothing to do with how many zones there are:
 
 ```
-chunk_size x n_nodes x 12 bytes   the Dijkstra distance + predecessor block
-      + n_edges x  8 bytes        the volume accumulator
+n_nodes x 32 bytes     search scratch: distances, predecessors, visit lists
+n_nodes x  8 bytes     + the flow being pushed up the tree   (assign only)
+n_edges x  8 bytes     + the volume accumulator              (assign only)
 ```
 
-On the 3.4 M-node national bike network that is 308 MB per worker at the default
-chunk size, or 105 MB at `--chunk-size 1`. The graph, the edge-key lookup and the
-demand are **memory-mapped**, so they cost once for the machine rather than once
-per worker, and do not enter this. Multiply by `--workers` and budget
-accordingly: 16 workers wants ~5 GB before the demand is considered.
+On the 3 M-node national bike network that is about 100 MB per worker for a
+matrix and 210 MB for an assignment; the run logs the figure before it starts.
+The graph and the demand are shared by every worker thread, so they cost once
+for the machine and do not enter this. Multiply by `--workers` and budget
+accordingly: 16 workers want ~3.5 GB for an assignment before the demand is
+considered.
 
 **Once, shared:** the expanded demand, which the run logs as `Expanded N zone OD
 pair(s) ... M point pair(s)`. It grows with zones² × K², so it is the term that
@@ -675,12 +689,7 @@ So, in order:
 |---|---|
 | too slow | `--near-minutes`, then `--max-minutes` |
 | out of memory, big zone system | `--min-demand` (it cuts K² point pairs per zone pair dropped), then `--points-per-zone` |
-| out of memory, big *network* | `--chunk-size`, then `--workers` |
-
-`--chunk-size` only ever moves the per-worker Dijkstra block. Lowering it also
-makes chunks *more numerous*, so it does nothing for demand-side memory — that
-was worth saying because reaching for it first is the natural instinct and the
-wrong one when the zone system is what is large.
+| out of memory, big *network* | `--workers` |
 
 ---
 
@@ -861,7 +870,8 @@ src/valma_bike_and_walk/
 ├── network.py     RoutableNetwork: CSR + coords + KD-tree  [stage 2]
 ├── centroids.py   reading points and snapping them to nodes
 ├── zones.py       zone polygons -> weighted access points inside them
-├── matrix.py      chunked / parallel OD travel-time matrices, point or zone level
+├── routing.py     Numba Dijkstra kernels and the thread pool that drives them
+├── matrix.py      OD travel-time matrices, point or zone level
 ├── demand.py      reading OD demand (long / .npz / OMX) as a sparse matrix, writing OMX
 ├── assignment.py  all-or-nothing assignment: demand -> per-link volumes
 ├── elevation.py   DEM tiles from the NLS: fetch, cache, height profiles
@@ -897,7 +907,8 @@ hand-built link layers and demand matrices, so the whole suite runs in seconds.
 | `test_assembly.py` | stitching extents on OSM node id, dedup, largest component |
 | `test_gpkg.py` | results joining back onto the right rows |
 | `test_pipeline.py` | end to end, including the CLI and an edit in the middle |
-| `test_routing.py` | SciPy routing, checked against NetworkX as an oracle |
+| `test_routing.py` | routing, checked against NetworkX as an oracle |
+| `test_routing_reference.py` | matrices and volumes identical to the SciPy implementation the kernels replaced (`tests/reference/`) |
 | `test_zones.py` | where access points land, and how they are weighted |
 | `test_zone_matrix.py` | the point-pair-to-zone-pair aggregation arithmetic |
 | `test_traffic.py` | which link a car volume lands on, and which it must not |
@@ -917,14 +928,18 @@ mostly there to catch:
   you edited. A new per-edge quantity must keep that alignment.
 - **Speeds are applied per link, before anything is merged.** Both profiles are
   plain dataclasses; change the tables, don't add special cases downstream.
-- **Big intermediates stay chunked and sparse.** SciPy's Dijkstra returns a
-  dense `(sources, n_nodes)` block, which is why both `matrix` and `assignment`
-  size their chunks against a byte budget and merge results as they complete.
-  Anything new that scales with zones² should be sparse (see `demand.py`).
+- **A search costs what it explores.** The routing kernels never touch a
+  per-node array in full per source — they reset only what a search visited —
+  and nothing per source is ever `n_nodes` long. Keep it that way in anything
+  new, and keep anything that scales with zones² sparse (see `demand.py`).
 
-Workers get the network by memory-mapping it from a temporary directory, not by
-pickling — so adding a parallel step means writing the arrays out once, not
-handing the graph to each process.
+Parallelism is threads over GIL-free kernels sharing one copy of everything, so
+a new parallel step is a new kernel plus a task list for
+`routing._run`, not a new way of shipping data to processes.
+
+`scripts/bench_routing.py` times the routing against the frozen SciPy
+implementation in `tests/reference/` on a real network and checks that the
+answers agree.
 
 ## Licence
 

@@ -5,9 +5,17 @@ convenient at city scale and hopeless at country scale: Finland's walking
 network runs to millions of nodes, which costs tens of gigabytes as dicts and
 makes every shortest-path call slow.
 
-This module keeps the same information in a handful of numpy arrays plus a SciPy
-CSR matrix -- roughly two orders of magnitude smaller, and routable with SciPy's
-compiled Dijkstra instead of NetworkX's pure-Python one.
+This module keeps the same information in a handful of numpy arrays in CSR
+layout -- roughly two orders of magnitude smaller, and routable with the
+compiled kernels in :mod:`valma_bike_and_walk.routing` instead of NetworkX's
+pure-Python Dijkstra.
+
+Nodes are numbered along a Hilbert curve over their coordinates, so nodes that
+are close on the map are close in memory too. A search expands outwards through
+space, and this keeps the part of the arrays it is working on in cache. The
+graph is an internal format: the version number in each saved file says which
+layout it holds, and a file from another version is refused rather than
+reinterpreted.
 
 This is stage two of the pipeline. Its input is the link layer
 (:mod:`valma_bike_and_walk.links`), not the PBF: geometry, tags and every
@@ -36,6 +44,7 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 from valma_bike_and_walk import links as links_module
+from valma_bike_and_walk import routing
 from valma_bike_and_walk.cache import (
     code_digest,
     dump_key,
@@ -56,6 +65,22 @@ from valma_bike_and_walk.config import (
 from valma_bike_and_walk.osm import read_links, resolve_clip
 
 logger = logging.getLogger(__name__)
+
+#: Layout of a saved graph. Bump it whenever what the arrays mean changes --
+#: node order, edge order, which arrays exist -- so that a file written by
+#: another version is refused (see :class:`NetworkFormatError`) and a cached one
+#: is rebuilt, rather than either being read as if it were this one.
+FORMAT_VERSION = 2
+
+#: Bits per axis of the Hilbert key nodes are sorted by. 2**16 cells across
+#: Finland is about 20 m a cell -- far finer than it needs to be to keep
+#: neighbouring streets together.
+_HILBERT_BITS = 16
+
+
+class NetworkFormatError(ValueError):
+    """A saved graph is from a different version of this package."""
+
 
 #: Modules whose code decides what a graph built from a link layer looks like.
 #: A change to any of them makes every cached graph stale.
@@ -99,6 +124,7 @@ class RoutableNetwork:
 
     def __post_init__(self) -> None:
         self._tree: cKDTree | None = None
+        self._graph: routing.Graph | None = None
 
     @property
     def n_nodes(self) -> int:
@@ -108,19 +134,13 @@ class RoutableNetwork:
     def n_edges(self) -> int:
         return int(self.indices.shape[0])
 
-    def csr(self) -> csr_matrix:
-        """Adjacency weighted by travel time in seconds."""
-        return csr_matrix(
-            (self.travel_time, self.indices, self.indptr),
-            shape=(self.n_nodes, self.n_nodes),
-        )
-
-    def distance_csr(self) -> csr_matrix:
-        """Adjacency weighted by length in metres."""
-        return csr_matrix(
-            (self.length.astype(np.float64), self.indices, self.indptr),
-            shape=(self.n_nodes, self.n_nodes),
-        )
+    def routing_graph(self) -> routing.Graph:
+        """The arrays the routing kernels search, weighted by travel time. Built once."""
+        if self._graph is None:
+            self._graph = routing.Graph.from_csr(
+                self.indptr, self.indices, self.travel_time
+            )
+        return self._graph
 
     @property
     def tree(self) -> cKDTree:
@@ -151,9 +171,13 @@ class RoutableNetwork:
             idx = np.where(distances <= max_distance, idx, -1)
         return idx, distances
 
-    def save(self, path: Path) -> Path:
+    def save(self, path: Path, compress: bool = True) -> Path:
         """
-        Persist as a compressed .npz -- far smaller and faster than GraphML.
+        Persist as an .npz -- far smaller and faster than GraphML.
+
+        ``compress=False`` trades disk for load time: a country-sized graph
+        takes seconds to decompress on every load, which is worth avoiding for a
+        cache that is read on every run and can be rebuilt at will.
 
         Written to a temporary file and moved into place, so a run that dies
         mid-write leaves the previous file (or none), never a truncated one.
@@ -165,8 +189,9 @@ class RoutableNetwork:
         )
         try:
             with os.fdopen(handle, "wb") as out:
-                np.savez_compressed(
+                (np.savez_compressed if compress else np.savez)(
                     out,
+                    format_version=np.array(FORMAT_VERSION),
                     mode=np.array(self.mode),
                     crs=np.array(self.crs),
                     source_key=np.array(self.source_key),
@@ -191,6 +216,16 @@ class RoutableNetwork:
     def load(cls, path: Path) -> "RoutableNetwork":
         path = Path(path)
         with np.load(Path(path), allow_pickle=False) as data:
+            version = (
+                int(data["format_version"]) if "format_version" in data.files else 1
+            )
+            if version != FORMAT_VERSION:
+                raise NetworkFormatError(
+                    f"{path} is graph format {version}; this version of "
+                    f"valma_bike_and_walk needs format {FORMAT_VERSION}. Rebuild "
+                    "it with `valma build --links <links.gpkg> --mode "
+                    f"{str(data['mode'])}`."
+                )
             return cls(
                 mode=str(data["mode"]),
                 crs=str(data["crs"]),
@@ -282,9 +317,9 @@ def _build_csr(
     travel_time, length = travel_time[first], length[first]
     link_id, direction = link_id[first], direction[first]
 
-    # int32 throughout: SciPy wants indptr and indices to share a dtype, and a
-    # mismatch makes it silently copy both arrays -- which on a country-sized
-    # network is hundreds of megabytes we would rather not spend.
+    # int32 wherever it fits: a country-sized network has millions of edges, and
+    # every array here is saved, loaded and read by every routing thread. The
+    # routing kernels take the dtypes they are compiled for from routing.Graph.
     indptr = np.zeros(n_nodes + 1, dtype=np.int64)
     np.cumsum(np.bincount(u_idx, minlength=n_nodes), out=indptr[1:])
     index_dtype = np.int32 if indptr[-1] <= np.iinfo(np.int32).max else np.int64
@@ -395,6 +430,15 @@ def _assemble(mode: str, parts: list[_EdgeArrays]) -> RoutableNetwork:
 
     transformer = Transformer.from_crs(WGS84, PROJECTED_CRS, always_xy=True)
     x, y = transformer.transform(lon, lat)
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+
+    # Number nodes along a Hilbert curve, so that map neighbours are memory
+    # neighbours (see the module docstring).
+    order = hilbert_order(x, y)
+    node_ids, x, y = node_ids[order], x[order], y[order]
+    new_index = np.empty_like(order)
+    new_index[order] = np.arange(order.shape[0])
+    u_idx, v_idx = new_index[u_idx], new_index[v_idx]
 
     indptr, indices, travel_time, length, link_id, direction = _build_csr(
         u_idx, v_idx, travel_time, length, link_id, direction, len(node_ids)
@@ -409,8 +453,8 @@ def _assemble(mode: str, parts: list[_EdgeArrays]) -> RoutableNetwork:
         RoutableNetwork(
             mode=mode,
             node_ids=node_ids,
-            x=np.asarray(x, dtype=float),
-            y=np.asarray(y, dtype=float),
+            x=x,
+            y=y,
             indptr=indptr,
             indices=indices,
             travel_time=travel_time,
@@ -420,6 +464,46 @@ def _assemble(mode: str, parts: list[_EdgeArrays]) -> RoutableNetwork:
         ),
         keep,
     )
+
+
+def _hilbert_keys(ix: np.ndarray, iy: np.ndarray, bits: int) -> np.ndarray:
+    """
+    Distance along a Hilbert curve of integer grid cells ``(ix, iy)``.
+
+    The classic bit-twiddling form, vectorised over every point at once: one
+    pass per bit level, rotating each quadrant into the orientation the curve
+    enters it in.
+    """
+    x = ix.astype(np.int64).copy()
+    y = iy.astype(np.int64).copy()
+    key = np.zeros(x.shape[0], dtype=np.int64)
+    side = 1 << bits
+    s = side >> 1
+    while s > 0:
+        rx = (x & s) > 0
+        ry = (y & s) > 0
+        key += s * s * ((3 * rx) ^ ry)
+        # Rotate the lower quadrants so the curve inside them lines up.
+        flip = ~ry & rx
+        x = np.where(flip, side - 1 - x, x)
+        y = np.where(flip, side - 1 - y, y)
+        swap = ~ry
+        x, y = np.where(swap, y, x), np.where(swap, x, y)
+        s >>= 1
+    return key
+
+
+def hilbert_order(
+    x: np.ndarray, y: np.ndarray, bits: int = _HILBERT_BITS
+) -> np.ndarray:
+    """Permutation that sorts points along a Hilbert curve over their bounding box."""
+    if x.shape[0] == 0:
+        return np.zeros(0, dtype=np.int64)
+    cells = (1 << bits) - 1
+    span = max(float(np.ptp(x)), float(np.ptp(y)), 1e-9)
+    ix = np.floor((x - x.min()) / span * cells).astype(np.int64)
+    iy = np.floor((y - y.min()) / span * cells).astype(np.int64)
+    return np.argsort(_hilbert_keys(ix, iy, bits), kind="stable")
 
 
 def network_from_links(links: gpd.GeoDataFrame, mode: str) -> RoutableNetwork:
@@ -459,6 +543,7 @@ def links_network_key(links_path: Path | str, mode: str) -> dict[str, Any]:
     """What a graph built from ``links_path`` depends on, as it stands now."""
     return make_key(
         "network",
+        format=FORMAT_VERSION,
         mode=mode,
         links=file_stamp(links_path),
         code=code_digest(*BUILD_MODULES),
@@ -471,9 +556,13 @@ def network_for_links(
     network_path: Path | str,
     force_reload: bool = False,
     links: gpd.GeoDataFrame | None = None,
+    compress: bool = False,
 ) -> RoutableNetwork:
     """
     The graph for a link layer: from ``network_path`` if it is current, else built.
+
+    ``compress`` is for a graph meant to be kept (``valma build``); a cache is
+    left uncompressed, because it is loaded on every run and is disposable.
 
     "Current" means built from this very version of the link layer, by this
     version of the build code -- see :mod:`valma_bike_and_walk.cache`. Edit the
@@ -500,7 +589,7 @@ def network_for_links(
         links = links_module.read_links(links_path)
     network = network_from_links(links, mode)
     network.source_key = dump_key(key)
-    network.save(network_path)
+    network.save(network_path, compress=compress)
     return network
 
 

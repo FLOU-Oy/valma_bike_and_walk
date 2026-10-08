@@ -95,6 +95,7 @@ from valma_bike_and_walk.matrix import (
     zone_travel_time_matrix,
 )
 from valma_bike_and_walk.network import (
+    NetworkFormatError,
     RoutableNetwork,
     build_links,
     build_network,
@@ -234,7 +235,10 @@ def _network_and_links(
 ) -> tuple[RoutableNetwork, Path | None]:
     """Load or build the network, and say which link layer it came from."""
     if args.network is not None:
-        network = load_network(args.network)
+        try:
+            network = load_network(args.network)
+        except NetworkFormatError as error:
+            raise SystemExit(str(error)) from None
         if network.mode != args.mode:
             raise SystemExit(
                 f"{args.network} holds a {network.mode!r} network but --mode is "
@@ -264,7 +268,11 @@ def _network_and_links(
         # Reused only while it was built from this very version of the layer;
         # an edit, `valma dem` or `valma traffic` since then rebuilds it.
         network = network_for_links(
-            args.links, args.mode, path, force_reload=args.force_reload
+            args.links,
+            args.mode,
+            path,
+            force_reload=args.force_reload,
+            compress=explicit_build,
         )
         return network, args.links
 
@@ -681,8 +689,17 @@ def _add_routing(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--max-snap-distance", type=float, default=DEFAULT_MAX_SNAP_M)
-    parser.add_argument("--workers", type=int, default=default_workers())
-    parser.add_argument("--chunk-size", type=int)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=default_workers(),
+        help="Threads to route on (default: all cores but two).",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        help="Origins a worker takes at a time. Sized automatically; rarely worth setting.",
+    )
 
 
 def _add_dem(parser: argparse.ArgumentParser) -> None:
