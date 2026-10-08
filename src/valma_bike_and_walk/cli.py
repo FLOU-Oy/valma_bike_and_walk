@@ -55,6 +55,7 @@ import numpy as np
 from valma_bike_and_walk import links as links_module
 from valma_bike_and_walk.assignment import (
     assign_traffic,
+    select_link_assignment,
     assign_zone_traffic,
     link_volume_frame,
 )
@@ -690,7 +691,24 @@ def cmd_assign(args: argparse.Namespace) -> int:
     demand = clip_minimum(demand, args.min_demand)
     max_seconds = args.max_minutes * 60 if args.max_minutes else None
 
-    if isinstance(points, Zones):
+    if args.select_link and isinstance(points, Zones):
+        raise SystemExit(
+            "--select-link works with --centroids for now; --zones spreads each "
+            "zone over several access points and two search tiers."
+        )
+
+    select_demand = None
+    if args.select_link:
+        link_volume, select_demand = select_link_assignment(
+            network,
+            points.node_index,
+            demand,
+            args.select_link,
+            max_seconds=max_seconds,
+            workers=args.workers,
+            chunk_size=args.chunk_size,
+        )
+    elif isinstance(points, Zones):
         link_volume = assign_zone_traffic(
             network,
             points,
@@ -741,7 +759,79 @@ def cmd_assign(args: argparse.Namespace) -> int:
 
     for key, value in summarise_assignment(link_volume).items():
         print(f"  {key}: {value:,.3f}")
+
+    if select_demand is not None:
+        _write_select_link(args, network, points, select_demand, max_seconds)
     return 0
+
+
+def _write_select_link(
+    args: argparse.Namespace,
+    network: RoutableNetwork,
+    points: Centroids,
+    select_demand,
+    max_seconds: float | None,
+) -> None:
+    """
+    Write what a select-link run found: the OD pairs whose path uses the
+    selected link(s), each zone's share as origin and as destination, and
+    where those trips run on the rest of the network.
+    """
+    import pandas as pd
+
+    stem = f"select_link_{args.mode}"
+    coo = select_demand.tocoo()
+    ids = np.asarray(points.ids)
+    od = pd.DataFrame(
+        {"origin": ids[coo.row], "destination": ids[coo.col], "demand": coo.data}
+    ).sort_values("demand", ascending=False)
+    od_path = args.output_dir / f"{stem}_od.csv"
+    od.to_csv(od_path, index=False)
+
+    as_origin = np.asarray(select_demand.sum(axis=1)).ravel()
+    as_destination = np.asarray(select_demand.sum(axis=0)).ravel()
+    zones = gpd.GeoDataFrame(
+        {
+            "zone_id": ids,
+            "as_origin": as_origin,
+            "as_destination": as_destination,
+            "total": as_origin + as_destination,
+        },
+        geometry=gpd.points_from_xy(points.x, points.y),
+        crs=network.crs,
+    )
+    zones = zones[zones["total"] > 0].sort_values("total", ascending=False)
+    zones_path = args.output_dir / f"{stem}_zones.gpkg"
+    zones.to_file(zones_path, layer="zones", driver="GPKG")
+
+    # Where the selected link's trips go: assign just those OD pairs.
+    flow = assign_traffic(
+        network,
+        points.node_index,
+        select_demand,
+        max_seconds=max_seconds,
+        workers=args.workers,
+        chunk_size=args.chunk_size,
+    )
+    flow_path = args.output_dir / f"{stem}.gpkg"
+    write_edges_gpkg(
+        network,
+        _link_layer(args),
+        flow_path,
+        extra_columns={"volume": flow},
+        edge_mask=flow > 0,
+    )
+
+    total = float(select_demand.sum())
+    print(f"\nSelect link {args.select_link}: {total:,.1f} trips, {len(od):,} OD pair(s)")
+    print(f"  {od_path}\n  {zones_path} ({len(zones):,} zones)\n  {flow_path}")
+    if total > 0:
+        print("  Largest origins / destinations (zone: trips, share):")
+        for _, row in zones.head(10).iterrows():
+            print(
+                f"    {row['zone_id']}: {row['as_origin']:,.1f} from, "
+                f"{row['as_destination']:,.1f} to ({row['total'] / total:.0%} of the trips)"
+            )
 
 
 def _add_routing(parser: argparse.ArgumentParser) -> None:
@@ -1261,6 +1351,20 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Name of the OMX lookup that maps matrix row/column position to "
             "zone/centroid id (default: 'zone_number')."
+        ),
+    )
+    assign.add_argument(
+        "--select-link",
+        type=int,
+        nargs="+",
+        metavar="LINK_ID",
+        help=(
+            "Select-link analysis of these link_id(s) from the link layer (with "
+            "--centroids): writes select_link_<mode>_od.csv (the OD pairs whose "
+            "path uses them), select_link_<mode>_zones.gpkg (each zone's trips "
+            "as origin and destination) and select_link_<mode>.gpkg (where those "
+            "trips run on the rest of the network). Costs one extra assignment "
+            "of just those trips."
         ),
     )
     assign.add_argument(

@@ -131,7 +131,8 @@ def _load_source(
     edge_keys: np.ndarray,
     n_nodes: int,
     link_volume: np.ndarray,
-) -> np.ndarray:
+    selected: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None]:
     """
     All-or-nothing load of one source's nonzero demand onto ``link_volume``.
 
@@ -151,9 +152,14 @@ def _load_source(
     route it another way. See :func:`assign_zone_traffic`'s two tiers.
     Destinations that *are* the source are not marked: their trip is
     zero-length, so there is nothing to place and nothing missing.
+
+    ``selected``, a boolean per edge, turns on select-link analysis: the
+    second return value then marks, over the same destinations, the ones whose
+    path crosses any selected edge. Without it, it is None.
     """
     if node.size == 0:
-        return np.zeros(0, dtype=bool)
+        empty = np.zeros(0, dtype=bool)
+        return empty, (empty if selected is not None else None)
 
     node = node.astype(np.int64).copy()
     load = load.astype(np.float64)
@@ -162,10 +168,12 @@ def _load_source(
     unreachable = (predecessors[node] == _NO_PREDECESSOR) & ~at_source
     keep = ~at_source & ~unreachable
 
+    hit_full = np.zeros(keep.shape[0], dtype=bool) if selected is not None else None
     node, load = node[keep], load[keep]
     if node.size == 0:
-        return unreachable
+        return unreachable, hit_full
 
+    hit = np.zeros(node.shape[0], dtype=bool) if selected is not None else None
     still = np.ones(node.shape[0], dtype=bool)
     hops = 0
     max_hops = n_nodes + 1  # a shortest-path tree has no cycles; this is a safety valve
@@ -181,10 +189,14 @@ def _load_source(
         pred = predecessors[cur]
         edge_idx = np.searchsorted(edge_keys, pred.astype(np.int64) * n_nodes + cur)
         np.add.at(link_volume, edge_idx, load[idx])
+        if hit is not None:
+            hit[idx] |= selected[edge_idx]
         node[idx] = pred
         still[idx] = pred != source
 
-    return unreachable
+    if hit_full is not None:
+        hit_full[keep] = hit
+    return unreachable, hit_full
 
 
 def _as_demand_csr(
@@ -262,8 +274,12 @@ class _Unplaced:
 
 
 #: What a chunk hands back: touched edge indices, their volumes, how many OD
-#: pairs went unplaced, and (row, col, value) of that demand at group level.
-_ChunkResult = tuple[np.ndarray, np.ndarray, int, tuple[np.ndarray, ...]]
+#: pairs went unplaced, (row, col, value) of that demand at group level, and
+#: (row, col, value) of the OD pairs whose path crosses a selected link (empty
+#: unless select-link analysis is on).
+_ChunkResult = tuple[
+    np.ndarray, np.ndarray, int, tuple[np.ndarray, ...], tuple[np.ndarray, ...]
+]
 
 
 def _solve_chunk(
@@ -279,6 +295,7 @@ def _solve_chunk(
     max_seconds: float | None,
     n_edges: int,
     groups: tuple[np.ndarray, np.ndarray, int] | None = None,
+    selected: np.ndarray | None = None,
 ) -> _ChunkResult:
     """
     One chunk of sources: Dijkstra, then load each row's demand.
@@ -307,13 +324,16 @@ def _solve_chunk(
     link_volume = np.zeros(n_edges, dtype=np.float64)
     dropped = 0
     unplaced = _Unplaced(*groups) if groups is not None else None
+    sel_rows: list[np.ndarray] = []
+    sel_cols: list[np.ndarray] = []
+    sel_vals: list[np.ndarray] = []
 
     for row, source in enumerate(sources):
         lo = int(demand_indptr[row_offset + row])
         hi = int(demand_indptr[row_offset + row + 1])
         columns = np.asarray(demand_indices[lo:hi])
         load = np.asarray(demand_data[lo:hi])
-        missed = _load_source(
+        missed, hit = _load_source(
             int(source),
             pred[row],
             targets[columns],
@@ -321,14 +341,24 @@ def _solve_chunk(
             edge_keys,
             n_nodes,
             link_volume,
+            selected,
         )
         dropped += int(missed.sum())
         if unplaced is not None:
             unplaced.add(row_offset + row, columns[missed], load[missed])
+        if hit is not None and hit.any():
+            sel_rows.append(np.full(int(hit.sum()), row_offset + row, dtype=np.int64))
+            sel_cols.append(columns[hit].astype(np.int64))
+            sel_vals.append(load[hit])
 
     touched = np.flatnonzero(link_volume)
     report = unplaced.collect() if unplaced is not None else ()
-    return touched, link_volume[touched], dropped, report
+    picked: tuple[np.ndarray, ...] = (
+        (np.concatenate(sel_rows), np.concatenate(sel_cols), np.concatenate(sel_vals))
+        if sel_rows
+        else ()
+    )
+    return touched, link_volume[touched], dropped, report, picked
 
 
 def _init_worker(cache_dir: str, shape: tuple[int, int]) -> None:
@@ -362,6 +392,7 @@ def _init_worker(cache_dir: str, shape: tuple[int, int]) -> None:
         "demand_indptr",
         "row_group",
         "col_group",
+        "selected",
     ):
         path = base / f"{name}.npy"
         if path.exists():
@@ -396,6 +427,7 @@ def _worker_solve(
         max_seconds,
         cast(int, _WORKER_STATE["n_edges"]),
         groups,
+        cast("np.ndarray | None", _WORKER_STATE.get("selected")),
     )
 
 
@@ -453,6 +485,45 @@ def assign_traffic(
     return volume
 
 
+def select_link_assignment(
+    network: RoutableNetwork,
+    sources: Sequence[int] | np.ndarray,
+    demand: np.ndarray | csr_matrix,
+    link_ids: Sequence[int] | np.ndarray,
+    targets: Sequence[int] | np.ndarray | None = None,
+    max_seconds: float | None = None,
+    workers: int = 1,
+    chunk_size: int | None = None,
+    progress_every: int = 10,
+) -> tuple[np.ndarray, csr_matrix]:
+    """
+    :func:`assign_traffic`, plus a select-link analysis of ``link_ids``.
+
+    Returns the ordinary link volumes and, as a sparse ``(len(sources),
+    len(targets))`` matrix, the demand of every OD pair whose shortest path
+    uses any of the links (in either direction). Assigning that matrix on its
+    own shows where the selected link's traffic comes from and goes to.
+    """
+    selected = np.isin(network.link_id, np.asarray(link_ids, dtype=np.int64))
+    if not selected.any():
+        raise ValueError(f"None of the link_id(s) {list(link_ids)} are in the network.")
+    select_out: list[csr_matrix] = []
+    volume, _ = _assign(
+        network,
+        sources,
+        demand,
+        targets,
+        max_seconds,
+        workers,
+        chunk_size,
+        progress_every,
+        groups=None,
+        selected=selected,
+        select_out=select_out,
+    )
+    return volume, select_out[0]
+
+
 def _assign(
     network: RoutableNetwork,
     sources: Sequence[int] | np.ndarray,
@@ -463,6 +534,8 @@ def _assign(
     chunk_size: int | None,
     progress_every: int,
     groups: tuple[np.ndarray, np.ndarray, int] | None,
+    selected: np.ndarray | None = None,
+    select_out: list[csr_matrix] | None = None,
 ) -> tuple[np.ndarray, csr_matrix | None]:
     """
     The engine behind :func:`assign_traffic`, plus a report of what it could not place.
@@ -472,6 +545,10 @@ def _assign(
     place -- everything beyond ``max_seconds`` -- comes back as an
     ``(n_groups, n_groups)`` sparse matrix ready to be assigned some other way.
     Without it the second return value is None and nothing extra is tracked.
+
+    ``selected`` (a boolean per edge) runs a select-link analysis alongside:
+    the demand of every OD pair whose path crosses a selected edge is appended
+    to ``select_out`` as one ``(len(sources), len(targets))`` sparse matrix.
     """
     sources = np.asarray(sources, dtype=np.int64)
     targets = sources if targets is None else np.asarray(targets, dtype=np.int64)
@@ -512,10 +589,13 @@ def _assign(
     dropped_total = 0
     n_groups = None if groups is None else groups[2]
     unplaced_parts: list[coo_matrix] = []
+    picked_parts: list[tuple[np.ndarray, ...]] = []
 
     def merge(result: _ChunkResult) -> None:
         nonlocal dropped_total
-        idx, values, dropped, report = result
+        idx, values, dropped, report, picked = result
+        if picked:
+            picked_parts.append(picked)
         link_volume[idx] += values
         dropped_total += dropped
         if n_groups is not None and report and report[0].size:
@@ -542,6 +622,7 @@ def _assign(
                     max_seconds,
                     network.n_edges,
                     groups,
+                    selected,
                 )
             )
             if progress_every and done % progress_every == 0:
@@ -560,6 +641,8 @@ def _assign(
             if groups is not None:
                 np.save(base / "row_group.npy", groups[0])
                 np.save(base / "col_group.npy", groups[1])
+            if selected is not None:
+                np.save(base / "selected.npy", selected)
             shape = (network.n_nodes, network.n_nodes)
 
             with ProcessPoolExecutor(
@@ -619,6 +702,16 @@ def _assign(
         logger.info(
             "%d OD pair(s) were beyond the cutoff; handing them back to the caller.",
             dropped_total,
+        )
+
+    if select_out is not None:
+        if picked_parts:
+            rows, cols, vals = (np.concatenate(part) for part in zip(*picked_parts))
+        else:
+            rows = cols = np.empty(0, dtype=np.int64)
+            vals = np.empty(0, dtype=np.float64)
+        select_out.append(
+            coo_matrix((vals, (rows, cols)), shape=(sources.size, targets.size)).tocsr()
         )
 
     if n_groups is None:

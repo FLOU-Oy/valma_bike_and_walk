@@ -143,7 +143,7 @@ def test_solve_chunk_returns_only_touched_edges():
     demand = _as_demand_csr(np.array([[0.0, 0.0, 0.0, 5.0]]), 1, 4)
     edge_keys = _edge_keys(net)
 
-    idx, vals, dropped, _ = _solve_chunk(
+    idx, vals, dropped, _, _ = _solve_chunk(
         net.csr(),
         np.array([0], dtype=np.int64),
         np.arange(4, dtype=np.int64),
@@ -393,3 +393,52 @@ def test_uneven_weights_split_demand_in_proportion():
     assert volume_of(net, volume, 0, 1) == pytest.approx(200.0)
     assert volume_of(net, volume, 1, 2) == pytest.approx(300.0)
     assert volume_of(net, volume, 2, 3) == pytest.approx(400.0)
+
+
+def _link_of(net, u, v):
+    """The link_id of edge u->v in a make_network graph."""
+    frame = link_volume_frame(net, np.zeros(net.n_edges))
+    match = (frame["u"] == u) & (frame["v"] == v)
+    return int(np.asarray(net.link_id)[np.flatnonzero(match)[0]])
+
+
+def test_select_link_finds_exactly_the_od_pairs_that_use_the_link():
+    from valma_bike_and_walk.assignment import select_link_assignment
+
+    # Two origins share 1->3; a third pair 0->2 never touches it.
+    net = make_network([(0, 1, 5.0), (2, 1, 5.0), (1, 3, 5.0), (0, 2, 1.0)], 4)
+    demand = np.zeros((2, 2))
+    demand[0, 0] = 4.0  # 0 -> 3, via 1->3
+    demand[1, 0] = 6.0  # 2 -> 3, via 1->3
+    demand[0, 1] = 9.0  # 0 -> 2, direct
+
+    volume, picked = select_link_assignment(
+        net, [0, 2], demand, [_link_of(net, 1, 3)], targets=[3, 2]
+    )
+
+    assert picked.toarray() == pytest.approx(np.array([[4.0, 0.0], [6.0, 0.0]]))
+    # The ordinary volumes are untouched by the analysis.
+    plain = assign_traffic(net, [0, 2], demand, targets=[3, 2])
+    assert volume == pytest.approx(plain)
+
+
+def test_select_link_gives_the_same_answer_in_parallel():
+    from valma_bike_and_walk.assignment import select_link_assignment
+
+    net = make_network([(0, 1, 5.0), (2, 1, 5.0), (1, 3, 5.0), (0, 2, 1.0)], 4)
+    demand = np.array([[0.0, 4.0, 9.0], [6.0, 0.0, 1.0], [2.0, 3.0, 0.0]])
+    sources = [0, 2, 1]
+    link = [_link_of(net, 1, 3)]
+    _, serial = select_link_assignment(net, sources, demand, link, targets=[3, 2, 1])
+    _, parallel = select_link_assignment(
+        net, sources, demand, link, targets=[3, 2, 1], workers=2, chunk_size=1
+    )
+    assert parallel.toarray() == pytest.approx(serial.toarray())
+
+
+def test_select_link_rejects_an_unknown_link():
+    from valma_bike_and_walk.assignment import select_link_assignment
+
+    net = make_network([(0, 1, 5.0)], 2)
+    with pytest.raises(ValueError):
+        select_link_assignment(net, [0], np.array([[0.0, 1.0]]), [999], targets=[0, 1])
