@@ -488,11 +488,15 @@ def _directional_speeds(**tags):
 
 
 def test_a_right_side_lane_serves_only_the_digitised_direction():
-    from valma_bike_and_walk.speeds import CYCLE_LANE_FACTOR, MIXED_TRAFFIC_FACTOR
+    from valma_bike_and_walk.speeds import (
+        CYCLE_LANE_FACTOR,
+        MIXED_TRAFFIC_FACTOR,
+        carriageway_divisor,
+    )
 
     forward, reverse = _directional_speeds(cycleway_left="no", cycleway_right="lane")
-    assert forward == pytest.approx(18.0 / CYCLE_LANE_FACTOR)
-    assert reverse == pytest.approx(18.0 / MIXED_TRAFFIC_FACTOR)
+    assert forward == pytest.approx(18.0 / carriageway_divisor("secondary", CYCLE_LANE_FACTOR))
+    assert reverse == pytest.approx(18.0 / carriageway_divisor("secondary", MIXED_TRAFFIC_FACTOR))
 
 
 def test_a_left_side_track_serves_only_the_reverse_direction():
@@ -511,10 +515,10 @@ def test_plain_and_both_side_tags_serve_both_directions():
 
 
 def test_cycleway_no_does_not_hide_a_side_lane():
-    from valma_bike_and_walk.speeds import CYCLE_LANE_FACTOR
+    from valma_bike_and_walk.speeds import CYCLE_LANE_FACTOR, carriageway_divisor
 
     forward, _ = _directional_speeds(cycleway="no", cycleway_right="lane")
-    assert forward == pytest.approx(18.0 / CYCLE_LANE_FACTOR)
+    assert forward == pytest.approx(18.0 / carriageway_divisor("secondary", CYCLE_LANE_FACTOR))
 
 
 def test_on_a_oneway_street_a_left_lane_serves_the_only_direction():
@@ -523,23 +527,31 @@ def test_on_a_oneway_street_a_left_lane_serves_the_only_direction():
 
 
 def test_a_contraflow_lane_serves_only_the_contraflow_rider():
-    from valma_bike_and_walk.speeds import CYCLE_LANE_FACTOR, MIXED_TRAFFIC_FACTOR
+    from valma_bike_and_walk.speeds import (
+        CYCLE_LANE_FACTOR,
+        MIXED_TRAFFIC_FACTOR,
+        carriageway_divisor,
+    )
 
     forward, reverse = _directional_speeds(
         oneway="yes", oneway_bicycle="no", cycleway_left="lane"
     )
-    assert forward == pytest.approx(18.0 / MIXED_TRAFFIC_FACTOR)
-    assert reverse == pytest.approx(18.0 / CYCLE_LANE_FACTOR)
+    assert forward == pytest.approx(18.0 / carriageway_divisor("secondary", MIXED_TRAFFIC_FACTOR))
+    assert reverse == pytest.approx(18.0 / carriageway_divisor("secondary", CYCLE_LANE_FACTOR))
 
 
 def test_plain_cycleway_on_a_oneway_street_is_not_given_to_contraflow():
-    from valma_bike_and_walk.speeds import CYCLE_LANE_FACTOR, MIXED_TRAFFIC_FACTOR
+    from valma_bike_and_walk.speeds import (
+        CYCLE_LANE_FACTOR,
+        MIXED_TRAFFIC_FACTOR,
+        carriageway_divisor,
+    )
 
     forward, reverse = _directional_speeds(
         oneway="yes", oneway_bicycle="no", cycleway="lane"
     )
-    assert forward == pytest.approx(18.0 / CYCLE_LANE_FACTOR)
-    assert reverse == pytest.approx(18.0 / MIXED_TRAFFIC_FACTOR)
+    assert forward == pytest.approx(18.0 / carriageway_divisor("secondary", CYCLE_LANE_FACTOR))
+    assert reverse == pytest.approx(18.0 / carriageway_divisor("secondary", MIXED_TRAFFIC_FACTOR))
 
 
 def test_directional_speed_reaches_the_reverse_travel_time():

@@ -27,29 +27,49 @@ TRAFFIC_COEFFICIENT = 0.008
 #: it into a per-km surcharge comparable with ``AVG_BASE_DISUTIL``.
 AVG_ROUTE_LENGTH_KM = 5.6
 
-#: Cycling on the carriageway, relative to a separate cycleway (1.0): the bike
-#: speed on a road is divided by exactly one of these -- the cycle-track factor
-#: where the road has a kerb-separated track (``cycleway=track``), the
-#: cycle-lane factor where it has a lane, the mixed-traffic factor otherwise.
+#: Tarkkala et al. (2024), Table 4 (M1): a route's disutility per km is the
+#: *sum* of a road-class and a bike-facility coefficient. The facility
+#: coefficients are kept here as multiples of the separated-path one -- the
+#: cycle-track factor where the road has a kerb-separated track
+#: (``cycleway=track``), the cycle-lane factor where it has a lane, the
+#: mixed-traffic factor otherwise.
+BETA_SEPARATED = 2.61
 MIXED_TRAFFIC_FACTOR = 1.927
 CYCLE_LANE_FACTOR = 1.169
 CYCLE_TRACK_FACTOR = 1.0
 
-#: Roads that take the mixed-traffic / cycle-lane factor. ``service``,
-#: ``unclassified`` and ``trunk`` are left out: their bike speeds carry no
-#: carriageway factor at all, so a lane has nothing to replace there.
-MIXED_TRAFFIC_HIGHWAYS = frozenset(
-    {
-        "living_street",
-        "residential",
-        "tertiary",
-        "tertiary_link",
-        "secondary",
-        "secondary_link",
-        "primary",
-        "primary_link",
-    }
-)
+#: Road-class coefficients per km (M1): local covers residential and collector
+#: streets, main the main streets, arterial the arterial roads.
+BETA_LOCAL = 4.96
+BETA_MAIN = 4.14
+BETA_ARTERIAL = 4.05
+ROAD_CLASS_BETA: Mapping[str, float] = {
+    "living_street": BETA_LOCAL,
+    "residential": BETA_LOCAL,
+    "tertiary": BETA_LOCAL,
+    "tertiary_link": BETA_LOCAL,
+    "secondary": BETA_MAIN,
+    "secondary_link": BETA_MAIN,
+    "primary": BETA_ARTERIAL,
+    "primary_link": BETA_ARTERIAL,
+}
+
+#: The reference the cycleway's speed stands for: a separated path along a
+#: main street. A road's bike speed is its nominal speed scaled by how much
+#: more its own road class + facility cost per km than this.
+REFERENCE_DISUTIL = BETA_MAIN + BETA_SEPARATED
+
+#: Roads that take a road-class + facility cost. ``service``, ``unclassified``
+#: and ``trunk`` are left out: their bike speeds carry no carriageway cost at
+#: all, so a lane has nothing to replace there.
+MIXED_TRAFFIC_HIGHWAYS = frozenset(ROAD_CLASS_BETA)
+
+
+def carriageway_divisor(highway: str, facility_factor: float) -> float:
+    """What a road's nominal bike speed is divided by: its road-class plus
+    facility disutility per km, relative to :data:`REFERENCE_DISUTIL`."""
+    road = ROAD_CLASS_BETA[highway]
+    return (road + BETA_SEPARATED * facility_factor) / REFERENCE_DISUTIL
 
 
 @dataclass(frozen=True)
@@ -91,17 +111,19 @@ class SpeedProfile:
                 lane_mask = values.str.contains(
                     r"(?:^|;)\s*lane\s*(?:;|$)", regex=True
                 ).to_numpy(dtype=bool)
-            mixed_road = highway.isin(MIXED_TRAFFIC_HIGHWAYS).to_numpy(dtype=bool)
-            carriageway_factor = np.where(
-                mixed_road,
-                np.select(
-                    [track_mask, lane_mask],
-                    [CYCLE_TRACK_FACTOR, CYCLE_LANE_FACTOR],
-                    default=MIXED_TRAFFIC_FACTOR,
-                ),
+            facility_factor = np.select(
+                [track_mask, lane_mask],
+                [CYCLE_TRACK_FACTOR, CYCLE_LANE_FACTOR],
+                default=MIXED_TRAFFIC_FACTOR,
+            )
+            road_beta = highway.map(ROAD_CLASS_BETA).astype(float).to_numpy()
+            carriageway = np.isfinite(road_beta)
+            divisor = np.where(
+                carriageway,
+                (road_beta + BETA_SEPARATED * facility_factor) / REFERENCE_DISUTIL,
                 1.0,
             )
-            base = base / carriageway_factor
+            base = base / divisor
 
         if surface is None:
             factor: pd.Series | float = 1.0
@@ -226,8 +248,9 @@ BIKE_PROFILE = SpeedProfile(
 #        "trunk_link": 16.0,
 #    },
     # without road-class based (i.e. with Valma road traffic assignment-based) traffic volume contribution, ref=main/secondary road
-    # Roads in MIXED_TRAFFIC_HIGHWAYS are further divided by MIXED_TRAFFIC_FACTOR,
-    # or by CYCLE_LANE_FACTOR where they have a cycle lane (see speeds_kph).
+    # Roads in MIXED_TRAFFIC_HIGHWAYS are nominal speeds here, divided by their
+    # road-class + facility cost relative to a separated path on a main street
+    # (carriageway_divisor, applied in speeds_kph).
     highway_kph={
             "steps": 1.2,
             "elevator": 1.0,
@@ -238,16 +261,16 @@ BIKE_PROFILE = SpeedProfile(
             "footway": 4.0,
             "pedestrian": 6.0,
             "corridor": 5.0,
-            "living_street": 13.0 /1.198,
-            "residential": 18.0 /1.198,
+            "living_street": 13.0,
+            "residential": 18.0,
             "service": 18.0,
             "unclassified": 18.0,
-            "tertiary": 18.0 /1.198,
-            "tertiary_link": 16.0 /1.198,
+            "tertiary": 18.0,
+            "tertiary_link": 16.0,
             "secondary": 18.0,
             "secondary_link": 16.0,
-            "primary": 18.0 /0.978,
-            "primary_link": 16.0 /0.978,
+            "primary": 18.0,
+            "primary_link": 16.0,
             "trunk": 18.0, 
             "trunk_link": 16.0,
         },

@@ -7,6 +7,7 @@ from valma_bike_and_walk.speeds import (
     CYCLE_LANE_FACTOR,
     MIXED_TRAFFIC_FACTOR,
     WALK_PROFILE,
+    carriageway_divisor,
     profile_for,
 )
 
@@ -124,8 +125,8 @@ def test_profile_lookup_rejects_unknown_mode():
 def test_cycle_lane_replaces_the_mixed_traffic_factor():
     highway = pd.Series(["secondary", "secondary"])
     speeds = BIKE_PROFILE.speeds_kph(highway, cycleway=pd.Series(["lane", None]))
-    assert speeds[0] == pytest.approx(18.0 / CYCLE_LANE_FACTOR)
-    assert speeds[1] == pytest.approx(18.0 / MIXED_TRAFFIC_FACTOR)
+    assert speeds[0] == pytest.approx(18.0 / carriageway_divisor("secondary", CYCLE_LANE_FACTOR))
+    assert speeds[1] == pytest.approx(18.0 / carriageway_divisor("secondary", MIXED_TRAFFIC_FACTOR))
 
 
 def test_cycle_lane_does_not_speed_up_roads_without_a_carriageway_factor():
@@ -142,3 +143,15 @@ def test_cycle_track_counts_as_a_separate_cycleway():
     )
     assert speeds[0] == pytest.approx(18.0)
     assert speeds[0] > speeds[1] > speeds[2]
+
+
+def test_road_class_and_facility_costs_add_up():
+    """Tarkkala's per-km terms are summed, not multiplied."""
+    highway = pd.Series(["secondary", "residential", "secondary"])
+    speeds = BIKE_PROFILE.speeds_kph(highway, cycleway=pd.Series([None, None, "track"]))
+    # Mixed traffic on a main street: (4.14 + 5.03) / (4.14 + 2.61).
+    assert speeds[0] == pytest.approx(18.0 * 6.75 / (4.14 + 2.61 * MIXED_TRAFFIC_FACTOR))
+    # On a local street the two costs still add rather than multiply.
+    assert speeds[1] == pytest.approx(18.0 * 6.75 / (4.96 + 2.61 * MIXED_TRAFFIC_FACTOR))
+    # A track along a main street is the reference itself.
+    assert speeds[2] == pytest.approx(18.0)
