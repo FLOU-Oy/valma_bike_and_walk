@@ -987,6 +987,10 @@ def link_volume_frame(
     return {
         "u": network.node_ids[rows],
         "v": network.node_ids[cols],
+        # Which link-layer row each edge is, and which way along it: what lets
+        # a saved result be joined back onto the links without matching ends.
+        "link_id": network.link_id,
+        "direction": network.direction,
         "length_m": network.length.astype(np.float64),
         "travel_time_s": network.travel_time,
         "volume": link_volume,

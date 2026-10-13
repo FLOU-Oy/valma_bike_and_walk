@@ -83,14 +83,14 @@ DERIVED_COLUMNS = (
 
 OVERRIDE_COLUMN = "speed_override_kmh"
 
-TRAFFIC_LIGHT_PENALTY_SECONDS = 15.0
+TRAFFIC_LIGHT_PENALTY_SECONDS = 10
 
 #: The same wait on foot. The walk speeds are walking pace in motion, so the
 #: time spent standing at a red light is not in them and is charged here.
-WALK_TRAFFIC_LIGHT_PENALTY_SECONDS = 15.0
+WALK_TRAFFIC_LIGHT_PENALTY_SECONDS = 10
 
 #: Slowing down and yielding at a crossing without lights, on a bike.
-UNSIGNALLED_CROSSING_PENALTY_SECONDS = 10.0
+UNSIGNALLED_CROSSING_PENALTY_SECONDS = 2.5
 
 #: ``crossing`` values that are not an unsignalled crossing: lights are charged
 #: separately, and ``no`` says there is no crossing at all.

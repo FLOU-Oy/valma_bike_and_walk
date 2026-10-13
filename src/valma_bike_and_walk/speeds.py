@@ -65,6 +65,27 @@ REFERENCE_DISUTIL = BETA_MAIN + BETA_SEPARATED
 MIXED_TRAFFIC_HIGHWAYS = frozenset(ROAD_CLASS_BETA)
 
 
+#: Paths that pedestrians share unless they are split into a cycling half and
+#: a walking half (``segregated=yes``). Shared and untagged paths ride at the
+#: highway's own speed; a segregated one is a little quicker, with no weaving
+#: round people on foot.
+SHARED_PATH_HIGHWAYS = frozenset({"cycleway", "path"})
+SEGREGATED_PATH_FACTOR = 1.05
+SHARED_PATH_FACTOR = 1.0
+
+
+def segregation_factor(highway: pd.Series, segregated: pd.Series | None) -> np.ndarray:
+    """Bike speed factor for shared vs segregated foot-and-cycle paths."""
+    on_path = highway.isin(SHARED_PATH_HIGHWAYS).to_numpy(dtype=bool)
+    if segregated is None:
+        split = np.zeros(len(highway), dtype=bool)
+    else:
+        split = segregated.eq("yes").fillna(False).to_numpy(dtype=bool)
+    return np.where(
+        on_path, np.where(split, SEGREGATED_PATH_FACTOR, SHARED_PATH_FACTOR), 1.0
+    )
+
+
 def carriageway_divisor(highway: str, facility_factor: float) -> float:
     """What a road's nominal bike speed is divided by: its road-class plus
     facility disutility per km, relative to :data:`REFERENCE_DISUTIL`."""
@@ -130,8 +151,8 @@ class SpeedProfile:
         else:
             factor = surface.map(self.surface_factor).astype(float).fillna(1.0)
 
-        if segregated is not None and self.name == "bike":
-            factor = factor * segregated.eq("yes").astype(float).mul(0.10).add(1.0)
+        if self.name == "bike":
+            factor = factor * segregation_factor(highway, segregated)
 
         if car_volume is not None and self.name == "bike":
             volume = pd.to_numeric(car_volume, errors="coerce")
