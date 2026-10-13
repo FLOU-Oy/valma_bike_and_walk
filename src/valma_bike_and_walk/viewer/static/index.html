@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>valma view</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/deck.gl@9.0.38/dist.min.js"></script>
+</head>
+<body>
+  <div id="map"></div>
+  <aside id="panel">
+    <header>
+      <h1>valma view</h1>
+      <span id="summary"></span>
+    </header>
+
+    <section>
+      <label>Run
+        <select id="run"></select>
+      </label>
+      <label>Measure
+        <select id="measure">
+          <option value="volume">Volume (both directions)</option>
+          <option value="volume_forward">Volume, digitised direction</option>
+          <option value="volume_reverse">Volume, against digitised direction</option>
+          <option value="speed">Speed (slower direction)</option>
+          <option value="speed_forward">Speed, digitised direction</option>
+          <option value="speed_reverse">Speed, against digitised direction</option>
+          <option value="under_construction">Read through roadworks</option>
+        </select>
+      </label>
+      <label>Compare with (A − B)
+        <select id="compare"><option value="">— none —</option></select>
+      </label>
+      <label>Hide volumes below <output id="minvalue-out">0</output>
+        <input id="minvalue" type="range" min="0" max="500" step="5" value="0">
+      </label>
+      <label class="check"><input id="counters" type="checkbox" checked> Counters (model ÷ observed)</label>
+    </section>
+
+    <section id="route-box">
+      <button id="route-toggle">Plan a route</button>
+      <button id="route-clear" hidden>Clear route</button>
+      <p id="route-hint" class="hint" hidden></p>
+      <div id="route-result"></div>
+    </section>
+
+    <section id="legend"></section>
+    <section id="details"><p class="hint">Click a link or a counter for details.</p></section>
+  </aside>
+  <div id="status"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+:root {
+  --bg: #ffffff;
+  --fg: #1d1f23;
+  --muted: #6b7079;
+  --line: #e3e5e8;
+  --accent: #0b7285;
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #1b1d21; --fg: #e8eaed; --muted: #9aa0a6; --line: #33363b; --accent: #66d9e8;
+  }
+}
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); }
+#map { position: absolute; inset: 0 340px 0 0; }
+#panel {
+  position: absolute; top: 0; right: 0; bottom: 0; width: 340px; box-sizing: border-box;
+  overflow-y: auto; border-left: 1px solid var(--line); background: var(--bg); padding: 12px 14px;
+}
+header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+h1 { font-size: 16px; margin: 0 0 8px; }
+h2 { font-size: 13px; margin: 14px 0 6px; }
+#summary { color: var(--muted); font-size: 12px; }
+section { border-top: 1px solid var(--line); padding: 10px 0; }
+label { display: block; margin: 0 0 8px; color: var(--muted); }
+label select, label input[type="range"] { display: block; width: 100%; margin-top: 3px; }
+label.check { display: flex; gap: 6px; align-items: center; color: var(--fg); }
+select { font: inherit; padding: 3px; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; }
+.hint { color: var(--muted); }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+td, th { padding: 2px 4px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.bar { height: 10px; border-radius: 2px; margin: 4px 0 2px; }
+.scale { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
+a.link { color: var(--accent); cursor: pointer; }
+button {
+  font: inherit; margin-top: 8px; padding: 4px 10px; border-radius: 4px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--bg); color: var(--fg);
+}
+button:hover { border-color: var(--accent); }
+#flow-status { color: var(--muted); }
+#flow-status table { color: var(--fg); }
+#status {
+  position: absolute; left: 10px; bottom: 10px; padding: 4px 8px; border-radius: 4px;
+  background: rgba(0, 0, 0, 0.65); color: #fff; font-size: 12px; display: none;
+}
+@media (max-width: 720px) {
+  #map { inset: 0 0 45% 0; }
+  #panel { top: 55%; width: 100%; border-left: 0; border-top: 1px solid var(--line); padding: 10px 16px; }
+}

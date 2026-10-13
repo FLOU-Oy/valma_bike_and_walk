@@ -651,20 +651,8 @@ def cmd_matrix(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_assign(args: argparse.Namespace) -> int:
-    network, links_path = _network_and_links(args)
-    points = _analysis_points(args, network)
-
-    if len(points) == 0:
-        logger.error("Nothing could be snapped to the network.")
-        return 1
-
-    if args.gpkg and links_path is None:
-        raise SystemExit(
-            "--gpkg draws volumes on the link layer's geometry, so it needs "
-            "--links pointing at the GeoPackage this network was built from."
-        )
-
+def _assign_demand(args: argparse.Namespace, points: Centroids | Zones):
+    """``--demand`` as a sparse matrix aligned with the analysis points."""
     suffix = args.demand.suffix.lower()
     if suffix == ".omx":
         if not args.demand_matrix:
@@ -687,8 +675,24 @@ def cmd_assign(args: argparse.Namespace) -> int:
             demand_column=args.demand_column,
         )
         demand = demand_matrix(long_demand, points.ids)
+    return clip_minimum(demand, args.min_demand)
 
-    demand = clip_minimum(demand, args.min_demand)
+
+def cmd_assign(args: argparse.Namespace) -> int:
+    network, links_path = _network_and_links(args)
+    points = _analysis_points(args, network)
+
+    if len(points) == 0:
+        logger.error("Nothing could be snapped to the network.")
+        return 1
+
+    if args.gpkg and links_path is None:
+        raise SystemExit(
+            "--gpkg draws volumes on the link layer's geometry, so it needs "
+            "--links pointing at the GeoPackage this network was built from."
+        )
+
+    demand = _assign_demand(args, points)
     max_seconds = args.max_minutes * 60 if args.max_minutes else None
 
     if args.select_link and isinstance(points, Zones):
@@ -832,6 +836,124 @@ def _write_select_link(
                 f"    {row['zone_id']}: {row['as_origin']:,.1f} from, "
                 f"{row['as_destination']:,.1f} to ({row['total'] / total:.0%} of the trips)"
             )
+
+
+def cmd_view(args: argparse.Namespace) -> int:
+    """Serve a link layer and its runs to the browser (``docs/viewer-design.md``)."""
+    try:
+        from valma_bike_and_walk.viewer.data import (
+            ViewerData,
+            cache_key,
+            discover_runs,
+            load_counters,
+            load_run,
+            prepare_links,
+        )
+        from valma_bike_and_walk.viewer.server import serve
+    except ImportError as error:
+        raise SystemExit(
+            "valma view needs the viewer extra: pip install "
+            f"'valma_bike_and_walk[viewer]' (missing: {error.name})"
+        ) from None
+
+    mode = _links_mode(args)
+    cache = args.cache_dir / "viewer"
+    links = prepare_links(args.links, cache, args.connectors)
+
+    runs = {}
+    sources = args.run or [args.output_dir / f"link_volumes_{mode}.npz"]
+    for path in discover_runs(sources, mode):
+        run = load_run(path, links)
+        runs[run.name] = run
+        print(f"  run {run.name}: {float(run.total.sum()):,.0f} vehicle-links")
+
+    data = ViewerData(links, mode, runs)
+    if args.count_lines.exists() and args.observed.exists():
+        data.counters = load_counters(data, args.count_lines, args.observed)
+    from valma_bike_and_walk.viewer.route import Router
+
+    network = _view_network(args, mode)
+    data.router = Router(network, links)
+    if args.demand is not None:
+        data.flows = _counter_flows(args, mode, links, cache, network)
+
+    tile_key = cache_key(args.links)
+    if args.connectors is not None:
+        tile_key += "+" + cache_key(args.connectors)
+    serve(
+        data,
+        cache / "tiles" / tile_key,
+        host=args.host,
+        port=args.port,
+        open_browser=not args.no_browser,
+        observations_dir=args.output_dir,
+    )
+    return 0
+
+
+def _view_assign_argv(args: argparse.Namespace, mode: str) -> list[str]:
+    """``assign`` arguments describing the graph ``valma view`` was given."""
+    argv = [
+        "assign", "--links", str(args.links), "--mode", mode,
+        "--cache-dir", str(args.cache_dir), "--workers", str(args.workers),
+        "--centroids", str(args.centroids or "unused"),
+        "--id-column", args.id_column,
+        "--demand", str(args.demand or "unused"), "--demand-mapping", args.demand_mapping,
+        "--min-demand", str(args.min_demand),
+    ]
+    if args.demand_matrix:
+        argv += ["--demand-matrix", args.demand_matrix]
+    if args.max_minutes:
+        argv += ["--max-minutes", str(args.max_minutes)]
+    if args.connectors is not None:
+        argv += ["--connectors", str(args.connectors)]
+    if args.chunk_size:
+        argv += ["--chunk-size", str(args.chunk_size)]
+    return argv
+
+
+def _view_network(args: argparse.Namespace, mode: str) -> RoutableNetwork:
+    """The routable graph, from the same cache ``assign`` builds and reuses."""
+    network, _ = _network_and_links(build_parser().parse_args(_view_assign_argv(args, mode)))
+    return network
+
+
+def _counter_flows(
+    args: argparse.Namespace, mode: str, links, cache: Path, network: RoutableNetwork
+):
+    """
+    The select-link service behind counter clicks in ``valma view``.
+
+    The graph, zones and demand are loaded through ``assign``'s own argument
+    handling, so a click answers exactly what ``assign --select-link`` would.
+    """
+    import hashlib
+
+    from valma_bike_and_walk.viewer.data import cache_key
+    from valma_bike_and_walk.viewer.select import CounterFlows, SelectSetup
+
+    if args.centroids is None:
+        raise SystemExit("valma view --demand needs --centroids, as assign was run with.")
+    argv = _view_assign_argv(args, mode)
+    assign_args = build_parser().parse_args(argv)
+
+    points = _analysis_points(assign_args, network)
+    demand = _assign_demand(assign_args, points)
+    description = " ".join(argv[1:]) + " | " + " ".join(
+        cache_key(Path(p)) for p in (args.links, args.demand, args.centroids)
+    ) + " | impedance " + hashlib.sha1(network.travel_time.tobytes()).hexdigest()
+    setup = SelectSetup(
+        network=network,
+        zone_ids=np.asarray(points.ids),
+        zone_nodes=np.asarray(points.node_index),
+        demand=demand.tocsr(),
+        max_seconds=args.max_minutes * 60 if args.max_minutes else None,
+        workers=args.workers,
+        chunk_size=args.chunk_size,
+        description=description,
+    )
+    print(f"  counter flows: {demand.nnz:,} OD pairs over {len(points):,} zones")
+    return CounterFlows(setup, links["link_id"].to_numpy(), cache / "counter_flows")
 
 
 def _add_routing(parser: argparse.ArgumentParser) -> None:
@@ -1398,6 +1520,64 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     assign.set_defaults(func=cmd_assign)
+
+    view = sub.add_parser(
+        "view",
+        help="Open a link layer and its assignment results on a browser map.",
+    )
+    view.add_argument("--links", type=Path, required=True, help="Link GeoPackage.")
+    view.add_argument(
+        "--mode",
+        choices=MODES,
+        help="Mode of --links (default: from a <mode>_links.gpkg name, else bike).",
+    )
+    view.add_argument(
+        "--run",
+        type=Path,
+        nargs="*",
+        help=(
+            "link_volumes_<mode>.npz files, or directories to search for them "
+            "(default: <output-dir>/link_volumes_<mode>.npz). Several runs can "
+            "be compared in the browser."
+        ),
+    )
+    view.add_argument(
+        "--connectors",
+        type=Path,
+        help="Connector layer the runs were assigned with, so gap connectors are drawn.",
+    )
+    view.add_argument(
+        "--count-lines",
+        type=Path,
+        default=Path("data/count_lines.gpkg"),
+        help="Counter lines to score against the runs (default: %(default)s, if present).",
+    )
+    view.add_argument(
+        "--observed",
+        type=Path,
+        default=Path("output/bicycle_counter_annual_averages.csv"),
+        help="Observed counter averages (default: %(default)s, if present).",
+    )
+    flows = view.add_argument_group(
+        "counter flows",
+        "Give the settings the run was assigned with, and clicking a counter "
+        "maps the flows that pass it (a select-link analysis, cached per counter).",
+    )
+    flows.add_argument("--demand", type=Path, help="Demand the run was assigned with.")
+    flows.add_argument("--demand-matrix", help="Matrix inside an OMX --demand file.")
+    flows.add_argument("--demand-mapping", default="zone_number")
+    flows.add_argument("--centroids", type=Path, help="Zone points the run used.")
+    flows.add_argument("--id-column", default="id")
+    flows.add_argument("--min-demand", type=float, default=0.0)
+    flows.add_argument("--max-minutes", type=float)
+    flows.add_argument("--workers", type=int, default=1)
+    flows.add_argument("--chunk-size", type=int)
+    view.add_argument("--host", default="127.0.0.1")
+    view.add_argument("--port", type=int, default=8765)
+    view.add_argument("--no-browser", action="store_true", help="Do not open a browser.")
+    view.add_argument("--cache-dir", type=Path, default=Path(".cache"))
+    view.add_argument("--output-dir", type=Path, default=Path("output"))
+    view.set_defaults(func=cmd_view)
 
     return parser
 
