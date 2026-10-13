@@ -155,3 +155,19 @@ def test_road_class_and_facility_costs_add_up():
     assert speeds[1] == pytest.approx(18.0 * 6.75 / (4.96 + 2.61 * MIXED_TRAFFIC_FACTOR))
     # A track along a main street is the reference itself.
     assert speeds[2] == pytest.approx(18.0)
+
+
+def test_a_segregated_path_is_quicker_and_untagged_counts_as_shared():
+    from valma_bike_and_walk.speeds import SEGREGATED_PATH_FACTOR
+
+    highway = pd.Series(["cycleway", "cycleway", "cycleway", "path", "secondary"])
+    segregated = pd.Series(["yes", "no", None, "yes", "yes"])
+    speeds = BIKE_PROFILE.speeds_kph(highway, segregated=segregated)
+    assert speeds[0] == pytest.approx(18.0 * SEGREGATED_PATH_FACTOR)
+    # Shared, whether tagged so or untagged: the cycleway's own speed.
+    assert speeds[1] == pytest.approx(18.0)
+    assert speeds[2] == pytest.approx(18.0)
+    assert speeds[3] == pytest.approx(11.0 * SEGREGATED_PATH_FACTOR)
+    # A road is not a foot-and-cycle path; the tag changes nothing there.
+    road = BIKE_PROFILE.speeds_kph(pd.Series(["secondary"]))
+    assert speeds[4] == pytest.approx(road[0])

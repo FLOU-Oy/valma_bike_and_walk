@@ -181,7 +181,9 @@ def test_link_volume_frame_is_edge_aligned():
     volume = np.zeros(net.n_edges)
     frame = link_volume_frame(net, volume)
 
-    assert set(frame) == {"u", "v", "length_m", "travel_time_s", "volume"}
+    assert set(frame) == {
+        "u", "v", "link_id", "direction", "length_m", "travel_time_s", "volume"
+    }
     for array in frame.values():
         assert array.shape == (net.n_edges,)
 
