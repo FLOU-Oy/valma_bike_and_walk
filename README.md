@@ -403,6 +403,67 @@ is no `if __name__ == "__main__":` ceremony to observe. The first run on a
 machine spends a few seconds compiling the routing kernels; the compiled code is
 cached, so later runs start straight away.
 
+## Settings files and scenarios
+
+Any option can be written in a TOML file instead of on the command line, named
+as the flag without its dashes (`max_minutes` or `max-minutes`). Top-level keys
+go to every command that takes the option and are ignored by the rest, so one
+file serves `matrix`, `assign` and `view` alike; a `[command]` section holds
+what only one command should see. Files layer: `extends` names a base to read
+first, and several `-c` stack in the order given. The command line always wins.
+
+```toml
+# scenarios/base.toml
+mode = "bike"
+links = "../output/{mode}_links.gpkg"
+connectors = "../output/{mode}_connectors.gpkg"
+centroids = "../data/centroids.csv"
+id_column = "zone_id"
+max_minutes = 60
+
+[assign]
+demand = "../data/demand_2023.omx"
+demand_matrix = "bike"
+gpkg = true
+```
+
+```toml
+# scenarios/2040.toml
+extends = "base.toml"
+scenario = "2040"
+
+[assign]
+demand = "../data/demand_2040.omx"
+```
+
+```bash
+valma assign -c scenarios/2040.toml                  # -> output/2040/
+valma assign -c scenarios/2040.toml --mode walk      # {mode} follows along
+valma assign -c scenarios/2040.toml --show-config    # what it would run with, and why
+```
+
+- **Paths are relative to the file they are written in**, not to where valma is
+  run, so a scenario folder works from anywhere.
+- **`{mode}` and `{scenario}`** in a value are filled in from the final
+  settings, a mode given on the command line included.
+- **`scenario`** puts results under `<output_dir>/<scenario>/`, so scenarios
+  do not overwrite one another, and `valma view --run output/` finds and
+  compares them all.
+- **Mistakes are refused, not ignored.** A key no command takes, a section
+  that is not a command or a value of the wrong type stops the run and names
+  the file, with a suggestion for a likely typo. A later layer that picks
+  `zones` replaces a base's `centroids` rather than clashing with it.
+
+`extract`, `build`, `matrix`, `assign` and `overlay` record the settings they
+ran with next to their results, as `valma_<command>_<mode>.toml`, with
+absolute paths and the `scenario` already folded into `output_dir`. `-c` reads
+that file back to repeat the run. Its shared keys suit other commands too:
+`valma view -c output/2040/valma_assign_bike.toml` opens that run with the
+demand and zones it was assigned with, ready for counter clicks.
+
+Keep the NLS API key in its environment variable rather than in a file, so
+settings files can be committed.
+
 ## Zones as polygons
 
 Routing every trip from one centroid node per zone is the standard
@@ -1061,6 +1122,7 @@ src/valma_bike_and_walk/
 ├── traffic.py     another network's car volumes, matched onto our links
 ├── progress.py    a progress line with an ETA, for the slow loops
 ├── gpkg.py        draw a per-edge result back onto the link layer
+├── config_file.py TOML settings files layered under the command line
 └── cli.py         extract / dem / traffic / build / matrix / assign
 ```
 

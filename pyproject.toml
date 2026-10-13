@@ -27,6 +27,8 @@ dependencies = [
     # Sparse demand matrices, KD-tree snapping, connected components -- not routing.
     "scipy>=1.11",
     "shapely>=2.0",
+    # Settings files (valma -c); tomllib is in the standard library from 3.11.
+    "tomli>=2.0; python_version < '3.11'",
     "truststore>=0.9",
 ]
 

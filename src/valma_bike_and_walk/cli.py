@@ -40,6 +40,16 @@ re-reading the link layer.
 stages themselves -- handy when there is nothing to edit. Those runs park their
 intermediates under `--cache-dir`, keyed on the PBF and the extent; anything a
 command names in its own output goes to `--output-dir`.
+
+Any option can also come from a TOML settings file, and several can be layered
+-- a base, a subarea, a scenario -- with the command line on top:
+
+  valma assign -c scenarios/base.toml -c scenarios/2040.toml --gpkg
+
+`--show-config` prints what a command would run with, and where each value
+came from. `extract`, `build`, `matrix`, `assign` and `overlay` leave the
+settings they ran with in `--output-dir` as `valma_<command>_<mode>.toml`,
+which `-c` reads back.
 """
 
 from __future__ import annotations
@@ -47,11 +57,13 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
 
+from valma_bike_and_walk import config_file
 from valma_bike_and_walk import links as links_module
 from valma_bike_and_walk.assignment import (
     assign_traffic,
@@ -152,10 +164,61 @@ _OMX_DEFAULT_PATH = object()
 _MODE_BASE_SPEED = object()
 
 
+#: Commands that leave the settings they ran with next to their results.
+_RECORDED = ("extract", "build", "matrix", "assign", "overlay")
+
+
+class _TakenEarly(argparse.Action):
+    """
+    ``-c`` and ``--show-config``, as far as argparse is concerned.
+
+    ``main`` takes both off the command line before parsing it, since the files
+    decide what the parser accepts. Reaching this means one was abbreviated
+    past what that early pass recognises.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(f"write {option_string} in full: -c/--config or --show-config")
+
+
+def _add_config(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-c",
+        "--config",
+        action=_TakenEarly,
+        metavar="FILE",
+        default=argparse.SUPPRESS,
+        help=(
+            "TOML settings file: any option, spelled without the dashes. Give "
+            "several to layer them, later over earlier; options given here "
+            "still win."
+        ),
+    )
+    parser.add_argument(
+        "--show-config",
+        action=_TakenEarly,
+        nargs=0,
+        default=argparse.SUPPRESS,
+        help="Print the settings this would run with, and where each came from; run nothing.",
+    )
+
+
+def _add_output_dir(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--output-dir", type=Path, default=Path("output"))
+    parser.add_argument(
+        "--scenario",
+        help=(
+            "Name of the scenario. Results go to <output-dir>/<scenario>/, so "
+            "scenarios do not overwrite one another. Usually set in a settings "
+            "file."
+        ),
+    )
+
+
 def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--mode", choices=MODES, required=True)
     parser.add_argument("--cache-dir", type=Path, default=Path(".cache"))
-    parser.add_argument("--output-dir", type=Path, default=Path("output"))
+    _add_output_dir(parser)
     parser.add_argument(
         "--force-reload",
         action="store_true",
@@ -1126,6 +1189,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-v", "--verbose", action="store_true")
+    _add_config(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
     extract = sub.add_parser(
@@ -1197,7 +1261,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     overlay_parser.add_argument("--mode", choices=MODES, required=True)
-    overlay_parser.add_argument("--output-dir", type=Path, default=Path("output"))
+    _add_output_dir(overlay_parser)
     overlay_parser.add_argument(
         "--model",
         type=Path,
@@ -1603,20 +1667,107 @@ def build_parser() -> argparse.ArgumentParser:
     view.add_argument("--port", type=int, default=8765)
     view.add_argument("--no-browser", action="store_true", help="Do not open a browser.")
     view.add_argument("--cache-dir", type=Path, default=Path(".cache"))
-    view.add_argument("--output-dir", type=Path, default=Path("output"))
+    _add_output_dir(view)
     view.set_defaults(func=cmd_view)
 
+    for command in sub.choices.values():
+        _add_config(command)
     return parser
 
 
+def _take_config_options(argv: list[str]) -> tuple[list[Path], bool, list[str]]:
+    """
+    ``-c`` files and ``--show-config``, and the command line without them.
+
+    Read before the real parse, because the files decide what it requires.
+    Abbreviations are not recognised here, so that ``--con`` cannot be taken
+    for ``--config`` when it was meant as ``--connectors``.
+    """
+    early = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    early.add_argument("-c", "--config", action="append", type=Path, default=[])
+    early.add_argument("--show-config", action="store_true")
+    known, rest = early.parse_known_args(argv)
+    return known.config, known.show_config, rest
+
+
+def _command_in(argv: list[str], parser: argparse.ArgumentParser) -> str | None:
+    """The command named on the command line: its first positional argument."""
+    for token in argv:
+        if not token.startswith("-"):
+            return token if token in config_file.subparsers(parser) else None
+    return None
+
+
+def _record(args: argparse.Namespace, parser, command: str, files: list[Path]) -> Path:
+    """Leave the settings a run used next to its results, for ``-c`` to repeat."""
+    mode = getattr(args, "mode", None)
+    path = args.output_dir / f"valma_{command}{f'_{mode}' if mode else ''}.toml"
+    header = [
+        f"Settings `valma {command}` ran with, {datetime.now():%Y-%m-%d %H:%M}.",
+        f"Run it again with: valma {command} -c {path.as_posix()}",
+    ]
+    if files:
+        header.append("Layered from: " + ", ".join(p.as_posix() for p in files))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        config_file.dump(args, parser, command, header=header), encoding="utf-8"
+    )
+    return path
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    files, show_config, argv = _take_config_options(
+        list(sys.argv[1:] if argv is None else argv)
+    )
+    parser = build_parser()
+    command = _command_in(argv, parser)
+
+    applied: dict[str, config_file.Setting] = {}
+    config: config_file.Config | None = None
+    if files and command is not None:
+        try:
+            config = config_file.load(files)
+            applied = config_file.apply(config, parser, command)
+        except config_file.ConfigError as error:
+            parser.exit(2, f"valma: error: {error}\n")
+
+    args = parser.parse_args(argv)
+    command = args.command
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
-    return int(args.func(args))
+
+    given: set[str] = set()
+    if applied or show_config:
+        given = config_file.given_on_command_line(build_parser, argv, command)
+    if applied:
+        try:
+            config_file.settle(args, parser, command, applied, given)
+        except config_file.ConfigError as error:
+            parser.exit(2, f"valma: error: {error}\n")
+    if getattr(args, "scenario", None):
+        args.output_dir = args.output_dir / args.scenario
+
+    if show_config:
+        sources = config_file.sources_of(args, applied, given)
+        if getattr(args, "scenario", None):
+            sources["output_dir"] = (
+                f"{sources.get('output_dir', 'default')}, "
+                f"+ scenario from {sources.get('scenario', 'default')}"
+            )
+        header = []
+        if config is not None:
+            header.append("Layered from: " + ", ".join(p.as_posix() for p in config.files))
+        print(config_file.dump(args, parser, command, sources=sources, header=header), end="")
+        return 0
+
+    code = int(args.func(args))
+    if code == 0 and command in _RECORDED:
+        files_used = config.files if config is not None else []
+        logger.info("Settings recorded in %s", _record(args, parser, command, files_used))
+    return code
 
 
 if __name__ == "__main__":
