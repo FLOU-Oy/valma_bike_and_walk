@@ -4,10 +4,9 @@ import numpy as np
 import pytest
 from scipy.sparse import csr_matrix
 
+from valma_bike_and_walk import routing
 from valma_bike_and_walk.assignment import (
     _as_demand_csr,
-    _edge_keys,
-    _solve_chunk,
     assign_traffic,
     assign_zone_traffic,
     expand_demand,
@@ -115,11 +114,8 @@ def test_multiple_workers_match_single_worker():
 
 
 def test_many_small_chunks_match_one_big_chunk():
-    # Regression test: chunk_size=1 forces one Dijkstra call (and, with
-    # workers=2, one process-pool task) per source -- the shape of thing that
-    # used to leak a full-network-sized array per chunk. Correctness across
-    # many chunks is the observable half of that fix (the memory bound isn't
-    # something a unit test can watch directly).
+    # chunk_size=1 makes every source its own task, so with workers=2 the
+    # sources are spread over threads whose volume arrays are summed at the end.
     rng = np.random.default_rng(1)
     n = 25
     edges = [(int(i), int(i + 1), float(rng.uniform(1, 10))) for i in range(n - 1)]
@@ -138,31 +134,23 @@ def test_many_small_chunks_match_one_big_chunk():
     np.testing.assert_allclose(one_chunk, many_chunks_parallel)
 
 
-def test_solve_chunk_returns_only_touched_edges():
+def test_aon_kernel_loads_only_the_shortest_path():
     net = make_network([(0, 1, 10.0), (1, 2, 10.0), (2, 3, 10.0), (0, 2, 100.0)], 4)
     demand = _as_demand_csr(np.array([[0.0, 0.0, 0.0, 5.0]]), 1, 4)
-    edge_keys = _edge_keys(net)
 
-    idx, vals, dropped, _, _ = _solve_chunk(
-        net.csr(),
-        np.array([0], dtype=np.int64),
-        np.arange(4, dtype=np.int64),
-        demand.data,
-        demand.indices,
+    volume, missed = routing.aon(
+        net.routing_graph(),
+        np.array([0]),
+        np.arange(4),
         demand.indptr,
-        0,
-        edge_keys,
-        net.n_nodes,
-        None,
-        net.n_edges,
+        demand.indices,
+        demand.data,
     )
 
-    # Only the 3 edges on the shortest path 0->1->2->3 were touched, not all
-    # 4 edges in the network (the untouched 0->2 shortcut is excluded).
-    assert idx.size == 3
-    assert vals.size == 3
-    np.testing.assert_allclose(vals, 5.0)
-    assert dropped == 0
+    # The 3 edges of 0->1->2->3 carry the demand; the 0->2 shortcut does not.
+    assert np.count_nonzero(volume) == 3
+    np.testing.assert_allclose(volume[volume > 0], 5.0)
+    assert not missed.any()
 
 
 def test_max_seconds_drops_far_pairs():
@@ -414,7 +402,7 @@ def test_select_link_finds_exactly_the_od_pairs_that_use_the_link():
     demand[1, 0] = 6.0  # 2 -> 3, via 1->3
     demand[0, 1] = 9.0  # 0 -> 2, direct
 
-    volume, picked = select_link_assignment(
+    volume, picked, through = select_link_assignment(
         net, [0, 2], demand, [_link_of(net, 1, 3)], targets=[3, 2]
     )
 
@@ -431,11 +419,34 @@ def test_select_link_gives_the_same_answer_in_parallel():
     demand = np.array([[0.0, 4.0, 9.0], [6.0, 0.0, 1.0], [2.0, 3.0, 0.0]])
     sources = [0, 2, 1]
     link = [_link_of(net, 1, 3)]
-    _, serial = select_link_assignment(net, sources, demand, link, targets=[3, 2, 1])
-    _, parallel = select_link_assignment(
+    _, serial, serial_flow = select_link_assignment(
+        net, sources, demand, link, targets=[3, 2, 1]
+    )
+    _, parallel, parallel_flow = select_link_assignment(
         net, sources, demand, link, targets=[3, 2, 1], workers=2, chunk_size=1
     )
     assert parallel.toarray() == pytest.approx(serial.toarray())
+    assert parallel_flow == pytest.approx(serial_flow)
+
+
+def test_select_link_flows_equal_assigning_the_selected_trips_alone():
+    """The one-pass flow map is what a second assignment of the hits would give."""
+    from valma_bike_and_walk.assignment import select_link_assignment
+
+    rng = np.random.default_rng(3)
+    n = 30
+    edges = [(i, j, float(rng.uniform(1, 9))) for i in range(n) for j in range(n)
+             if i != j and rng.random() < 0.12]
+    net = make_network(edges, n)
+    nodes = np.arange(0, n, 3)
+    demand = rng.uniform(0, 5, size=(nodes.size, nodes.size))
+    np.fill_diagonal(demand, 0.0)
+    links = [_link_of(net, *edges[k][:2]) for k in (0, 5, 9)]
+
+    volume, picked, through = select_link_assignment(net, nodes, demand, links)
+    assert picked.nnz > 0
+    assert through == pytest.approx(assign_traffic(net, nodes, picked))
+    assert volume == pytest.approx(assign_traffic(net, nodes, demand))
 
 
 def test_select_link_rejects_an_unknown_link():

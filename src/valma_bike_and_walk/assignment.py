@@ -29,174 +29,34 @@ threshold away near-zero entries before assigning (`demand.demand_matrix`
 does this once for you if it's built from a long/sparse-format file, which
 avoids the dense step entirely).
 
-The network side reuses the same chunked-Dijkstra approach as
-:func:`valma_bike_and_walk.matrix.travel_time_matrix`, for the same reason:
-SciPy's Dijkstra returns a dense ``(sources_in_chunk, n_nodes)`` block, so
-memory is bounded by chunk size rather than by the number of origins. Runtime
-scales with the network's edge count (each Dijkstra relaxes every edge from
-an expanded node) as well as its node count -- for a country-sized edge set,
-narrowing the network to the relevant area/mode, or setting ``max_seconds``,
-is the biggest lever available.
+The network side is :func:`valma_bike_and_walk.routing.aon`: one bounded
+search per source, which stops once every destination with demand from that
+source has been settled, followed by a single pass over the settled nodes,
+farthest first, that pushes each node's accumulated demand onto the edge it was
+reached by. Every path from a source is loaded in that one pass, so the cost is
+proportional to the size of the tree rather than to the number of destinations
+times the length of their paths.
 
-Each chunk's own *result*, on the other hand, is kept sparse (see
-``_solve_chunk``) and merged into the running total as soon as it's ready
-(in completion order, not submission order) rather than being collected as a
-full network-sized array per chunk and held until the whole run finishes --
-important once there are enough sources that "one array per chunk" stops
-being a rounding error next to the network itself.
-
-Three things keep the parallel path's memory flat in the worker count, all of
-which matter far more once zones spread demand over access points (see
-:func:`assign_zone_traffic`), because that multiplies both the size of the
-demand and the number of chunks:
-
-- The demand, the targets and the graph reach workers by **memory mapping**,
-  not as ``submit`` arguments. A task argument is pickled and unpickled per
-  task per worker, so passing the demand that way gave every worker its own
-  full copy of it -- the one thing in the whole run that scales with zones
-  squared. See :func:`_init_worker`.
-- Chunks are **submitted in a bounded window** rather than all at once, so
-  the pool holds a couple of rounds of work items rather than one per chunk.
-- What a chunk hands *back* is sparse both ways: touched edges only, and any
-  demand it could not place aggregated to zone level rather than listed pair
-  by pair (see :class:`_Unplaced`).
+Workers are threads sharing one copy of the graph and of the demand; each keeps
+its own volume array, summed once at the end. Any demand a bounded search could
+not place comes back as a mask over the demand's nonzeros, which
+:func:`_assign` turns into a zone-level matrix for the caller to route another
+way (see :func:`assign_zone_traffic`'s two tiers).
 """
 
 from __future__ import annotations
 
 import logging
-import tempfile
-from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
-from pathlib import Path
-from typing import Iterator, Sequence, cast
+from typing import Sequence
 
 import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix, diags, issparse
-from scipy.sparse.csgraph import dijkstra
 
-from valma_bike_and_walk.matrix import DEFAULT_CHUNK_BYTES
+from valma_bike_and_walk import routing
 from valma_bike_and_walk.network import RoutableNetwork
 from valma_bike_and_walk.zones import Zones
 
 logger = logging.getLogger(__name__)
-
-#: SciPy's sentinel for "this node has no predecessor" -- either it's the
-#: source itself, or Dijkstra never reached it.
-_NO_PREDECESSOR = -9999
-
-# Set once per worker process by _init_worker.
-_WORKER_STATE: dict[str, object] = {}
-
-
-def choose_chunk_size(n_nodes: int, budget_bytes: int = DEFAULT_CHUNK_BYTES) -> int:
-    """
-    Largest number of sources whose dense distance+predecessor block fits the budget.
-
-    Like :func:`valma_bike_and_walk.matrix.choose_chunk_size`, but assignment
-    needs the predecessor block too (int32, on top of Dijkstra's float64
-    distances) to be able to walk paths back to each source.
-    """
-    per_source = max(1, n_nodes * (8 + 4))
-    return int(max(1, min(n_nodes, budget_bytes // per_source)))
-
-
-def _chunks(values: np.ndarray, size: int) -> Iterator[np.ndarray]:
-    for start in range(0, values.shape[0], size):
-        yield values[start : start + size]
-
-
-def _edge_keys(network: RoutableNetwork) -> np.ndarray:
-    """
-    A sortable id for every directed edge: ``u * n_nodes + v``.
-
-    CSR rows are non-decreasing and each row's columns are already sorted (a
-    side effect of how ``network._build_csr`` builds them, to dedupe parallel
-    edges), so this key array comes out strictly increasing -- meaning its
-    position *is* the edge index. That turns an (u, v) pair straight into an
-    edge index with ``np.searchsorted``, without building or maintaining a
-    separate lookup structure.
-    """
-    rows = np.repeat(
-        np.arange(network.n_nodes, dtype=np.int64), np.diff(network.indptr)
-    )
-    cols = network.indices.astype(np.int64)
-    return rows * network.n_nodes + cols
-
-
-def _load_source(
-    source: int,
-    predecessors: np.ndarray,
-    node: np.ndarray,
-    load: np.ndarray,
-    edge_keys: np.ndarray,
-    n_nodes: int,
-    link_volume: np.ndarray,
-    selected: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray | None]:
-    """
-    All-or-nothing load of one source's nonzero demand onto ``link_volume``.
-
-    Walks every destination back toward the source one hop at a time, all
-    destinations in lockstep, adding that destination's (fixed) demand onto
-    every link crossed. Destinations that share the tail of their shortest
-    path -- the usual case near the source, where many trees converge -- walk
-    that shared tail together in the same vectorised step, rather than each
-    retracing it independently.
-
-    ``node``/``load`` are this source's nonzero demand: destination node
-    indices and the (positive) demand to each.
-
-    Returns a boolean mask over them marking the ones with no path from
-    ``source`` -- which is more than a count, because a caller running a
-    *bounded* search needs to know exactly which demand went unplaced so it can
-    route it another way. See :func:`assign_zone_traffic`'s two tiers.
-    Destinations that *are* the source are not marked: their trip is
-    zero-length, so there is nothing to place and nothing missing.
-
-    ``selected``, a boolean per edge, turns on select-link analysis: the
-    second return value then marks, over the same destinations, the ones whose
-    path crosses any selected edge. Without it, it is None.
-    """
-    if node.size == 0:
-        empty = np.zeros(0, dtype=bool)
-        return empty, (empty if selected is not None else None)
-
-    node = node.astype(np.int64).copy()
-    load = load.astype(np.float64)
-
-    at_source = node == source
-    unreachable = (predecessors[node] == _NO_PREDECESSOR) & ~at_source
-    keep = ~at_source & ~unreachable
-
-    hit_full = np.zeros(keep.shape[0], dtype=bool) if selected is not None else None
-    node, load = node[keep], load[keep]
-    if node.size == 0:
-        return unreachable, hit_full
-
-    hit = np.zeros(node.shape[0], dtype=bool) if selected is not None else None
-    still = np.ones(node.shape[0], dtype=bool)
-    hops = 0
-    max_hops = n_nodes + 1  # a shortest-path tree has no cycles; this is a safety valve
-    while still.any():
-        hops += 1
-        if hops > max_hops:
-            raise RuntimeError(
-                "Shortest-path walk from source did not terminate within "
-                f"{max_hops} hops; the predecessor tree may be corrupt."
-            )
-        idx = np.flatnonzero(still)
-        cur = node[idx]
-        pred = predecessors[cur]
-        edge_idx = np.searchsorted(edge_keys, pred.astype(np.int64) * n_nodes + cur)
-        np.add.at(link_volume, edge_idx, load[idx])
-        if hit is not None:
-            hit[idx] |= selected[edge_idx]
-        node[idx] = pred
-        still[idx] = pred != source
-
-    if hit_full is not None:
-        hit_full[keep] = hit
-    return unreachable, hit_full
 
 
 def _as_demand_csr(
@@ -229,208 +89,6 @@ def _as_demand_csr(
     return matrix
 
 
-class _Unplaced:
-    """
-    Demand a bounded search could not place, accumulated at *group* level.
-
-    Chunks report what they failed to place so a caller can route it some other
-    way, but reporting it pair by pair would hand back an array the size of the
-    demand itself. Groups collapse that: with one group per zone, a chunk's
-    report is at most (zones in chunk) x (zones), summed as it goes, and it
-    comes back in exactly the shape the fallback pass wants as input.
-    """
-
-    def __init__(self, row_group: np.ndarray, col_group: np.ndarray, n_groups: int):
-        self.row_group = row_group
-        self.col_group = col_group
-        self.n_groups = n_groups
-        self._rows: list[np.ndarray] = []
-        self._cols: list[np.ndarray] = []
-        self._values: list[np.ndarray] = []
-
-    def add(self, row: int, columns: np.ndarray, values: np.ndarray) -> None:
-        if columns.size == 0:
-            return
-        self._rows.append(
-            np.full(columns.shape[0], self.row_group[row], dtype=np.int64)
-        )
-        self._cols.append(self.col_group[columns])
-        self._values.append(values)
-
-    def collect(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Sum duplicates once per chunk, so the payload is groups, not pairs."""
-        if not self._rows:
-            empty_index = np.empty(0, dtype=np.int64)
-            return empty_index, empty_index, np.empty(0, dtype=np.float64)
-        matrix = coo_matrix(
-            (
-                np.concatenate(self._values),
-                (np.concatenate(self._rows), np.concatenate(self._cols)),
-            ),
-            shape=(self.n_groups, self.n_groups),
-        ).tocoo()
-        matrix.sum_duplicates()
-        return matrix.row, matrix.col, matrix.data
-
-
-#: What a chunk hands back: touched edge indices, their volumes, how many OD
-#: pairs went unplaced, (row, col, value) of that demand at group level, and
-#: (row, col, value) of the OD pairs whose path crosses a selected link (empty
-#: unless select-link analysis is on).
-_ChunkResult = tuple[
-    np.ndarray, np.ndarray, int, tuple[np.ndarray, ...], tuple[np.ndarray, ...]
-]
-
-
-def _solve_chunk(
-    graph: csr_matrix,
-    sources: np.ndarray,
-    targets: np.ndarray,
-    demand_data: np.ndarray,
-    demand_indices: np.ndarray,
-    demand_indptr: np.ndarray,
-    row_offset: int,
-    edge_keys: np.ndarray,
-    n_nodes: int,
-    max_seconds: float | None,
-    n_edges: int,
-    groups: tuple[np.ndarray, np.ndarray, int] | None = None,
-    selected: np.ndarray | None = None,
-) -> _ChunkResult:
-    """
-    One chunk of sources: Dijkstra, then load each row's demand.
-
-    Returns a *sparse* update -- ``(edge_index, volume, ...)`` for only the
-    edges this chunk actually touched -- rather than a full ``n_edges``-long
-    array. A chunk of even a few dozen sources only ever touches a small
-    fraction of a country-sized network's edges, so handing back (and, across
-    the process-pool path, pickling) a whole network-sized array per chunk
-    wastes memory and IPC bandwidth in direct proportion to the number of
-    chunks -- which is exactly backwards, since chunking exists to keep memory
-    *down*. See :func:`assign_traffic`'s merge step.
-
-    Demand arrives as its three CSR arrays rather than as a ``csr_matrix``, so
-    that the parallel path can hand workers a memory *mapping* of it instead of
-    a value to pickle. That distinction is the difference between one copy of
-    the demand and one per worker -- see :func:`_init_worker`.
-    """
-    _dist, pred = dijkstra(
-        graph,
-        directed=True,
-        indices=sources,
-        limit=np.inf if max_seconds is None else max_seconds,
-        return_predecessors=True,
-    )
-    link_volume = np.zeros(n_edges, dtype=np.float64)
-    dropped = 0
-    unplaced = _Unplaced(*groups) if groups is not None else None
-    sel_rows: list[np.ndarray] = []
-    sel_cols: list[np.ndarray] = []
-    sel_vals: list[np.ndarray] = []
-
-    for row, source in enumerate(sources):
-        lo = int(demand_indptr[row_offset + row])
-        hi = int(demand_indptr[row_offset + row + 1])
-        columns = np.asarray(demand_indices[lo:hi])
-        load = np.asarray(demand_data[lo:hi])
-        missed, hit = _load_source(
-            int(source),
-            pred[row],
-            targets[columns],
-            load,
-            edge_keys,
-            n_nodes,
-            link_volume,
-            selected,
-        )
-        dropped += int(missed.sum())
-        if unplaced is not None:
-            unplaced.add(row_offset + row, columns[missed], load[missed])
-        if hit is not None and hit.any():
-            sel_rows.append(np.full(int(hit.sum()), row_offset + row, dtype=np.int64))
-            sel_cols.append(columns[hit].astype(np.int64))
-            sel_vals.append(load[hit])
-
-    touched = np.flatnonzero(link_volume)
-    report = unplaced.collect() if unplaced is not None else ()
-    picked: tuple[np.ndarray, ...] = (
-        (np.concatenate(sel_rows), np.concatenate(sel_cols), np.concatenate(sel_vals))
-        if sel_rows
-        else ()
-    )
-    return touched, link_volume[touched], dropped, report, picked
-
-
-def _init_worker(cache_dir: str, shape: tuple[int, int]) -> None:
-    """
-    Rebuild the graph, edge keys, targets and demand in a worker, memory-mapped.
-
-    Everything a chunk needs beyond its own source indices lives here rather
-    than in the arguments to each task, and that is load-bearing rather than
-    tidiness. A ``pool.submit`` argument is pickled and unpickled *per task, per
-    worker*: passing the demand matrix that way gave every one of N workers its
-    own full copy, so a zone run -- where the demand is already K^2 times bigger
-    for having been spread over access points -- multiplied that by the worker
-    count and ran the machine out of memory. Memory-mapping it instead means one
-    read-only copy the OS pages in and shares between every worker.
-    """
-    base = Path(cache_dir)
-    indptr = np.load(base / "indptr.npy", mmap_mode="r")
-    indices = np.load(base / "indices.npy", mmap_mode="r")
-    data = np.load(base / "data.npy", mmap_mode="r")
-    _WORKER_STATE["graph"] = csr_matrix(
-        (data, indices, indptr), shape=shape, copy=False
-    )
-    _WORKER_STATE["edge_keys"] = np.load(base / "edge_keys.npy", mmap_mode="r")
-    _WORKER_STATE["n_nodes"] = shape[0]
-    _WORKER_STATE["n_edges"] = int(indices.shape[0])
-
-    for name in (
-        "targets",
-        "demand_data",
-        "demand_indices",
-        "demand_indptr",
-        "row_group",
-        "col_group",
-        "selected",
-    ):
-        path = base / f"{name}.npy"
-        if path.exists():
-            _WORKER_STATE[name] = np.load(path, mmap_mode="r")
-
-
-def _worker_solve(
-    sources: np.ndarray,
-    row_offset: int,
-    max_seconds: float | None,
-    n_groups: int | None,
-) -> _ChunkResult:
-    groups = (
-        None
-        if n_groups is None
-        else (
-            cast(np.ndarray, _WORKER_STATE["row_group"]),
-            cast(np.ndarray, _WORKER_STATE["col_group"]),
-            n_groups,
-        )
-    )
-    return _solve_chunk(
-        cast(csr_matrix, _WORKER_STATE["graph"]),
-        sources,
-        cast(np.ndarray, _WORKER_STATE["targets"]),
-        cast(np.ndarray, _WORKER_STATE["demand_data"]),
-        cast(np.ndarray, _WORKER_STATE["demand_indices"]),
-        cast(np.ndarray, _WORKER_STATE["demand_indptr"]),
-        row_offset,
-        cast(np.ndarray, _WORKER_STATE["edge_keys"]),
-        cast(int, _WORKER_STATE["n_nodes"]),
-        max_seconds,
-        cast(int, _WORKER_STATE["n_edges"]),
-        groups,
-        cast("np.ndarray | None", _WORKER_STATE.get("selected")),
-    )
-
-
 def assign_traffic(
     network: RoutableNetwork,
     sources: Sequence[int] | np.ndarray,
@@ -458,12 +116,10 @@ def assign_traffic(
       ``sources``/``targets`` run into the thousands.
     - max_seconds: stop expanding a source's search beyond this travel time.
       OD pairs further apart come back unreached (and get dropped, like any
-      other unreachable pair) rather than assigned. Bounds both time and the
-      per-chunk Dijkstra memory, and is the cheapest lever for a
+      other unreachable pair) rather than assigned. The cheapest lever for a
       country-sized network.
-    - workers: processes to spread source chunks over. 1 keeps it in-process.
-    - chunk_size: sources per Dijkstra call; defaults to a 256 MB block
-      (see :func:`choose_chunk_size`).
+    - workers: threads to spread the sources over.
+    - chunk_size: sources per task handed to a thread; sized automatically.
 
     Returns a float64 array of shape ``(network.n_edges,)``: total volume on
     every directed edge, positionally aligned with ``network.travel_time``,
@@ -495,33 +151,52 @@ def select_link_assignment(
     workers: int = 1,
     chunk_size: int | None = None,
     progress_every: int = 10,
-) -> tuple[np.ndarray, csr_matrix]:
+) -> tuple[np.ndarray, csr_matrix, np.ndarray]:
     """
     :func:`assign_traffic`, plus a select-link analysis of ``link_ids``.
 
-    Returns the ordinary link volumes and, as a sparse ``(len(sources),
-    len(targets))`` matrix, the demand of every OD pair whose shortest path
-    uses any of the links (in either direction). Assigning that matrix on its
-    own shows where the selected link's traffic comes from and goes to.
+    Returns, in one pass over the network:
+
+    - the ordinary link volumes;
+    - as a sparse ``(len(sources), len(targets))`` matrix, the demand of every
+      OD pair whose shortest path uses any of the links (in either direction);
+    - the volume those trips alone put on every edge -- where the selected
+      link's traffic comes from and goes to.
     """
+    sources = np.asarray(sources, dtype=np.int64)
+    targets = sources if targets is None else np.asarray(targets, dtype=np.int64)
     selected = np.isin(network.link_id, np.asarray(link_ids, dtype=np.int64))
     if not selected.any():
         raise ValueError(f"None of the link_id(s) {list(link_ids)} are in the network.")
-    select_out: list[csr_matrix] = []
-    volume, _ = _assign(
-        network,
+    demand = _as_demand_csr(demand, sources.size, targets.size)
+    if demand.nnz == 0:
+        empty = np.zeros(network.n_edges, dtype=np.float64)
+        return empty, csr_matrix(demand.shape, dtype=np.float64), empty.copy()
+
+    volume, missed, hit, select_volume = routing.aon_select(
+        network.routing_graph(),
         sources,
-        demand,
         targets,
-        max_seconds,
-        workers,
-        chunk_size,
-        progress_every,
-        groups=None,
-        selected=selected,
-        select_out=select_out,
+        demand.indptr,
+        demand.indices,
+        demand.data,
+        selected,
+        limit=max_seconds,
+        workers=workers,
+        chunk_size=chunk_size,
+        progress_every=progress_every,
     )
-    return volume, select_out[0]
+    if missed.any():
+        logger.warning(
+            "%d OD pair(s) had demand but no path within reach; dropped from "
+            "the assignment.",
+            int(missed.sum()),
+        )
+    rows = np.repeat(np.arange(sources.size), np.diff(demand.indptr))
+    picked = coo_matrix(
+        (demand.data[hit], (rows[hit], demand.indices[hit])), shape=demand.shape
+    ).tocsr()
+    return volume, picked, select_volume
 
 
 def _assign(
@@ -534,21 +209,15 @@ def _assign(
     chunk_size: int | None,
     progress_every: int,
     groups: tuple[np.ndarray, np.ndarray, int] | None,
-    selected: np.ndarray | None = None,
-    select_out: list[csr_matrix] | None = None,
 ) -> tuple[np.ndarray, csr_matrix | None]:
     """
     The engine behind :func:`assign_traffic`, plus a report of what it could not place.
 
     ``groups`` is ``(row_group, col_group, n_groups)``: give it a source-point to
-    zone map and a target-point to zone map, and the demand that no chunk could
-    place -- everything beyond ``max_seconds`` -- comes back as an
+    zone map and a target-point to zone map, and the demand that could not be
+    placed -- everything beyond ``max_seconds`` -- comes back as an
     ``(n_groups, n_groups)`` sparse matrix ready to be assigned some other way.
     Without it the second return value is None and nothing extra is tracked.
-
-    ``selected`` (a boolean per edge) runs a select-link analysis alongside:
-    the demand of every OD pair whose path crosses a selected edge is appended
-    to ``select_out`` as one ``(len(sources), len(targets))`` sparse matrix.
     """
     sources = np.asarray(sources, dtype=np.int64)
     targets = sources if targets is None else np.asarray(targets, dtype=np.int64)
@@ -568,158 +237,65 @@ def _assign(
         logger.warning("Demand matrix has no positive entries; nothing to assign.")
         return empty, None
 
-    edge_keys = _edge_keys(network)
-
-    if chunk_size is None:
-        chunk_size = choose_chunk_size(network.n_nodes)
-    offsets = list(range(0, sources.size, chunk_size))
     logger.info(
-        "Assigning %d nonzero OD pair(s) from %d source(s) over %d nodes / %d edges: "
-        "%d chunks of <=%d sources, %d worker(s)",
+        "Assigning %d nonzero OD pair(s) from %d source(s) over %d nodes / %d edges, "
+        "%d worker(s)",
         demand.nnz,
         sources.size,
         network.n_nodes,
         network.n_edges,
-        len(offsets),
-        chunk_size,
         workers,
     )
+    per_thread = routing.workspace_bytes(network.n_nodes, network.n_edges, flow=True)
+    logger.info(
+        "Routing scratch space: %.0f MB per worker, %.1f GB for %d worker(s)",
+        per_thread / 1e6,
+        per_thread * max(1, workers) / 1e9,
+        max(1, workers),
+    )
 
-    link_volume = np.zeros(network.n_edges, dtype=np.float64)
-    dropped_total = 0
-    n_groups = None if groups is None else groups[2]
-    unplaced_parts: list[coo_matrix] = []
-    picked_parts: list[tuple[np.ndarray, ...]] = []
+    link_volume, missed = routing.aon(
+        network.routing_graph(),
+        sources,
+        targets,
+        demand.indptr,
+        demand.indices,
+        demand.data,
+        limit=max_seconds,
+        workers=workers,
+        chunk_size=chunk_size,
+        progress_every=progress_every,
+    )
+    dropped = int(missed.sum())
 
-    def merge(result: _ChunkResult) -> None:
-        nonlocal dropped_total
-        idx, values, dropped, report, picked = result
-        if picked:
-            picked_parts.append(picked)
-        link_volume[idx] += values
-        dropped_total += dropped
-        if n_groups is not None and report and report[0].size:
-            unplaced_parts.append(
-                coo_matrix(
-                    (report[2], (report[0], report[1])), shape=(n_groups, n_groups)
-                )
-            )
-
-    if workers <= 1:
-        graph = network.csr()
-        for done, start in enumerate(offsets, start=1):
-            merge(
-                _solve_chunk(
-                    graph,
-                    sources[start : start + chunk_size],
-                    targets,
-                    demand.data,
-                    demand.indices,
-                    demand.indptr,
-                    start,
-                    edge_keys,
-                    network.n_nodes,
-                    max_seconds,
-                    network.n_edges,
-                    groups,
-                    selected,
-                )
-            )
-            if progress_every and done % progress_every == 0:
-                logger.info("  %d/%d chunks", done, len(offsets))
-    else:
-        with tempfile.TemporaryDirectory(prefix="valma-assign-") as tmp:
-            base = Path(tmp)
-            np.save(base / "indptr.npy", network.indptr)
-            np.save(base / "indices.npy", network.indices)
-            np.save(base / "data.npy", network.travel_time)
-            np.save(base / "edge_keys.npy", edge_keys)
-            np.save(base / "targets.npy", targets)
-            np.save(base / "demand_data.npy", demand.data)
-            np.save(base / "demand_indices.npy", demand.indices)
-            np.save(base / "demand_indptr.npy", demand.indptr)
-            if groups is not None:
-                np.save(base / "row_group.npy", groups[0])
-                np.save(base / "col_group.npy", groups[1])
-            if selected is not None:
-                np.save(base / "selected.npy", selected)
-            shape = (network.n_nodes, network.n_nodes)
-
-            with ProcessPoolExecutor(
-                max_workers=workers,
-                initializer=_init_worker,
-                initargs=(str(base), shape),
-            ) as pool:
-                # Submit a bounded window rather than every chunk at once. An
-                # eager `for start in offsets` comprehension queues one work
-                # item per chunk, each holding its arguments and later its
-                # result alive until the whole run drains -- which on a zone
-                # run, where chunks number in the thousands, is memory spent in
-                # proportion to how finely the work was divided. Refilling as
-                # results land keeps at most a couple of rounds in flight.
-                pending: dict[Future[_ChunkResult], int] = {}
-                queue = iter(offsets)
-
-                def submit_next() -> bool:
-                    start = next(queue, None)
-                    if start is None:
-                        return False
-                    pending[
-                        pool.submit(
-                            _worker_solve,
-                            sources[start : start + chunk_size],
-                            start,
-                            max_seconds,
-                            n_groups,
-                        )
-                    ] = start
-                    return True
-
-                for _ in range(min(len(offsets), 2 * max(workers, 1))):
-                    submit_next()
-
-                done = 0
-                while pending:
-                    finished, _ = wait(pending, return_when=FIRST_COMPLETED)
-                    for future in finished:
-                        del pending[future]
-                        merge(future.result())
-                        submit_next()
-                        done += 1
-                        if progress_every and done % progress_every == 0:
-                            logger.info("  %d/%d chunks", done, len(offsets))
-
-    if dropped_total and n_groups is None:
+    if dropped and groups is None:
         logger.warning(
             "%d OD pair(s) had demand but no path within reach; dropped from "
             "the assignment.",
-            dropped_total,
+            dropped,
         )
-    elif dropped_total:
+    elif dropped:
         # Not a warning: a caller that asked for the unplaced demand back has
         # somewhere else to send it, so an unreached pair here is the cutoff
         # doing its job, not demand going missing.
         logger.info(
             "%d OD pair(s) were beyond the cutoff; handing them back to the caller.",
-            dropped_total,
+            dropped,
         )
 
-    if select_out is not None:
-        if picked_parts:
-            rows, cols, vals = (np.concatenate(part) for part in zip(*picked_parts))
-        else:
-            rows = cols = np.empty(0, dtype=np.int64)
-            vals = np.empty(0, dtype=np.float64)
-        select_out.append(
-            coo_matrix((vals, (rows, cols)), shape=(sources.size, targets.size)).tocsr()
-        )
-
-    if n_groups is None:
+    if groups is None:
         return link_volume, None
-    if not unplaced_parts:
-        return link_volume, csr_matrix((n_groups, n_groups), dtype=np.float64)
 
-    unplaced = sum(unplaced_parts[1:], unplaced_parts[0]).tocsr()
+    row_group, col_group, n_groups = groups
+    position = np.flatnonzero(missed)
+    rows = np.repeat(np.arange(sources.size), np.diff(demand.indptr))[position]
+    unplaced = coo_matrix(
+        (
+            demand.data[position],
+            (row_group[rows], col_group[demand.indices[position]]),
+        ),
+        shape=(n_groups, n_groups),
+    ).tocsr()
     unplaced.sum_duplicates()
     return link_volume, unplaced
 

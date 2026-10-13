@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from valma_bike_and_walk.cache import path_digest
+
 #: Coordinate system OSM data is stored in.
 WGS84 = "EPSG:4326"
 
@@ -100,12 +102,14 @@ class Settings:
         Where `matrix`/`assign` park a graph they built themselves from
         `--links`, without an explicit `valma build` in between.
 
-        Same naming as :meth:`network_path`, but under `--cache-dir`: nobody
+        Named like :meth:`network_path`, but under `--cache-dir` -- nobody
         asked for this file by name, so it should not show up next to the
-        results.
+        results -- and with a short digest of the layer's full path, so that
+        `scenario_a/bike_links.gpkg` and `scenario_b/bike_links.gpkg` get a
+        graph each instead of evicting one another on every run.
         """
         stem = self._network_stem(mode, links_path, connectors_path)
-        return self.cache_dir / f"{stem}.npz"
+        return self.cache_dir / f"{stem}_{path_digest(links_path)}.npz"
 
     @property
     def _read_key(self) -> str:

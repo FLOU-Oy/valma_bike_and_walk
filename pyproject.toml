@@ -15,6 +15,8 @@ authors = [
 
 dependencies = [
     "geopandas>=0.14",
+    # Routing kernels (valma_bike_and_walk.routing) are compiled with Numba.
+    "numba>=0.60",
     "numpy>=1.24",
     "pandas>=2.0",
     "openmatrix>=0.3",
@@ -22,6 +24,7 @@ dependencies = [
     "xlrd>=2.0",
     "osmium>=4.0",
     "pyproj>=3.5",
+    # Sparse demand matrices, KD-tree snapping, connected components -- not routing.
     "scipy>=1.11",
     "shapely>=2.0",
     "truststore>=0.9",
@@ -29,7 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # NetworkX is only needed for RoutableNetwork.to_networkx() (plotting/interop)
-# and for the test that checks our SciPy routing against a reference
+# and for the test that checks our routing against a reference
 # implementation; the routing core itself does not import it.
 viz = [
     "matplotlib>=3.7",
@@ -50,6 +53,8 @@ dev = [
     "networkx>=3.0",
     "openmatrix>=0.3",
     "rasterio>=1.3",
+    # scripts/bench_routing.py measures peak memory across worker processes.
+    "psutil>=5.9",
 ]
 viewer = [
     "fastapi>=0.110",

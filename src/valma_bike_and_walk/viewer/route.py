@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import shapely
 from pyproj import Transformer
+from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
 from valma_bike_and_walk.network import RoutableNetwork
@@ -26,7 +27,10 @@ class Router:
 
     def __init__(self, network: RoutableNetwork, links) -> None:
         self.network = network
-        self.graph = network.csr()
+        self.graph = csr_matrix(
+            (network.travel_time, network.indices, network.indptr),
+            shape=(network.n_nodes, network.n_nodes),
+        )
         n = network.n_nodes
         tails = np.repeat(np.arange(n, dtype=np.int64), np.diff(network.indptr))
         self.edge_keys = tails * n + network.indices.astype(np.int64)

@@ -3,6 +3,7 @@
 import geopandas as gpd
 import numpy as np
 import pytest
+from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
 from valma_bike_and_walk.cli import main
@@ -79,7 +80,13 @@ def test_islands_survive_the_build_behind_a_prohibitive_crossing(archipelago):
     assert joined.n_nodes == 12
     assert 31 not in set(joined.node_ids)
 
-    seconds = dijkstra(joined.csr(), indices=[0])[0]
+    seconds = dijkstra(
+        csr_matrix(
+            (joined.travel_time, joined.indices, joined.indptr),
+            shape=(joined.n_nodes, joined.n_nodes),
+        ),
+        indices=[0],
+    )[0]
     island_b = int(np.flatnonzero(joined.node_ids == 21)[0])
     crossing_s = connectors.length_m.sum() / (speed_kmh / 3.6)
     assert seconds[island_b] == pytest.approx(crossing_s, rel=0.01, abs=120)
@@ -126,7 +133,7 @@ def test_connect_then_route_from_the_command_line(archipelago, tmp_path):
     with_islands = np.load(tmp_path / "out" / "travel_times_walk.npz")
     assert list(with_islands["ids"]) == [1, 2]
     # Kept apart in its own cache file, not mistaken for the plain graph.
-    assert (tmp_path / "cache" / "walk+walk_connectors.npz").exists()
+    assert list((tmp_path / "cache").glob("walk+walk_connectors_*.npz"))
 
 
 def test_assign_leaves_connectors_off_the_volume_map(archipelago, tmp_path):

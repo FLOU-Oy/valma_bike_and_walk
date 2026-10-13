@@ -13,9 +13,9 @@ line, and two searches find them cheaply:
 
 The survivors get the real select-link assignment
 (:func:`~valma_bike_and_walk.assignment.select_link_assignment`), so the
-answer is exactly the one ``assign --select-link`` gives; the pairs it finds
-are then assigned on their own to draw where those trips run. Results are
-cached on disk per counter, keyed on the assignment settings.
+answer is exactly the one ``assign --select-link`` gives, and the same pass
+loads those trips to draw where they run. Results are cached on disk per
+counter, keyed on the assignment settings.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ import pandas as pd
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import dijkstra
 
-from valma_bike_and_walk.assignment import assign_traffic, select_link_assignment
+from valma_bike_and_walk.assignment import select_link_assignment
 from valma_bike_and_walk.network import RoutableNetwork
 
 logger = logging.getLogger(__name__)
@@ -124,7 +124,10 @@ class CounterFlows:
         self.n_rows = int(link_ids.shape[0])
         self.link_ids = np.asarray(link_ids)
         net = setup.network
-        self.graph = net.csr()
+        self.graph = csr_matrix(
+            (net.travel_time, net.indices, net.indptr),
+            shape=(net.n_nodes, net.n_nodes),
+        )
         self.reverse_graph = self.graph.T.tocsr()
         self.edge_tail = np.repeat(np.arange(net.n_nodes), np.diff(net.indptr))
         self.edge_rows = _edge_rows(net, self.link_ids)
@@ -230,7 +233,8 @@ class CounterFlows:
             return empty
 
         progress(f"select-link over {origins.size:,} origins")
-        _, picked = select_link_assignment(
+        # One pass finds the trips through the counter and loads them.
+        _, picked, flow = select_link_assignment(
             net, nodes[origins], candidates[origins], link_ids, targets=nodes,
             max_seconds=setup.max_seconds, workers=setup.workers,
             chunk_size=setup.chunk_size,
@@ -239,13 +243,6 @@ class CounterFlows:
         if users.size == 0:
             empty.summary = {"trips": 0.0, "od_pairs": 0, "origins_searched": int(origins.size)}
             return empty
-
-        progress(f"drawing the flows of {users.size:,} origins")
-        flow = assign_traffic(
-            net, nodes[origins][users], picked[users], targets=nodes,
-            max_seconds=setup.max_seconds, workers=setup.workers,
-            chunk_size=setup.chunk_size,
-        )
 
         rows = self.edge_rows
         ok = (flow > 0) & (rows >= 0)

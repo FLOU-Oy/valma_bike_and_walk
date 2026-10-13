@@ -142,7 +142,7 @@ def test_counter_flows_equal_a_full_select_link(tmp_path, max_seconds):
     result = flows.compute(COUNTER_ROWS)
 
     # The reference: select-link over every origin, then those trips alone.
-    _, picked = select_link_assignment(
+    _, picked, _ = select_link_assignment(
         setup.network, setup.zone_nodes, setup.demand, COUNTER_ROWS, max_seconds=max_seconds
     )
     reference = assign_traffic(setup.network, setup.zone_nodes, picked, max_seconds=max_seconds)
