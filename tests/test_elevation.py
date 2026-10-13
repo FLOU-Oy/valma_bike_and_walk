@@ -447,6 +447,63 @@ def test_moderate_profile_changes_next_to_structures_are_kept():
     assert profile["ascent_m"].iloc[0] == pytest.approx(50.0)
 
 
+def test_a_lone_sample_on_a_cliff_is_interpolated_out():
+    """One sample landing on the rock cut beside the road is not a hill."""
+
+    def cliff_beside_the_road(east, north):
+        z = 100.0 + 0.05 * np.asarray(east, dtype=float)
+        z[np.isclose(east, 500.0)] += 15.0
+        return z
+
+    links = links_frame([{"coords": [(0.0, 0.0), (1_000.0, 0.0)]}], crs=PROJECTED_CRS)
+    profile = elevation.link_profiles(links, cliff_beside_the_road)
+
+    assert profile["ascent_m"].iloc[0] == pytest.approx(50.0)
+    assert profile["descent_m"].iloc[0] == pytest.approx(0.0)
+
+
+def test_a_one_sided_jump_is_clipped_to_the_cap_not_dropped():
+    """A step down off a pixel edge keeps its direction but not its height."""
+
+    def step_down(east, north):
+        east = np.asarray(east, dtype=float)
+        return np.where(east < 512.0, 120.0, 100.0)
+
+    links = links_frame([{"coords": [(0.0, 0.0), (1_000.0, 0.0)]}], crs=PROJECTED_CRS)
+    profile = elevation.link_profiles(links, step_down, spacing_m=25.0)
+
+    assert profile["ascent_m"].iloc[0] == pytest.approx(0.0)
+    assert profile["descent_m"].iloc[0] == pytest.approx(
+        elevation.MAX_PROFILE_GRADE * 25.0
+    )
+
+
+def test_the_cap_follows_the_actual_step_on_a_short_link():
+    """A 2 m jump over a 5 m link is 40 %; the same jump over 25 m is not."""
+
+    def jump(east, north):
+        return np.where(np.asarray(east, dtype=float) > 1.0, 102.0, 100.0)
+
+    links = links_frame(
+        [
+            {"coords": [(0.0, 0.0), (5.0, 0.0)]},
+            {"coords": [(0.0, 0.0), (25.0, 0.0)]},
+        ],
+        crs=PROJECTED_CRS,
+    )
+    profile = elevation.link_profiles(links, jump)
+
+    assert profile["ascent_m"].to_numpy() == pytest.approx(
+        [elevation.MAX_PROFILE_GRADE * 5.0, 2.0]
+    )
+
+
+def test_a_steep_but_believable_hill_is_untouched():
+    links = links_frame([{"coords": [(0.0, 0.0), (200.0, 0.0)]}], crs=PROJECTED_CRS)
+    profile = elevation.link_profiles(links, slope_sampler(0.25))
+    assert profile["ascent_m"].iloc[0] == pytest.approx(50.0)
+
+
 def test_a_gap_in_the_dem_is_read_as_flat_rather_than_poisoning_the_total():
     def holey(east, north):
         z = 100.0 + 0.05 * np.asarray(east, dtype=float)

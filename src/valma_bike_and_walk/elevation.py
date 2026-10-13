@@ -156,6 +156,16 @@ PROFILE_SPACING_M = 25.0
 #: phantom-ascent problem a GPS track has.
 DEAD_BAND_M = 0.5
 
+#: Steepest grade a single profile step is believed at, as a fraction. The DEM
+#: is a square grid laid over a world that is not: where a road runs along a
+#: rock cut, a retaining wall or an embankment, a sample a metre off the road's
+#: line -- or on the wrong side of a pixel edge -- lands on the cliff beside it,
+#: and over a short step that reads as a 50 % climb. Finnish streets rarely pass
+#: 15-20 %, so anything beyond this is taken to be the grid, not the street.
+#: A lone sample jutting out past it on both sides is replaced by its
+#: neighbours' mean; any other step past it is clipped back to it.
+MAX_PROFILE_GRADE = 0.15
+
 # A terrain-model spike at a bridge or tunnel can spill into its neighbouring
 # link. Only steep changes are treated as that artefact; gentler grades remain.
 STRUCTURE_ADJACENT_GRADE = 0.15
@@ -802,11 +812,13 @@ Sampler = Callable[[np.ndarray, np.ndarray], np.ndarray]
 
 def _sample_positions(
     links: gpd.GeoDataFrame, spacing_m: float
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Points at a fixed spacing along every link.
 
-    Returns (link_index, east, north, samples_per_link). Sampling at a fixed
+    Returns (link_index, east, north, samples_per_link, step_m), where
+    ``step_m`` is each link's actual distance between samples -- at most
+    ``spacing_m``, and less on a short link. Sampling at a fixed
     spacing rather than at the geometry's own vertices matters both ways round:
     a long straight link has only two vertices and would otherwise hide a hill
     between them, and a densely drawn curve would otherwise be sampled far more
@@ -830,7 +842,40 @@ def _sample_positions(
     points = shapely.line_interpolate_point(
         np.repeat(geometry, counts), fraction * np.repeat(length, counts)
     )
-    return link_index, shapely.get_x(points), shapely.get_y(points), counts
+    step_m = length / (counts - 1)
+    return link_index, shapely.get_x(points), shapely.get_y(points), counts, step_m
+
+
+def _remove_grid_spikes(
+    z: np.ndarray, link_index: np.ndarray, step_m: np.ndarray, max_grade: float
+) -> tuple[np.ndarray, int]:
+    """
+    Replace lone samples that jut out implausibly steeply on both sides.
+
+    A sample that landed on a cliff beside the road reads as a climb straight
+    back down again. Requiring *both* steps to be too steep, and in opposite
+    directions, is what keeps this off genuine hills: a real crest or valley
+    floor is approached at a believable grade, so it is never touched, where a
+    plain median filter would shave a step off every one of them.
+    """
+    if z.size < 3:
+        return z, 0
+    before = z[1:-1] - z[:-2]
+    after = z[2:] - z[1:-1]
+    middle = link_index[1:-1]
+    # Within one link, so a sample's neighbours share its step length.
+    interior = (link_index[:-2] == middle) & (link_index[2:] == middle)
+    limit = max_grade * step_m[middle]
+    with np.errstate(invalid="ignore"):
+        spike = (
+            interior
+            & (np.abs(before) > limit)
+            & (np.abs(after) > limit)
+            & (np.sign(before) != np.sign(after))
+        )
+    z = z.copy()
+    z[1:-1][spike] = 0.5 * (z[:-2][spike] + z[2:][spike])
+    return z, int(spike.sum())
 
 
 def link_profiles(
@@ -838,6 +883,7 @@ def link_profiles(
     sampler: Sampler,
     spacing_m: float = PROFILE_SPACING_M,
     dead_band_m: float = DEAD_BAND_M,
+    max_grade: float = MAX_PROFILE_GRADE,
 ) -> pd.DataFrame:
     """
     Read each link's height profile and reduce it to four columns.
@@ -860,15 +906,27 @@ def link_profiles(
     over a tunnel, so sampling one produces a violent climb that is not on the
     route. Flat is wrong for a bridge that genuinely rises, but it is wrong by
     far less, and ``grade_override`` is there for the ones that matter.
+
+    No step is believed steeper than ``max_grade`` (see
+    :data:`MAX_PROFILE_GRADE`): a lone spike is interpolated out, and any other
+    step past the cap is clipped to it, keeping its direction.
     """
     logger.info(
         "Laying out sample points every %g m along %d link(s)", spacing_m, len(links)
     )
-    link_index, east, north, counts = _sample_positions(links, spacing_m)
+    link_index, east, north, counts, step_m = _sample_positions(links, spacing_m)
     z = np.asarray(sampler(east, north), dtype=float)
     if z.shape != east.shape:
         raise ValueError(
             f"The sampler returned {z.shape} heights for {east.shape} points."
+        )
+
+    z, spikes = _remove_grid_spikes(z, link_index, step_m, max_grade)
+    if spikes:
+        logger.info(
+            "Interpolated over %d DEM spike(s) steeper than %g %% both ways",
+            spikes,
+            100 * max_grade,
         )
 
     n = len(links)
@@ -889,6 +947,18 @@ def link_profiles(
             step.shape[0],
         )
         step = np.where(unknown, 0.0, step)
+
+    # Capped before the dead band, so the two thresholds stay independent.
+    limit = max_grade * step_m[owner]
+    steep = np.abs(step) > limit
+    if steep.any():
+        logger.info(
+            "Clipped %d of %d profile steps to a %g %% grade",
+            int(steep.sum()),
+            step.shape[0],
+            100 * max_grade,
+        )
+        step = np.where(steep, np.sign(step) * limit, step)
 
     # The dead band goes on each step, not on the total: it is there to stop
     # noise accumulating, and a genuine slope survives it intact.

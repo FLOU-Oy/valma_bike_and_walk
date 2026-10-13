@@ -284,7 +284,7 @@ BIKE_PROFILE = SpeedProfile(
             "corridor": 5.0,
             "living_street": 13.0,
             "residential": 18.0,
-            "service": 18.0,
+            "service": 16.0,
             "unclassified": 18.0,
             "tertiary": 18.0,
             "tertiary_link": 16.0,
