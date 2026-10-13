@@ -88,6 +88,73 @@ def test_summarise_ignores_unreachable():
     assert stats["median_minutes"] == pytest.approx(1.0)
 
 
+def _random_network(seed: int, n: int = 120, m: int = 400):
+    rng = np.random.default_rng(seed)
+    edges = set()
+    while len(edges) < m:
+        u, v = rng.integers(0, n, size=2)
+        if u != v:
+            edges.add((int(u), int(v)))
+    return make_network([(u, v, float(rng.uniform(1, 100))) for u, v in sorted(edges)], n)
+
+
+def _scipy_graph(net):
+    from scipy.sparse import csr_matrix
+
+    return csr_matrix((net.travel_time, net.indices, net.indptr), shape=(net.n_nodes,) * 2)
+
+
+def test_searcher_paths_are_shortest_and_connected():
+    from scipy.sparse.csgraph import dijkstra
+
+    from valma_bike_and_walk.routing import Searcher
+
+    net = _random_network(1)
+    searcher = Searcher(net.routing_graph())
+    graph = searcher.graph
+    reference = dijkstra(_scipy_graph(net), directed=True, indices=np.arange(0, 120, 13))
+    for row, source in enumerate(range(0, 120, 13)):
+        for target in range(0, 120, 7):
+            edges, cost = searcher.path(source, target)
+            assert cost == pytest.approx(reference[row, target])
+            if not np.isfinite(cost) or source == target:
+                assert edges.size == 0
+                continue
+            # A chain from source to target whose edges add up to the cost.
+            assert graph.edge_tail[edges[0]] == source and graph.indices[edges[-1]] == target
+            np.testing.assert_array_equal(graph.indices[edges[:-1]], graph.edge_tail[edges[1:]])
+            assert net.travel_time[edges].sum() == pytest.approx(cost)
+
+
+def test_searcher_costs_match_scipy_min_only_both_ways():
+    from scipy.sparse.csgraph import dijkstra
+
+    from valma_bike_and_walk.routing import Searcher
+
+    net = _random_network(2)
+    sources = np.array([3, 40, 77, 40])
+    targets = np.arange(0, 120, 3)
+    forward = Searcher(net.routing_graph())
+    backward = Searcher(net.routing_graph().reversed())
+    scipy_graph = _scipy_graph(net)
+    for limit in (None, 60.0):
+        bound = np.inf if limit is None else limit
+        ahead = dijkstra(scipy_graph, indices=sources, min_only=True, limit=bound)
+        behind = dijkstra(scipy_graph.T.tocsr(), indices=sources, min_only=True, limit=bound)
+        np.testing.assert_allclose(forward.costs(sources, targets, limit), ahead[targets])
+        np.testing.assert_allclose(backward.costs(sources, targets, limit), behind[targets])
+
+
+def test_searcher_rejects_nodes_outside_the_graph():
+    from valma_bike_and_walk.routing import Searcher
+
+    searcher = Searcher(make_network([(0, 1, 1.0)], 2).routing_graph())
+    with pytest.raises(ValueError, match="node indices"):
+        searcher.path(0, 2)
+    with pytest.raises(ValueError, match="node indices"):
+        searcher.costs(np.array([-1]), np.array([0]))
+
+
 def test_matches_networkx_on_a_random_graph():
     """SciPy CSR routing must agree with NetworkX, our reference implementation."""
     nx = pytest.importorskip("networkx")

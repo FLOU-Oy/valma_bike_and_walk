@@ -1,8 +1,9 @@
 """Shortest-path kernels, compiled with Numba.
 
 Everything this project routes -- a point-to-point matrix, a zone matrix
-aggregated over weighted access points, an all-or-nothing assignment -- is a
-sequence of single-source shortest-path searches followed by something cheap
+aggregated over weighted access points, an all-or-nothing assignment, the
+viewer's routes and select-link pruning (:class:`Searcher`) -- is a
+sequence of shortest-path searches followed by something cheap
 done with each search's result. This module is those searches, and that
 something, compiled together into one loop per operation.
 
@@ -97,6 +98,23 @@ class Graph:
             edge_tail=edge_tail,
         )
 
+    def reversed(self) -> "Graph":
+        """
+        The same graph with every edge turned around, for searches *to* a node.
+
+        Edge ``k`` here is the edge ``order[k]`` of this graph, where ``order``
+        sorts the edges by head; weights travel with their edges.
+        """
+        order = np.argsort(self.indices, kind="stable")
+        indptr = np.zeros(self.n_nodes + 1, dtype=np.int64)
+        np.cumsum(np.bincount(self.indices, minlength=self.n_nodes), out=indptr[1:])
+        return Graph(
+            indptr=indptr,
+            indices=np.ascontiguousarray(self.edge_tail[order]),
+            weight=np.ascontiguousarray(self.weight[order]),
+            edge_tail=np.ascontiguousarray(self.indices[order]),
+        )
+
     @property
     def n_nodes(self) -> int:
         return int(self.indptr.shape[0] - 1)
@@ -116,7 +134,7 @@ def _search(
     indptr,
     indices,
     weight,
-    source,
+    sources,
     limit,
     stamp,
     serial,
@@ -129,7 +147,10 @@ def _search(
     heap_node,
 ):
     """
-    One Dijkstra search from ``source``, leaving its answer in the workspace.
+    One Dijkstra search from ``sources``, leaving its answer in the workspace.
+
+    Usually there is one source; with several, every one starts at cost 0 and
+    the search finds the least cost from any of them.
 
     On return ``dist`` holds the cost to every node the search touched (``inf``
     elsewhere), ``pred_edge`` the edge each settled node was reached by, and
@@ -144,16 +165,25 @@ def _search(
 
     Returns the possibly regrown heap arrays, so the workspace keeps them.
     """
-    dist[source] = 0.0
-    pred_edge[source] = -1
-    touched[0] = source
-    n_touched = 1
+    if sources.shape[0] > heap_key.shape[0]:
+        heap_key = np.empty(sources.shape[0], dtype=heap_key.dtype)
+        heap_node = np.empty(sources.shape[0], dtype=heap_node.dtype)
+    n_touched = 0
     n_settled = 0
     remaining = n_targets
 
-    heap_key[0] = 0.0
-    heap_node[0] = source
-    size = 1
+    # Every source enters at cost 0, so the heap is valid in any order.
+    size = 0
+    for k in range(sources.shape[0]):
+        source = sources[k]
+        if dist[source] == np.inf:
+            dist[source] = 0.0
+            pred_edge[source] = -1
+            touched[n_touched] = source
+            n_touched += 1
+            heap_key[size] = 0.0
+            heap_node[size] = source
+            size += 1
 
     while size > 0:
         key = heap_key[0]
@@ -263,7 +293,7 @@ def _point_rows(
             indptr,
             indices,
             weight,
-            sources[i],
+            sources[i : i + 1],
             limit,
             stamp,
             serial,
@@ -323,7 +353,7 @@ def _zone_rows(
             indptr,
             indices,
             weight,
-            source_nodes[a],
+            source_nodes[a : a + 1],
             limit,
             stamp,
             serial,
@@ -393,7 +423,7 @@ def _zone_rows_settled(
             indptr,
             indices,
             weight,
-            source_nodes[a],
+            source_nodes[a : a + 1],
             limit,
             stamp,
             serial,
@@ -481,7 +511,7 @@ def _aon_rows(
             indptr,
             indices,
             weight,
-            source,
+            sources[r : r + 1],
             limit,
             stamp,
             serial,
@@ -579,7 +609,7 @@ def _aon_select_rows(
             indptr,
             indices,
             weight,
-            source,
+            sources[r : r + 1],
             limit,
             stamp,
             serial,
@@ -628,6 +658,108 @@ def _aon_select_rows(
 
         _reset(dist, touched, n_touched)
     return serial, heap_key, heap_node
+
+
+@njit(nogil=True, cache=True)
+def _costs(
+    indptr,
+    indices,
+    weight,
+    sources,
+    targets,
+    limit,
+    out,
+    stamp,
+    serial,
+    dist,
+    pred_edge,
+    touched,
+    settled,
+    heap_key,
+    heap_node,
+):
+    """``out[j]`` = least cost from any of ``sources`` to ``targets[j]``, inf if beyond reach."""
+    serial += 1
+    n_targets = _mark(stamp, serial, targets)
+    n_touched, _, heap_key, heap_node = _search(
+        indptr,
+        indices,
+        weight,
+        sources,
+        limit,
+        stamp,
+        serial,
+        n_targets,
+        dist,
+        pred_edge,
+        touched,
+        settled,
+        heap_key,
+        heap_node,
+    )
+    for j in range(targets.shape[0]):
+        out[j] = dist[targets[j]]
+    _reset(dist, touched, n_touched)
+    return serial, heap_key, heap_node
+
+
+@njit(nogil=True, cache=True)
+def _path(
+    indptr,
+    indices,
+    weight,
+    edge_tail,
+    sources,
+    target,
+    limit,
+    stamp,
+    serial,
+    dist,
+    pred_edge,
+    touched,
+    settled,
+    heap_key,
+    heap_node,
+):
+    """
+    The edges of the least-cost path from ``sources[0]`` to ``target``, in order.
+
+    The search stops as soon as ``target`` is settled. Returns an empty path
+    and a cost of inf when the target is beyond reach.
+    """
+    serial += 1
+    stamp[target] = serial
+    n_touched, _, heap_key, heap_node = _search(
+        indptr,
+        indices,
+        weight,
+        sources,
+        limit,
+        stamp,
+        serial,
+        1,
+        dist,
+        pred_edge,
+        touched,
+        settled,
+        heap_key,
+        heap_node,
+    )
+    cost = dist[target]
+    n_edges = 0
+    if cost < np.inf:
+        node = target
+        while pred_edge[node] >= 0:
+            n_edges += 1
+            node = edge_tail[pred_edge[node]]
+    edges = np.empty(n_edges, dtype=np.int64)
+    node = target
+    for k in range(n_edges - 1, -1, -1):
+        edge = pred_edge[node]
+        edges[k] = edge
+        node = edge_tail[edge]
+    _reset(dist, touched, n_touched)
+    return edges, cost, serial, heap_key, heap_node
 
 
 # --------------------------------------------------------------------------
@@ -1071,3 +1203,101 @@ def aon_select(
         volume += ws.volume
         select_volume += ws.select_volume
     return volume, missed, hit, select_volume
+
+
+class Searcher:
+    """
+    Single searches on demand, for callers that ask one question at a time.
+
+    The viewer routes a click, or prunes a select-link job, while a server
+    waits; each of those is one search. Allocating a workspace for each would
+    cost O(n_nodes) however little the search explores, so finished workspaces
+    are kept and handed to the next call, from whichever thread it comes.
+    """
+
+    def __init__(self, graph: Graph) -> None:
+        self.graph = graph
+        self._free: list[_Workspace] = []
+        self._lock = threading.Lock()
+
+    def _acquire(self) -> _Workspace:
+        with self._lock:
+            if self._free:
+                return self._free.pop()
+        return _Workspace(self.graph.n_nodes)
+
+    def _release(self, ws: _Workspace) -> None:
+        with self._lock:
+            self._free.append(ws)
+
+    def _nodes(self, nodes, what: str) -> np.ndarray:
+        nodes = np.ascontiguousarray(np.atleast_1d(nodes), dtype=np.int32)
+        if nodes.size and (nodes.min() < 0 or nodes.max() >= self.graph.n_nodes):
+            raise ValueError(f"{what} must be node indices in [0, {self.graph.n_nodes}).")
+        return nodes
+
+    def path(
+        self, source: int, target: int, limit: float | None = None
+    ) -> tuple[np.ndarray, float]:
+        """
+        ``(edges, cost)`` of the least-cost path from ``source`` to ``target``.
+
+        ``edges`` are edge indices in travel order; an unreachable target gives
+        no edges and a cost of inf, and ``source == target`` no edges at cost 0.
+        """
+        sources = self._nodes(source, "source")
+        target = int(self._nodes(target, "target")[0])
+        ws = self._acquire()
+        edges, cost, ws.serial, ws.heap_key, ws.heap_node = _path(
+            self.graph.indptr,
+            self.graph.indices,
+            self.graph.weight,
+            self.graph.edge_tail,
+            sources,
+            target,
+            _limit(limit),
+            ws.stamp,
+            ws.serial,
+            ws.dist,
+            ws.pred_edge,
+            ws.touched,
+            ws.settled,
+            ws.heap_key,
+            ws.heap_node,
+        )
+        self._release(ws)  # only a search that finished leaves its workspace clean
+        return edges, float(cost)
+
+    def costs(
+        self, sources: np.ndarray, targets: np.ndarray, limit: float | None = None
+    ) -> np.ndarray:
+        """
+        Least cost from *any* of ``sources`` to each of ``targets``, inf if beyond reach.
+
+        One search, which stops once every target is settled or at ``limit``.
+        """
+        sources = self._nodes(sources, "sources")
+        targets = self._nodes(targets, "targets")
+        out = np.full(targets.shape[0], np.inf, dtype=np.float64)
+        if sources.size == 0 or targets.size == 0:
+            return out
+        ws = self._acquire()
+        ws.serial, ws.heap_key, ws.heap_node = _costs(
+            self.graph.indptr,
+            self.graph.indices,
+            self.graph.weight,
+            sources,
+            targets,
+            _limit(limit),
+            out,
+            ws.stamp,
+            ws.serial,
+            ws.dist,
+            ws.pred_edge,
+            ws.touched,
+            ws.settled,
+            ws.heap_key,
+            ws.heap_node,
+        )
+        self._release(ws)
+        return out

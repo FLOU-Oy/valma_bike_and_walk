@@ -300,10 +300,10 @@ def break_even(model: dict, alternative: dict, mode: str) -> list[dict]:
 
 def calibrate(router, links: pd.DataFrame, mode: str, points: list, vias: list) -> dict:
     """Model route between the end points vs the route through ``vias``."""
-    model_edges, *_ = router.path_edges([points[0], points[-1]])
-    alt_edges, *_ = router.path_edges([points[0], *vias, points[-1]])
-    result = {"model": router.route_via([points[0], points[-1]]),
-              "alternative": router.route_via([points[0], *vias, points[-1]])}
+    model = router.path_edges([points[0], points[-1]])
+    alternative = router.path_edges([points[0], *vias, points[-1]])
+    model_edges, alt_edges = model[0], alternative[0]
+    result = {"model": router.describe(*model), "alternative": router.describe(*alternative)}
 
     def analyse(edges):
         rows = router.edge_rows[edges]
