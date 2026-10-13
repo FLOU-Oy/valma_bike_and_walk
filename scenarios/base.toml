@@ -1,0 +1,114 @@
+# Base scenario: the settings every other scenario starts from.
+#
+#   valma extract -c scenarios/base.toml           # OSM -> output/base/bike_links.gpkg
+#   valma assign  -c scenarios/base.toml           # -> output/base/
+#   valma assign  -c scenarios/base.toml --mode walk
+#   valma view    -c scenarios/base.toml --run output/
+#   valma assign  -c scenarios/base.toml --show-config   # what it would run with, and why
+#
+# A variant names this file and overrides only what differs:
+#
+#   # scenarios/2040.toml
+#   extends = "base.toml"
+#   scenario = "2040"
+#   [assign]
+#   demand = "../data/demand_2040.omx"
+#
+# Keys are the command-line flags without their dashes. A top-level key goes to
+# every command that takes it; a [command] section only to that command and
+# wins over the top level. The command line wins over everything. Relative
+# paths are from this file, and {mode} and {scenario} are filled in from the
+# final settings. Commented-out lines show each option's default or an example.
+
+# --------------------------------------------------------------------------
+# Shared by every command
+# --------------------------------------------------------------------------
+
+mode = "bike"                       # "bike" or "walk"
+scenario = "base"                   # results go to <output_dir>/<scenario>/
+output_dir = "../output"
+cache_dir = "../.cache"
+
+# The network. Written out rather than with {scenario}, so variants extending
+# this file route on the base network unless they name a layer of their own.
+links = "../output/base/{mode}_links.gpkg"
+# connectors = "../output/base/{mode}_links_connectors.gpkg"   # from `valma connect`
+# network = "../output/base/{mode}.npz"                        # a built graph instead of links
+
+# Zones: either point centroids or polygon zones (they exclude each other; a
+# variant giving zones replaces centroids from here).
+centroids = "../data/points.csv"
+id_column = "id"
+# x_column = "lon"
+# y_column = "lat"
+# centroid_crs = "EPSG:4326"
+
+# zones = "../data/zones.gpkg"
+# id_column = "input_zone_id"
+# weights = "../data/buildings.gpkg"    # where demand sits inside each zone
+# weight_column = "population"
+# points_per_zone = 8
+# access_speed_kmh = 15.0               # default: the mode's base speed
+# no_access_time = false
+# near_minutes = 10.0
+
+# max_snap_distance = 1000.0
+# workers = 14                          # default: all cores but two
+
+# Demand. Read by `assign`, and by `view` for counter clicks.
+demand = "../output/time_bike_aht.omx"  # placeholder: point at the real OD demand
+demand_matrix = "{mode}"
+# demand_mapping = "zone_number"
+
+# --------------------------------------------------------------------------
+# Per command
+# --------------------------------------------------------------------------
+
+[extract]
+pbf = "../data/finland-260805.osm.pbf"
+bbox = [24.50, 60.10, 25.30, 60.40]     # lon/lat box; much cheaper than area
+# area = "Espoo"
+# include_construction = true
+# index_storage = "flex_mem"
+
+[connect]
+# min_nodes = 20
+# speed_kmh = 0.1
+# gap_m = 50.0
+
+[dem]
+# dem_resolution = 2.0
+# dem_tile = 8000
+# dem_workers = 4
+# The NLS API key stays in the MML_API_KEY environment variable, not here.
+
+[traffic]
+# volumes = "../data/link_volumes.gpkg"
+# volume_column = "volume"
+# max_distance = 12.0
+# max_angle = 45.0
+# min_coverage = 0.5
+
+[matrix]
+max_minutes = 60.0
+# omx = true                            # also write <output_dir>/<scenario>/... .omx
+# omx_matrix_name = "bike"
+
+[assign]
+gpkg = true                             # link volumes drawn on the link layer
+max_minutes = 60.0
+# min_demand = 0.0
+# select_link = [12345]
+
+[overlay]
+# Note: max_minutes means something else here (keep the baseline beyond it),
+# which is why it is set per command above rather than at the top level.
+# baseline = "../data/baseline.omx"
+# baseline_matrix = "bike"
+# baseline_speed_kmh = true             # baseline in km, at the mode's base speed
+
+[view]
+# count_lines = "../data/count_lines.gpkg"
+# observed = "../output/bicycle_counter_annual_averages.csv"
+# port = 8765
+# no_browser = false
