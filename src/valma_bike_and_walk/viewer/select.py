@@ -31,8 +31,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import dijkstra
 
+from valma_bike_and_walk import routing
 from valma_bike_and_walk.assignment import select_link_assignment
 from valma_bike_and_walk.network import RoutableNetwork
 
@@ -80,10 +80,9 @@ def _edge_rows(network: RoutableNetwork, link_ids: np.ndarray) -> np.ndarray:
 
 
 def candidate_demand(
-    graph: csr_matrix,
-    reverse_graph: csr_matrix,
+    forward: routing.Searcher,
+    backward: routing.Searcher,
     selected: np.ndarray,
-    edge_tail: np.ndarray,
     zone_nodes: np.ndarray,
     demand: csr_matrix,
     max_seconds: float | None,
@@ -95,18 +94,21 @@ def candidate_demand(
     nearest selected edge's head to the destination) fits within the cutoff,
     which no pair routed through the counter can fail. A loose bound -- the
     edge itself and the choice of edge are ignored -- but a safe one.
+
+    ``forward`` searches the network and ``backward`` the same network
+    reversed. Each is one search from all of the counter's edge ends at once,
+    which stops once every zone is settled or at the cutoff.
     """
-    tails = np.unique(edge_tail[selected])
+    graph = forward.graph
+    tails = np.unique(graph.edge_tail[selected])
     heads = np.unique(graph.indices[selected])
     limit = np.inf if max_seconds is None else max_seconds
-    to_counter = dijkstra(reverse_graph, directed=True, indices=tails, min_only=True, limit=limit)
-    from_counter = dijkstra(graph, directed=True, indices=heads, min_only=True, limit=limit)
 
     snapped = zone_nodes >= 0
     a = np.full(zone_nodes.shape[0], np.inf)
     b = np.full(zone_nodes.shape[0], np.inf)
-    a[snapped] = to_counter[zone_nodes[snapped]]
-    b[snapped] = from_counter[zone_nodes[snapped]]
+    a[snapped] = backward.costs(tails, zone_nodes[snapped], max_seconds)
+    b[snapped] = forward.costs(heads, zone_nodes[snapped], max_seconds)
 
     coo = demand.tocoo()
     via = a[coo.row] + b[coo.col]
@@ -124,12 +126,10 @@ class CounterFlows:
         self.n_rows = int(link_ids.shape[0])
         self.link_ids = np.asarray(link_ids)
         net = setup.network
-        self.graph = csr_matrix(
-            (net.travel_time, net.indices, net.indptr),
-            shape=(net.n_nodes, net.n_nodes),
-        )
-        self.reverse_graph = self.graph.T.tocsr()
-        self.edge_tail = np.repeat(np.arange(net.n_nodes), np.diff(net.indptr))
+        # The graph select_link_assignment routes on, so the pruning sees the same costs.
+        graph = net.routing_graph()
+        self.forward = routing.Searcher(graph)
+        self.backward = routing.Searcher(graph.reversed())
         self.edge_rows = _edge_rows(net, self.link_ids)
         key = hashlib.sha1(setup.description.encode()).hexdigest()[:12]
         self.cache_dir = Path(cache_dir) / key
@@ -219,8 +219,7 @@ class CounterFlows:
         ids = setup.zone_ids[snapped]
 
         candidates = candidate_demand(
-            self.graph, self.reverse_graph, selected, self.edge_tail, nodes, demand,
-            setup.max_seconds,
+            self.forward, self.backward, selected, nodes, demand, setup.max_seconds,
         )
         origins = np.flatnonzero(np.diff(candidates.indptr))
         logger.info(
