@@ -65,7 +65,8 @@ of) — via explicit, reviewable profiles in [`speeds.py`](src/valma_bike_and_wa
 | | walking | cycling |
 |---|---|---|
 | baseline | 4.8 km/h | 14 km/h |
-| segregated cycleway | 4.8 km/h | 18 km/h |
+| cycleway (shared or untagged) | 4.8 km/h | 18 km/h |
+| segregated cycleway (`segregated=yes`) | 4.8 km/h | 18.9 km/h (×1.05) |
 | forest path | 4.3 km/h | 11 km/h |
 | steps | 1.2 km/h | 1.2 km/h (pushing) |
 | mud vs asphalt | ×0.70 | ×0.40 |
@@ -952,6 +953,70 @@ Walking demand is dominated by short trips — in `demand_vrk.omx` a third of
 all walk trips are intrazonal. With `--centroids` those are dropped (there is
 no path from a node to itself); give `assign` zone polygons with `--zones` to
 load them onto local streets — see [Zones as polygons](#zones-as-polygons).
+
+## Viewing results in the browser
+
+`valma view` opens a link layer and its assignment results on a WebGL map
+(MapLibre + deck.gl). It needs the `viewer` extra:
+
+```bash
+pip install -e ".[viewer]"
+valma view --links output/bike_links.gpkg --connectors output/bike_connectors.gpkg \
+           --run output/link_volumes_bike.npz output/select_viikki
+```
+
+- **Volume map**: width and colour by volume, either direction or both, with a
+  threshold slider; any two runs can be compared as A − B.
+- **Speed map**: the speeds the current code gives each direction, plus the
+  links read through roadworks.
+- **Link inspector**: click a link for its tags and how its speed and travel
+  time are built up — road class and facility, surface, segregation, traffic,
+  penalties — in each direction, with its volume in every run.
+- **Counters**: count lines and observed averages (`data/count_lines.gpkg`,
+  `output/bicycle_counter_annual_averages.csv` by default) coloured by
+  model ÷ observed for the selected run; click one to see the links it sums.
+- **Routing**: *Plan a route*, then click an origin and a destination; drag
+  either marker to re-route. The route is the shortest path by the same
+  travel times `assign` and `matrix` use, so it is exactly what an OD pair
+  between those points is assigned to, listed street by street with its
+  length, model travel time and the road types it uses.
+- **Calibration from a dragged route**: with a route drawn, click it to add a
+  via point and drag that onto the route you believe people really take
+  (double-click a via point to remove it). The panel then shows both routes,
+  the extra cost of yours split by cause — base riding time, road class and
+  facility, surface, segregation, car traffic, signals, crossings, grade — and,
+  for every parameter that tells the two apart, the **break-even value** at
+  which your route would cost no more than the model's, all else unchanged,
+  smallest change first. *Copy report* gives the same as Markdown; *Save case*
+  appends it to `output/route_observations.jsonl`. One case is an anecdote —
+  a parameter worth changing is one that many saved cases point the same way
+  on. If the link tags no longer reproduce the graph's travel times (the code
+  changed since `assign` built it), the panel says so: rebuild with
+  `assign --force-reload` first.
+- **Trips through a counter**: start `view` with the settings the run was
+  assigned with, and clicking a counter maps only the trips that pass it — a
+  select-link analysis, with its largest origin and destination zones:
+
+  ```bash
+  valma view --links output/bike_links.gpkg --connectors output/bike_connectors.gpkg \
+             --run output/link_volumes_bike.npz \
+             --demand demand_vrk.omx --demand-matrix bike --centroids centroids.csv \
+             --id-column id --min-demand 0.01 --max-minutes 90 --workers 8
+  ```
+
+  The answer is the one `assign --select-link` gives, but only origins that
+  could reach the counter within `--max-minutes` are searched — about an
+  eighth of them for a Helsinki counter, so a first click takes a minute or
+  two for the whole country. Each counter is cached under `.cache/viewer/`
+  (keyed on the settings and the network's travel times), so later clicks
+  are instant.
+
+`--run` takes `link_volumes_<mode>.npz` files or directories to search for
+them. The first start for a link layer converts it to GeoParquet under
+`.cache/viewer/` (about two minutes for the whole of Finland); later starts take
+seconds, and map tiles are cached there as they are first drawn. The map
+libraries and the OpenFreeMap base map load from the internet. Design notes and
+planned features: [docs/viewer-design.md](docs/viewer-design.md).
 
 ## Layout
 
