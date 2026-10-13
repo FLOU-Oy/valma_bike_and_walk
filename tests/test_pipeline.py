@@ -669,17 +669,15 @@ def test_the_graph_is_named_after_its_link_layer(tmp_path):
     assert settings.network_path("walk", "espoo.gpkg").name == "espoo_walk.npz"
     assert settings.network_path("bike", "espoo.gpkg").name == "espoo_bike.npz"
 
-    # The implicit graph `matrix`/`assign` build from `--links` is the same
-    # name, just parked under --cache-dir instead of --output-dir.
+    # The implicit graph `matrix`/`assign` build from `--links` is named the
+    # same way, parked under --cache-dir instead of --output-dir, and tagged
+    # with the layer's path so same-named layers in two folders do not collide.
     settings = Settings(cache_dir=tmp_path / "cache", output_dir=tmp_path / "out")
-    assert (
-        settings.network_cache_path_for_links("walk", "out/walk_links.gpkg").name
-        == "walk.npz"
-    )
-    assert (
-        settings.network_cache_path_for_links("walk", "out/walk_links.gpkg").parent
-        == tmp_path / "cache"
-    )
+    cached = settings.network_cache_path_for_links("walk", "a/walk_links.gpkg")
+    assert cached.parent == tmp_path / "cache"
+    assert cached.name.startswith("walk_") and cached.suffix == ".npz"
+    assert cached == settings.network_cache_path_for_links("walk", "a/walk_links.gpkg")
+    assert cached != settings.network_cache_path_for_links("walk", "b/walk_links.gpkg")
 
 
 def test_cli_matrix_with_links_caches_the_graph_instead_of_writing_it_out(
@@ -730,7 +728,7 @@ def test_cli_matrix_with_links_caches_the_graph_instead_of_writing_it_out(
 
     # No explicit `valma build` ran, so the graph is a cache, not a named
     # output sitting next to the results.
-    assert (cache / "walk.npz").exists()
+    assert len(list(cache.glob("walk_*.npz"))) == 1
     assert not (out_dir / "walk.npz").exists()
 
 

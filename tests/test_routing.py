@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from valma_bike_and_walk.matrix import choose_chunk_size, summarise, travel_time_matrix
+from valma_bike_and_walk.matrix import summarise, travel_time_matrix
 from valma_bike_and_walk.network import RoutableNetwork
 
 from .conftest import make_network
@@ -79,12 +79,6 @@ def test_rejects_unsnapped_indices():
     net = make_network([(0, 1, 10.0)], 2)
     with pytest.raises(ValueError, match="non-negative"):
         travel_time_matrix(net, np.array([-1]), np.array([1]))
-
-
-def test_choose_chunk_size_respects_budget():
-    # 1e6 nodes at float64 = 8 MB per source, so a 64 MB budget allows 8.
-    assert choose_chunk_size(1_000_000, budget_bytes=64 * 1024**2) == 8
-    assert choose_chunk_size(10**9, budget_bytes=1024) >= 1
 
 
 def test_summarise_ignores_unreachable():

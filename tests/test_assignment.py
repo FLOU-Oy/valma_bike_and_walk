@@ -4,10 +4,9 @@ import numpy as np
 import pytest
 from scipy.sparse import csr_matrix
 
+from valma_bike_and_walk import routing
 from valma_bike_and_walk.assignment import (
     _as_demand_csr,
-    _edge_keys,
-    _solve_chunk,
     assign_traffic,
     assign_zone_traffic,
     expand_demand,
@@ -115,11 +114,8 @@ def test_multiple_workers_match_single_worker():
 
 
 def test_many_small_chunks_match_one_big_chunk():
-    # Regression test: chunk_size=1 forces one Dijkstra call (and, with
-    # workers=2, one process-pool task) per source -- the shape of thing that
-    # used to leak a full-network-sized array per chunk. Correctness across
-    # many chunks is the observable half of that fix (the memory bound isn't
-    # something a unit test can watch directly).
+    # chunk_size=1 makes every source its own task, so with workers=2 the
+    # sources are spread over threads whose volume arrays are summed at the end.
     rng = np.random.default_rng(1)
     n = 25
     edges = [(int(i), int(i + 1), float(rng.uniform(1, 10))) for i in range(n - 1)]
@@ -138,31 +134,23 @@ def test_many_small_chunks_match_one_big_chunk():
     np.testing.assert_allclose(one_chunk, many_chunks_parallel)
 
 
-def test_solve_chunk_returns_only_touched_edges():
+def test_aon_kernel_loads_only_the_shortest_path():
     net = make_network([(0, 1, 10.0), (1, 2, 10.0), (2, 3, 10.0), (0, 2, 100.0)], 4)
     demand = _as_demand_csr(np.array([[0.0, 0.0, 0.0, 5.0]]), 1, 4)
-    edge_keys = _edge_keys(net)
 
-    idx, vals, dropped, _ = _solve_chunk(
-        net.csr(),
-        np.array([0], dtype=np.int64),
-        np.arange(4, dtype=np.int64),
-        demand.data,
-        demand.indices,
+    volume, missed = routing.aon(
+        net.routing_graph(),
+        np.array([0]),
+        np.arange(4),
         demand.indptr,
-        0,
-        edge_keys,
-        net.n_nodes,
-        None,
-        net.n_edges,
+        demand.indices,
+        demand.data,
     )
 
-    # Only the 3 edges on the shortest path 0->1->2->3 were touched, not all
-    # 4 edges in the network (the untouched 0->2 shortcut is excluded).
-    assert idx.size == 3
-    assert vals.size == 3
-    np.testing.assert_allclose(vals, 5.0)
-    assert dropped == 0
+    # The 3 edges of 0->1->2->3 carry the demand; the 0->2 shortcut does not.
+    assert np.count_nonzero(volume) == 3
+    np.testing.assert_allclose(volume[volume > 0], 5.0)
+    assert not missed.any()
 
 
 def test_max_seconds_drops_far_pairs():

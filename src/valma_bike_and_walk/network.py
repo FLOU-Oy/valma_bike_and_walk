@@ -5,9 +5,17 @@ convenient at city scale and hopeless at country scale: Finland's walking
 network runs to millions of nodes, which costs tens of gigabytes as dicts and
 makes every shortest-path call slow.
 
-This module keeps the same information in a handful of numpy arrays plus a SciPy
-CSR matrix -- roughly two orders of magnitude smaller, and routable with SciPy's
-compiled Dijkstra instead of NetworkX's pure-Python one.
+This module keeps the same information in a handful of numpy arrays in CSR
+layout -- roughly two orders of magnitude smaller, and routable with the
+compiled kernels in :mod:`valma_bike_and_walk.routing` instead of NetworkX's
+pure-Python Dijkstra.
+
+Nodes are numbered along a Hilbert curve over their coordinates, so nodes that
+are close on the map are close in memory too. A search expands outwards through
+space, and this keeps the part of the arrays it is working on in cache. The
+graph is an internal format: the version number in each saved file says which
+layout it holds, and a file from another version is refused rather than
+reinterpreted.
 
 This is stage two of the pipeline. Its input is the link layer
 (:mod:`valma_bike_and_walk.links`), not the PBF: geometry, tags and every
@@ -18,10 +26,14 @@ here maps straight back onto the rows you edited.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
+import tempfile
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import geopandas as gpd
 import numpy as np
@@ -32,6 +44,18 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 
 from valma_bike_and_walk import links as links_module
+from valma_bike_and_walk import routing
+from valma_bike_and_walk.cache import (
+    code_digest,
+    dump_key,
+    file_stamp,
+    load_key,
+    make_key,
+    read_sidecar,
+    remove_sidecar,
+    stale_reason,
+    write_sidecar,
+)
 from valma_bike_and_walk.config import (
     PROJECTED_CRS,
     WGS84,
@@ -41,6 +65,39 @@ from valma_bike_and_walk.config import (
 from valma_bike_and_walk.osm import read_links, resolve_clip
 
 logger = logging.getLogger(__name__)
+
+#: Layout of a saved graph. Bump it whenever what the arrays mean changes --
+#: node order, edge order, which arrays exist -- so that a file written by
+#: another version is refused (see :class:`NetworkFormatError`) and a cached one
+#: is rebuilt, rather than either being read as if it were this one.
+FORMAT_VERSION = 2
+
+#: Bits per axis of the Hilbert key nodes are sorted by. 2**16 cells across
+#: Finland is about 20 m a cell -- far finer than it needs to be to keep
+#: neighbouring streets together.
+_HILBERT_BITS = 16
+
+
+class NetworkFormatError(ValueError):
+    """A saved graph is from a different version of this package."""
+
+
+#: Modules whose code decides what a graph built from a link layer looks like.
+#: A change to any of them makes every cached graph stale.
+BUILD_MODULES = (
+    "valma_bike_and_walk.config",
+    "valma_bike_and_walk.links",
+    "valma_bike_and_walk.network",
+    "valma_bike_and_walk.speeds",
+)
+
+#: The same, for a link layer extracted from a PBF.
+EXTRACT_MODULES = (
+    "valma_bike_and_walk.config",
+    "valma_bike_and_walk.links",
+    "valma_bike_and_walk.osm",
+    "valma_bike_and_walk.speeds",
+)
 
 
 @dataclass
@@ -61,9 +118,13 @@ class RoutableNetwork:
     #: +1 if the edge runs along the link's digitised direction, -1 against it.
     direction: np.ndarray  # int8
     crs: str = PROJECTED_CRS
+    #: What this graph was built from, as a JSON cache key (see
+    #: :mod:`valma_bike_and_walk.cache`); empty if nobody recorded it.
+    source_key: str = ""
 
     def __post_init__(self) -> None:
         self._tree: cKDTree | None = None
+        self._graph: routing.Graph | None = None
 
     @property
     def n_nodes(self) -> int:
@@ -73,19 +134,13 @@ class RoutableNetwork:
     def n_edges(self) -> int:
         return int(self.indices.shape[0])
 
-    def csr(self) -> csr_matrix:
-        """Adjacency weighted by travel time in seconds."""
-        return csr_matrix(
-            (self.travel_time, self.indices, self.indptr),
-            shape=(self.n_nodes, self.n_nodes),
-        )
-
-    def distance_csr(self) -> csr_matrix:
-        """Adjacency weighted by length in metres."""
-        return csr_matrix(
-            (self.length.astype(np.float64), self.indices, self.indptr),
-            shape=(self.n_nodes, self.n_nodes),
-        )
+    def routing_graph(self) -> routing.Graph:
+        """The arrays the routing kernels search, weighted by travel time. Built once."""
+        if self._graph is None:
+            self._graph = routing.Graph.from_csr(
+                self.indptr, self.indices, self.travel_time
+            )
+        return self._graph
 
     @property
     def tree(self) -> cKDTree:
@@ -116,24 +171,44 @@ class RoutableNetwork:
             idx = np.where(distances <= max_distance, idx, -1)
         return idx, distances
 
-    def save(self, path: Path) -> Path:
-        """Persist as a compressed .npz -- far smaller and faster than GraphML."""
+    def save(self, path: Path, compress: bool = True) -> Path:
+        """
+        Persist as an .npz -- far smaller and faster than GraphML.
+
+        ``compress=False`` trades disk for load time: a country-sized graph
+        takes seconds to decompress on every load, which is worth avoiding for a
+        cache that is read on every run and can be rebuilt at will.
+
+        Written to a temporary file and moved into place, so a run that dies
+        mid-write leaves the previous file (or none), never a truncated one.
+        """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            path,
-            mode=np.array(self.mode),
-            crs=np.array(self.crs),
-            node_ids=self.node_ids,
-            x=self.x,
-            y=self.y,
-            indptr=self.indptr,
-            indices=self.indices,
-            travel_time=self.travel_time,
-            length=self.length,
-            link_id=self.link_id,
-            direction=self.direction,
+        handle, tmp = tempfile.mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=path.parent
         )
+        try:
+            with os.fdopen(handle, "wb") as out:
+                (np.savez_compressed if compress else np.savez)(
+                    out,
+                    format_version=np.array(FORMAT_VERSION),
+                    mode=np.array(self.mode),
+                    crs=np.array(self.crs),
+                    source_key=np.array(self.source_key),
+                    node_ids=self.node_ids,
+                    x=self.x,
+                    y=self.y,
+                    indptr=self.indptr,
+                    indices=self.indices,
+                    travel_time=self.travel_time,
+                    length=self.length,
+                    link_id=self.link_id,
+                    direction=self.direction,
+                )
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
         logger.info("Saved network to %s (%.1f MB)", path, path.stat().st_size / 1e6)
         return path
 
@@ -141,9 +216,22 @@ class RoutableNetwork:
     def load(cls, path: Path) -> "RoutableNetwork":
         path = Path(path)
         with np.load(Path(path), allow_pickle=False) as data:
+            version = (
+                int(data["format_version"]) if "format_version" in data.files else 1
+            )
+            if version != FORMAT_VERSION:
+                raise NetworkFormatError(
+                    f"{path} is graph format {version}; this version of "
+                    f"valma_bike_and_walk needs format {FORMAT_VERSION}. Rebuild "
+                    "it with `valma build --links <links.gpkg> --mode "
+                    f"{str(data['mode'])}`."
+                )
             return cls(
                 mode=str(data["mode"]),
                 crs=str(data["crs"]),
+                source_key=(
+                    str(data["source_key"]) if "source_key" in data.files else ""
+                ),
                 node_ids=data["node_ids"],
                 x=data["x"],
                 y=data["y"],
@@ -229,9 +317,9 @@ def _build_csr(
     travel_time, length = travel_time[first], length[first]
     link_id, direction = link_id[first], direction[first]
 
-    # int32 throughout: SciPy wants indptr and indices to share a dtype, and a
-    # mismatch makes it silently copy both arrays -- which on a country-sized
-    # network is hundreds of megabytes we would rather not spend.
+    # int32 wherever it fits: a country-sized network has millions of edges, and
+    # every array here is saved, loaded and read by every routing thread. The
+    # routing kernels take the dtypes they are compiled for from routing.Graph.
     indptr = np.zeros(n_nodes + 1, dtype=np.int64)
     np.cumsum(np.bincount(u_idx, minlength=n_nodes), out=indptr[1:])
     index_dtype = np.int32 if indptr[-1] <= np.iinfo(np.int32).max else np.int64
@@ -342,6 +430,15 @@ def _assemble(mode: str, parts: list[_EdgeArrays]) -> RoutableNetwork:
 
     transformer = Transformer.from_crs(WGS84, PROJECTED_CRS, always_xy=True)
     x, y = transformer.transform(lon, lat)
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+
+    # Number nodes along a Hilbert curve, so that map neighbours are memory
+    # neighbours (see the module docstring).
+    order = hilbert_order(x, y)
+    node_ids, x, y = node_ids[order], x[order], y[order]
+    new_index = np.empty_like(order)
+    new_index[order] = np.arange(order.shape[0])
+    u_idx, v_idx = new_index[u_idx], new_index[v_idx]
 
     indptr, indices, travel_time, length, link_id, direction = _build_csr(
         u_idx, v_idx, travel_time, length, link_id, direction, len(node_ids)
@@ -356,8 +453,8 @@ def _assemble(mode: str, parts: list[_EdgeArrays]) -> RoutableNetwork:
         RoutableNetwork(
             mode=mode,
             node_ids=node_ids,
-            x=np.asarray(x, dtype=float),
-            y=np.asarray(y, dtype=float),
+            x=x,
+            y=y,
             indptr=indptr,
             indices=indices,
             travel_time=travel_time,
@@ -367,6 +464,46 @@ def _assemble(mode: str, parts: list[_EdgeArrays]) -> RoutableNetwork:
         ),
         keep,
     )
+
+
+def _hilbert_keys(ix: np.ndarray, iy: np.ndarray, bits: int) -> np.ndarray:
+    """
+    Distance along a Hilbert curve of integer grid cells ``(ix, iy)``.
+
+    The classic bit-twiddling form, vectorised over every point at once: one
+    pass per bit level, rotating each quadrant into the orientation the curve
+    enters it in.
+    """
+    x = ix.astype(np.int64).copy()
+    y = iy.astype(np.int64).copy()
+    key = np.zeros(x.shape[0], dtype=np.int64)
+    side = 1 << bits
+    s = side >> 1
+    while s > 0:
+        rx = (x & s) > 0
+        ry = (y & s) > 0
+        key += s * s * ((3 * rx) ^ ry)
+        # Rotate the lower quadrants so the curve inside them lines up.
+        flip = ~ry & rx
+        x = np.where(flip, side - 1 - x, x)
+        y = np.where(flip, side - 1 - y, y)
+        swap = ~ry
+        x, y = np.where(swap, y, x), np.where(swap, x, y)
+        s >>= 1
+    return key
+
+
+def hilbert_order(
+    x: np.ndarray, y: np.ndarray, bits: int = _HILBERT_BITS
+) -> np.ndarray:
+    """Permutation that sorts points along a Hilbert curve over their bounding box."""
+    if x.shape[0] == 0:
+        return np.zeros(0, dtype=np.int64)
+    cells = (1 << bits) - 1
+    span = max(float(np.ptp(x)), float(np.ptp(y)), 1e-9)
+    ix = np.floor((x - x.min()) / span * cells).astype(np.int64)
+    iy = np.floor((y - y.min()) / span * cells).astype(np.int64)
+    return np.argsort(_hilbert_keys(ix, iy, bits), kind="stable")
 
 
 def network_from_links(links: gpd.GeoDataFrame, mode: str) -> RoutableNetwork:
@@ -385,6 +522,171 @@ def network_from_links(links: gpd.GeoDataFrame, mode: str) -> RoutableNetwork:
     return network
 
 
+def stored_network_key(path: Path | str) -> dict[str, Any] | None:
+    """
+    The cache key a saved network was built with, without loading the network.
+
+    An ``.npz`` is a zip of separately compressed arrays, so this decompresses
+    one short string, not the graph. A file that cannot be read at all -- or one
+    saved before keys were recorded -- has no key, which makes it stale.
+    """
+    try:
+        with np.load(Path(path), allow_pickle=False) as data:
+            if "source_key" not in data.files:
+                return None
+            return load_key(str(data["source_key"]))
+    except (OSError, ValueError, EOFError, zipfile.BadZipFile):
+        return None
+
+
+def links_network_key(
+    links_path: Path | str,
+    mode: str,
+    connectors_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """What a graph built from ``links_path`` depends on, as it stands now."""
+    parts: dict[str, Any] = {}
+    if connectors_path is not None:
+        # Only present when given, so graphs without connectors keep their key.
+        parts["connectors"] = file_stamp(connectors_path)
+    return make_key(
+        "network",
+        format=FORMAT_VERSION,
+        mode=mode,
+        links=file_stamp(links_path),
+        code=code_digest(*BUILD_MODULES),
+        **parts,
+    )
+
+
+def network_for_links(
+    links_path: Path | str,
+    mode: str,
+    network_path: Path | str,
+    force_reload: bool = False,
+    links: gpd.GeoDataFrame | None = None,
+    compress: bool = False,
+    connectors_path: Path | str | None = None,
+) -> RoutableNetwork:
+    """
+    The graph for a link layer: from ``network_path`` if it is current, else built.
+
+    ``connectors_path`` is a connector layer appended to the link layer before
+    the build; it is part of what the graph is current against.
+
+    ``compress`` is for a graph meant to be kept (``valma build``); a cache is
+    left uncompressed, because it is loaded on every run and is disposable.
+
+    "Current" means built from this very version of the link layer, by this
+    version of the build code -- see :mod:`valma_bike_and_walk.cache`. Edit the
+    layer in QGIS, add elevation or car volumes to it, or change a speed profile,
+    and the next call rebuilds rather than routing on the graph from before.
+
+    ``links`` may hand over the layer already in memory, when the caller has
+    just written it to ``links_path``, to save reading it straight back.
+    """
+    validate_mode(mode)
+    links_path = Path(links_path)
+    network_path = Path(network_path)
+    # Stamp before reading, so an edit saved mid-build leaves us stale, not wrong.
+    key = links_network_key(links_path, mode, connectors_path)
+
+    if network_path.exists() and not force_reload:
+        reason = stale_reason(stored_network_key(network_path), key)
+        if reason is None:
+            logger.info("Loading network from %s", network_path)
+            return RoutableNetwork.load(network_path)
+        logger.info("Rebuilding %s: %s", network_path, reason)
+
+    if links is None:
+        links = links_module.read_links(links_path)
+    if connectors_path is not None:
+        from valma_bike_and_walk.connectors import merge_connectors
+
+        links = merge_connectors(links, links_module.read_links(connectors_path))
+    network = network_from_links(links, mode)
+    network.source_key = dump_key(key)
+    network.save(network_path, compress=compress)
+    return network
+
+
+def _extract_key(
+    settings: Settings,
+    mode: str,
+    clip: shapely.Geometry | None,
+    extent_key: str,
+) -> dict[str, Any]:
+    """What a link layer extracted from the PBF depends on."""
+    return make_key(
+        "links",
+        mode=mode,
+        extent=extent_key,
+        # A named area resolves to whatever boundary the PBF holds, so the key
+        # follows the geometry rather than just the name.
+        clip=(
+            None
+            if clip is None
+            else hashlib.blake2b(shapely.to_wkb(clip), digest_size=16).hexdigest()
+        ),
+        pbf=file_stamp(settings.require_pbf()),
+        code=code_digest(*EXTRACT_MODULES),
+    )
+
+
+def _ensure_links(
+    settings: Settings,
+    mode: str,
+    area: str | None,
+    bbox: Sequence[float] | None,
+    force_reload: bool,
+    links_path: Path | None,
+) -> tuple[Path, gpd.GeoDataFrame | None]:
+    """
+    Make sure the link layer exists and is current, without reading it if so.
+
+    Returns its path, and the layer itself when this call had to extract it --
+    None when what was on disk could be reused, and so has not been read.
+
+    Two kinds of layer are treated differently on purpose. One under
+    ``--cache-dir`` is ours: keyed on the PBF, the extent and the extract code,
+    and re-extracted whenever any of them changes. One at an explicit
+    ``links_path`` is the user's -- possibly hours of QGIS edits -- so an
+    existing file there is never overwritten without ``force_reload``.
+    """
+    clip, extent_key = resolve_clip(settings, area, bbox, force_reload)
+
+    if links_path is not None:
+        path = Path(links_path)
+        if path.exists() and not force_reload:
+            return path, None
+        links = links_module.annotate(read_links(settings, mode, clip), mode)
+        links_module.write_links(links, path)
+        return path, links
+
+    path = settings.links_cache_path(mode, extent_key)
+    if path.exists() and not force_reload:
+        if not settings.require_pbf().exists():
+            logger.warning(
+                "%s is gone; reusing %s without being able to check it is current",
+                settings.pbf_path,
+                path,
+            )
+            return path, None
+        key = _extract_key(settings, mode, clip, extent_key)
+        reason = stale_reason(read_sidecar(path), key)
+        if reason is None:
+            return path, None
+        logger.info("Re-extracting %s: %s", path, reason)
+    else:
+        key = _extract_key(settings, mode, clip, extent_key)
+
+    remove_sidecar(path)
+    links = links_module.annotate(read_links(settings, mode, clip), mode)
+    links_module.write_links(links, path)
+    write_sidecar(path, key)
+    return path, links
+
+
 def build_links(
     settings: Settings,
     mode: str,
@@ -399,21 +701,19 @@ def build_links(
     Returns the GeoPackage's path alongside the layer, so a caller that only
     wanted the file can ignore the frame and one that wants to keep building can
     skip reading it back.
+
+    Without ``links_path`` the layer is a cache under ``settings.cache_dir``,
+    re-extracted whenever the PBF, the extent or the extract code changes. With
+    one, an existing file there is the user's and is reused as it stands unless
+    ``force_reload`` is given.
     """
     validate_mode(mode)
     settings.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    clip, extent_key = resolve_clip(settings, area, bbox, force_reload)
-    path = (
-        Path(links_path) if links_path else settings.links_cache_path(mode, extent_key)
-    )
-
-    if path.exists() and not force_reload:
+    path, links = _ensure_links(settings, mode, area, bbox, force_reload, links_path)
+    if links is None:
         logger.info("Loading links from %s", path)
-        return path, links_module.read_links(path)
-
-    links = links_module.annotate(read_links(settings, mode, clip), mode)
-    links_module.write_links(links, path)
+        links = links_module.read_links(path)
     return path, links
 
 
@@ -428,27 +728,24 @@ def build_network(
     """
     Build (or load from cache) a routable network for one mode, PBF to graph.
 
-    Both stages are cached: the link GeoPackage from stage one and the ``.npz``
-    from stage two. Edit the GeoPackage between the two -- or point
-    ``links_path`` at your own edited copy -- and delete the ``.npz`` (or pass
-    ``force_reload``) to have the edits taken up.
+    Both stages are cached -- the link GeoPackage from stage one and the
+    ``.npz`` from stage two -- and each is rebuilt by itself once what it was
+    built from changes: a new PBF re-extracts the layer, and a changed layer
+    (re-extracted, or edited at ``links_path``) rebuilds the graph. Nothing has
+    to be deleted by hand; ``force_reload`` rebuilds both regardless.
     """
     validate_mode(mode)
     settings.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    _, extent_key = resolve_clip(settings, area, bbox, force_reload)
-    cache_path = settings.network_cache_path(mode, extent_key)
-
-    if cache_path.exists() and not force_reload:
-        logger.info("Loading network from cache: %s", cache_path)
-        return RoutableNetwork.load(cache_path)
-
-    _, links = build_links(
-        settings, mode, area, bbox, force_reload, links_path=links_path
+    path, links = _ensure_links(settings, mode, area, bbox, force_reload, links_path)
+    _, extent_key = resolve_clip(settings, area, bbox)
+    return network_for_links(
+        path,
+        mode,
+        settings.network_cache_path(mode, extent_key),
+        force_reload=force_reload,
+        links=links,
     )
-    network = network_from_links(links, mode)
-    network.save(cache_path)
-    return network
 
 
 def _subset(network: RoutableNetwork, keep: np.ndarray) -> RoutableNetwork:

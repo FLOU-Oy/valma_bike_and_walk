@@ -1,14 +1,9 @@
 """Origin-destination travel-time matrices.
 
-The whole point of this module is that an OD matrix over many origins is a
-sequence of single-source shortest-path runs, and the only two things that
-matter at scale are how fast one run is and how much memory a batch of them
-holds.
-
-SciPy's Dijkstra returns a dense ``(n_sources, n_nodes)`` block, which for a
-country-sized network is gigabytes if you ask for too many sources at once. So
-sources are processed in chunks sized from a memory budget, and each chunk is
-immediately narrowed to the destination columns we actually want.
+An OD matrix over many origins is a sequence of single-source shortest-path
+searches, one per origin. The searches themselves are the compiled kernels in
+:mod:`valma_bike_and_walk.routing`; this module decides what to search from,
+how far, and what a row of the result means.
 
 Two entry points, differing in what a row of the result means:
 
@@ -26,24 +21,17 @@ from __future__ import annotations
 
 import logging
 import os
-import tempfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from pathlib import Path
-from typing import Iterator, Sequence
+from typing import Sequence
 
 import numpy as np
 import numpy.typing as npt
-from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import dijkstra
 
+from valma_bike_and_walk import routing
 from valma_bike_and_walk.network import RoutableNetwork
 from valma_bike_and_walk.speeds import SECONDS_PER_HOUR, profile_for
 from valma_bike_and_walk.zones import Zones
 
 logger = logging.getLogger(__name__)
-
-#: How much memory one chunk's dense distance block may occupy.
-DEFAULT_CHUNK_BYTES = 256 * 1024**2
 
 #: How much of a zone pair's weight has to be reachable for the near tier of a
 #: two-tier run to be trusted. A cell where only the closest access-point pairs
@@ -60,62 +48,15 @@ _REACHABLE_TOLERANCE = 1e-9
 #: "equal-area circle" intrazonal estimate.
 _DISC_MEAN_DISTANCE = 128.0 / (45.0 * np.pi)
 
-# Set once per worker process by _init_worker.
-_WORKER_STATE: dict[str, object] = {}
 
-
-def choose_chunk_size(n_nodes: int, budget_bytes: int = DEFAULT_CHUNK_BYTES) -> int:
-    """Largest number of sources whose dense distance block fits the budget."""
-    per_source = max(1, n_nodes * 8)  # SciPy always returns float64
-    return int(max(1, min(n_nodes, budget_bytes // per_source)))
-
-
-def _chunks(values: np.ndarray, size: int) -> Iterator[np.ndarray]:
-    for start in range(0, values.shape[0], size):
-        yield values[start : start + size]
-
-
-def _solve_chunk(
-    graph: csr_matrix,
-    sources: np.ndarray,
-    targets: np.ndarray,
-    max_seconds: float | None,
-    dtype: np.dtype,
-) -> np.ndarray:
-    distances = dijkstra(
-        graph,
-        directed=True,
-        indices=sources,
-        limit=np.inf if max_seconds is None else max_seconds,
+def _log_workspace(network: RoutableNetwork, workers: int, flow: bool = False) -> None:
+    per_thread = routing.workspace_bytes(network.n_nodes, network.n_edges, flow=flow)
+    logger.info(
+        "Routing scratch space: %.0f MB per worker, %.1f GB for %d worker(s)",
+        per_thread / 1e6,
+        per_thread * max(1, workers) / 1e9,
+        max(1, workers),
     )
-    return np.ascontiguousarray(distances[:, targets], dtype=dtype)
-
-
-def _init_worker(cache_dir: str, shape: tuple[int, int]) -> None:
-    """
-    Rebuild the CSR in a worker from memory-mapped arrays.
-
-    Memory-mapping rather than pickling matters on Windows, where every worker
-    is a fresh process: the OS pages one shared read-only copy of the network in
-    instead of each worker inflating its own.
-    """
-    base = Path(cache_dir)
-    indptr = np.load(base / "indptr.npy", mmap_mode="r")
-    indices = np.load(base / "indices.npy", mmap_mode="r")
-    data = np.load(base / "data.npy", mmap_mode="r")
-    _WORKER_STATE["graph"] = csr_matrix(
-        (data, indices, indptr), shape=shape, copy=False
-    )
-
-
-def _worker_solve(
-    sources: np.ndarray,
-    targets: np.ndarray,
-    max_seconds: float | None,
-    dtype_name: str,
-) -> np.ndarray:
-    graph = _WORKER_STATE["graph"]
-    return _solve_chunk(graph, sources, targets, max_seconds, np.dtype(dtype_name))
 
 
 def travel_time_matrix(
@@ -138,13 +79,13 @@ def travel_time_matrix(
     - max_seconds: stop expanding beyond this travel time. Anything further away
       comes back as infinity. On a big network this is by far the cheapest way
       to speed the whole thing up, if your analysis has a cutoff anyway.
-    - workers: processes to spread source chunks over. 1 keeps it in-process.
-    - chunk_size: sources per Dijkstra call; defaults to a 256 MB block.
+    - workers: threads to spread the sources over.
+    - chunk_size: sources per task handed to a thread; sized automatically.
 
     Returns an ``(len(sources), len(targets))`` array; unreachable pairs are inf.
     """
-    sources = np.asarray(sources, dtype=np.int32)
-    targets = sources if targets is None else np.asarray(targets, dtype=np.int32)
+    sources = np.asarray(sources, dtype=np.int64)
+    targets = sources if targets is None else np.asarray(targets, dtype=np.int64)
     dtype = np.dtype(dtype)
 
     if sources.size == 0 or targets.size == 0:
@@ -156,159 +97,27 @@ def travel_time_matrix(
     if sources.max() >= network.n_nodes or targets.max() >= network.n_nodes:
         raise ValueError("Node index out of range for this network.")
 
-    if chunk_size is None:
-        chunk_size = choose_chunk_size(network.n_nodes)
-    n_chunks = int(np.ceil(sources.size / chunk_size))
-
     logger.info(
-        "OD matrix %d x %d over %d nodes: %d chunks of <=%d sources, %d worker(s)",
+        "OD matrix %d x %d over %d nodes, %d worker(s)",
         sources.size,
         targets.size,
         network.n_nodes,
-        n_chunks,
-        chunk_size,
         workers,
     )
+    _log_workspace(network, workers)
 
     result = np.empty((sources.size, targets.size), dtype=dtype)
-
-    if workers <= 1:
-        graph = network.csr()
-        for i, chunk in enumerate(_chunks(sources, chunk_size)):
-            start = i * chunk_size
-            result[start : start + chunk.size] = _solve_chunk(
-                graph, chunk, targets, max_seconds, dtype
-            )
-            if progress_every and (i + 1) % progress_every == 0:
-                logger.info("  %d/%d chunks", i + 1, n_chunks)
-        return result
-
-    with tempfile.TemporaryDirectory(prefix="valma-od-") as tmp:
-        base = Path(tmp)
-        np.save(base / "indptr.npy", network.indptr)
-        np.save(base / "indices.npy", network.indices)
-        np.save(base / "data.npy", network.travel_time)
-        shape = (network.n_nodes, network.n_nodes)
-
-        offsets = list(range(0, sources.size, chunk_size))
-        with ProcessPoolExecutor(
-            max_workers=workers,
-            initializer=_init_worker,
-            initargs=(str(base), shape),
-        ) as pool:
-            futures = {
-                pool.submit(
-                    _worker_solve,
-                    sources[start : start + chunk_size],
-                    targets,
-                    max_seconds,
-                    dtype.name,
-                ): start
-                for start in offsets
-            }
-            # Pop each future as it's consumed (and iterate as-completed
-            # rather than submission order) so a finished chunk's block is
-            # freed once it's copied into `result`, instead of every
-            # completed future -- and the block inside it -- staying alive
-            # in `futures` until the very last chunk finishes.
-            done = 0
-            for future in as_completed(futures):
-                start = futures.pop(future)
-                block = future.result()
-                result[start : start + block.shape[0]] = block
-                done += 1
-                if progress_every and done % progress_every == 0:
-                    logger.info("  %d/%d chunks", done, n_chunks)
-
+    routing.point_matrix(
+        network.routing_graph(),
+        sources,
+        targets,
+        result,
+        limit=max_seconds,
+        workers=workers,
+        chunk_size=chunk_size,
+        progress_every=progress_every,
+    )
     return result
-
-
-def _solve_zone_chunk(
-    graph: csr_matrix,
-    source_nodes: np.ndarray,
-    source_access: np.ndarray,
-    source_weight: np.ndarray,
-    source_starts: np.ndarray,
-    target_nodes: np.ndarray,
-    target_access: np.ndarray,
-    target_weight: np.ndarray,
-    target_starts: np.ndarray,
-    max_seconds: float | None,
-    decay_mu: float | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    One chunk of whole zones: Dijkstra, then reduce point pairs to zone pairs.
-
-    Returns the numerator and denominator of the weighted mean, both
-    ``(zones_in_chunk, n_zones)``, rather than the mean itself -- the two have
-    to be summed across chunks separately, and keeping them apart is also what
-    makes the reachability bookkeeping work: the denominator *is* the weight of
-    the access-point pairs that came back inside the cutoff.
-
-    The reduction is two ``reduceat`` passes, not a matmul, because every access
-    point belongs to exactly one zone and the points are stored sorted by zone.
-    That makes the zone-weight "matrix" a segment sum: contiguous column groups
-    collapse to one column each, then contiguous row groups to one row each.
-    """
-    distance = dijkstra(
-        graph,
-        directed=True,
-        indices=source_nodes,
-        limit=np.inf if max_seconds is None else max_seconds,
-    )
-    block = distance[:, target_nodes]
-    block += source_access[:, None]
-    block += target_access[None, :]
-
-    # inf marks "not reached within the cutoff". exp(-mu * inf) is 0 rather than
-    # a warning, but mask explicitly anyway so both branches read the same.
-    finite = np.isfinite(block)
-    value = block if decay_mu is None else np.exp(-decay_mu * block)
-    value = np.where(finite, value, 0.0)
-
-    weighted = value * target_weight[None, :]
-    reached = np.where(finite, target_weight[None, :], 0.0)
-
-    numerator = np.add.reduceat(weighted, target_starts, axis=1)
-    denominator = np.add.reduceat(reached, target_starts, axis=1)
-    numerator *= source_weight[:, None]
-    denominator *= source_weight[:, None]
-
-    return (
-        np.add.reduceat(numerator, source_starts, axis=0),
-        np.add.reduceat(denominator, source_starts, axis=0),
-    )
-
-
-def _init_zone_worker(cache_dir: str, shape: tuple[int, int]) -> None:
-    """Like :func:`_init_worker`, plus the destination side, which every chunk shares."""
-    _init_worker(cache_dir, shape)
-    base = Path(cache_dir)
-    for name in ("target_nodes", "target_access", "target_weight", "target_starts"):
-        _WORKER_STATE[name] = np.load(base / f"{name}.npy", mmap_mode="r")
-
-
-def _worker_zone_solve(
-    source_nodes: np.ndarray,
-    source_access: np.ndarray,
-    source_weight: np.ndarray,
-    source_starts: np.ndarray,
-    max_seconds: float | None,
-    decay_mu: float | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    return _solve_zone_chunk(
-        _WORKER_STATE["graph"],  # type: ignore[arg-type]
-        source_nodes,
-        source_access,
-        source_weight,
-        source_starts,
-        _WORKER_STATE["target_nodes"],  # type: ignore[arg-type]
-        _WORKER_STATE["target_access"],  # type: ignore[arg-type]
-        _WORKER_STATE["target_weight"],  # type: ignore[arg-type]
-        _WORKER_STATE["target_starts"],  # type: ignore[arg-type]
-        max_seconds,
-        decay_mu,
-    )
 
 
 def _accumulate_zone_matrix(
@@ -320,14 +129,20 @@ def _accumulate_zone_matrix(
     chunk_size: int | None,
     progress_every: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Run every zone's access points as sources and sum the chunk reductions."""
+    """
+    Run every zone's access points as sources and sum their weighted terms.
+
+    Returns the numerator and denominator of the weighted mean, both
+    ``(n_zones, n_zones)``, rather than the mean itself: the denominator *is*
+    the weight of the access-point pairs that came back inside the cutoff,
+    which is what the reachability bookkeeping needs.
+    """
     n = zones.n_zones
     numerator = np.zeros((n, n), dtype=np.float64)
     denominator = np.zeros((n, n), dtype=np.float64)
 
-    if chunk_size is None:
-        chunk_size = choose_chunk_size(network.n_nodes)
-    ranges = list(zones.chunk_ranges(chunk_size))
+    points_per_task = routing.task_size(zones.n_points, workers, chunk_size)
+    ranges = list(zones.chunk_ranges(points_per_task))
     logger.info(
         "Zone OD matrix %d x %d from %d access point(s) over %d nodes: "
         "%d chunks of <=%d points, %d worker(s)",
@@ -336,76 +151,27 @@ def _accumulate_zone_matrix(
         zones.n_points,
         network.n_nodes,
         len(ranges),
-        chunk_size,
+        points_per_task,
         workers,
     )
+    _log_workspace(network, workers)
 
-    indptr = zones.indptr
-    target_starts = indptr[:-1]
-
-    def chunk_args(
-        lo: int, hi: int
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """This chunk's source nodes, access times, weights and row offsets."""
-        first, last = int(indptr[lo]), int(indptr[hi])
-        return (
-            zones.node_index[first:last],
-            zones.access_seconds[first:last],
-            zones.weight[first:last],
-            indptr[lo:hi] - first,
-        )
-
-    if workers <= 1:
-        graph = network.csr()
-        for done, (lo, hi) in enumerate(ranges, start=1):
-            num, den = _solve_zone_chunk(
-                graph,
-                *chunk_args(lo, hi),
-                zones.node_index,
-                zones.access_seconds,
-                zones.weight,
-                target_starts,
-                max_seconds,
-                decay_mu,
-            )
-            numerator[lo:hi] += num
-            denominator[lo:hi] += den
-            if progress_every and done % progress_every == 0:
-                logger.info("  %d/%d chunks", done, len(ranges))
-        return numerator, denominator
-
-    with tempfile.TemporaryDirectory(prefix="valma-zone-od-") as tmp:
-        base = Path(tmp)
-        np.save(base / "indptr.npy", network.indptr)
-        np.save(base / "indices.npy", network.indices)
-        np.save(base / "data.npy", network.travel_time)
-        np.save(base / "target_nodes.npy", zones.node_index)
-        np.save(base / "target_access.npy", zones.access_seconds)
-        np.save(base / "target_weight.npy", zones.weight)
-        np.save(base / "target_starts.npy", target_starts)
-        shape = (network.n_nodes, network.n_nodes)
-
-        with ProcessPoolExecutor(
-            max_workers=workers,
-            initializer=_init_zone_worker,
-            initargs=(str(base), shape),
-        ) as pool:
-            futures = {
-                pool.submit(
-                    _worker_zone_solve, *chunk_args(lo, hi), max_seconds, decay_mu
-                ): (lo, hi)
-                for lo, hi in ranges
-            }
-            done = 0
-            for future in as_completed(futures):
-                lo, hi = futures.pop(future)
-                num, den = future.result()
-                numerator[lo:hi] += num
-                denominator[lo:hi] += den
-                done += 1
-                if progress_every and done % progress_every == 0:
-                    logger.info("  %d/%d chunks", done, len(ranges))
-
+    routing.zone_sums(
+        network.routing_graph(),
+        routing.AccessPoints(
+            indptr=zones.indptr,
+            node=zones.node_index,
+            access=zones.access_seconds,
+            weight=zones.weight,
+        ),
+        ranges,
+        numerator,
+        denominator,
+        limit=max_seconds,
+        decay_mu=decay_mu,
+        workers=workers,
+        progress_every=progress_every,
+    )
     return numerator, denominator
 
 
