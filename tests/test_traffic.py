@@ -123,7 +123,7 @@ def test_a_motorway_missing_from_the_network_does_not_load_the_road_beside_it():
 
     matched, match = add_volumes(links, volumes)
 
-    assert volume_of(matched, 0) == 50
+    assert volume_of(matched, 0) == 25
     assert not match.source_used.any()
     assert match.source_coverage[0] == pytest.approx(0.25, abs=0.06)
 
@@ -182,7 +182,7 @@ def test_a_road_crossing_at_a_right_angle_takes_none_of_the_volume():
     matched, _ = add_volumes(links, volumes)
 
     assert volume_of(matched, 0) == 9000 / 16
-    assert volume_of(matched, 1) == 50
+    assert volume_of(matched, 1) == 25
 
 
 def test_a_source_further_off_than_the_tolerance_matches_nothing():
@@ -199,7 +199,7 @@ def test_a_source_further_off_than_the_tolerance_matches_nothing():
     matched, match = add_volumes(links, volumes)
 
     assert match.source_in_extent.all()
-    assert matched[VOLUME_COLUMN].tolist() == [2000, 2000]
+    assert matched[VOLUME_COLUMN].tolist() == [500, 500]
 
 
 def test_a_source_layer_covering_the_whole_country_is_not_all_a_failed_match():
@@ -400,15 +400,15 @@ def test_unmatched_car_links_get_highway_default_volumes():
 
     assert matched[VOLUME_COLUMN].iloc[:10].tolist() == [
         12000.0 / 16,
-        2000.0,
-        750.0,
-        750.0,
-        50.0,
-        250.0,
-        50.0,
-        50.0,
-        50.0,
-        50.0,
+        500.0,
+        100.0,
+        100.0,
+        25.0,
+        25.0,
+        25.0,
+        25.0,
+        25.0,
+        25.0,
     ]
     assert np.isnan(matched[VOLUME_COLUMN].iloc[10])
 

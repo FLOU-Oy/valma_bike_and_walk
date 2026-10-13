@@ -102,11 +102,11 @@ def test_steps_are_slow_for_both_modes():
 
 
 def test_travel_time_matches_hand_calculation():
-    # 1000 m of cycleway at 20 km/h = 180 s
+    # 1000 m of cycleway at 18 km/h = 200 s
     seconds = BIKE_PROFILE.travel_times_seconds(
         np.array([1000.0]), pd.Series(["cycleway"]), pd.Series(["asphalt"])
     )
-    assert seconds[0] == pytest.approx(1000 / (20 * 1000 / 3600))
+    assert seconds[0] == pytest.approx(1000 / (18 * 1000 / 3600))
 
 
 def test_profile_lookup_rejects_unknown_mode():
