@@ -55,8 +55,11 @@ which `-c` reads back.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import logging
 import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -66,10 +69,10 @@ import numpy as np
 from valma_bike_and_walk import config_file
 from valma_bike_and_walk import links as links_module
 from valma_bike_and_walk.assignment import (
-    assign_traffic,
     select_link_assignment,
     assign_zone_traffic,
     link_volume_frame,
+    trip_length_assignment,
 )
 from valma_bike_and_walk.assignment import summarise as summarise_assignment
 from valma_bike_and_walk.cache import file_stamp, load_key
@@ -151,6 +154,7 @@ from valma_bike_and_walk.zones import (
     load_zones,
     zone_points_frame,
 )
+from valma_bike_and_walk.vector_io import write_vector
 
 logger = logging.getLogger("valma_bike_and_walk")
 
@@ -611,7 +615,7 @@ def cmd_traffic(args: argparse.Namespace) -> int:
 
     if args.unmatched_out is not None:
         missed = unmatched_sources(volumes, match)
-        missed.to_file(args.unmatched_out, driver="GPKG", layer="unmatched")
+        write_vector(missed, args.unmatched_out, driver="GPKG", layer="unmatched")
         print(
             f"  {len(missed):,} unmatched source link(s) -> {args.unmatched_out} "
             "(mostly roads the bike network drops, such as motorways)"
@@ -652,8 +656,8 @@ def _analysis_points(
         )
         if args.zone_points_gpkg is not None:
             args.zone_points_gpkg.parent.mkdir(parents=True, exist_ok=True)
-            zone_points_frame(zones).to_file(
-                args.zone_points_gpkg, layer="zone_points", driver="GPKG"
+            write_vector(
+                zone_points_frame(zones), args.zone_points_gpkg, layer="zone_points", driver="GPKG"
             )
             print(
                 f"Wrote {args.zone_points_gpkg} "
@@ -812,7 +816,7 @@ def cmd_assign(args: argparse.Namespace) -> int:
             chunk_size=args.chunk_size,
         )
     else:
-        link_volume = assign_traffic(
+        link_volume, trip_lengths = trip_length_assignment(
             network,
             points.node_index,
             demand,
@@ -820,6 +824,8 @@ def cmd_assign(args: argparse.Namespace) -> int:
             workers=args.workers,
             chunk_size=args.chunk_size,
         )
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        _write_trip_lengths(args, points, trip_lengths)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     frame = link_volume_frame(network, link_volume)
@@ -856,6 +862,34 @@ def cmd_assign(args: argparse.Namespace) -> int:
     if select_demand is not None:
         _write_select_link(args, network, points, select_demand, select_flow)
     return 0
+
+
+def _write_trip_lengths(args: argparse.Namespace, points: Centroids, trips) -> None:
+    """
+    ``trip_lengths_<mode>.npz``: every OD pair's demand and network length.
+
+    Zone ids rather than positions, so ``valma view`` can group trips by where
+    they start. Intrazonal pairs are kept, at length 0, for it to estimate.
+    """
+    ids = np.asarray(points.ids)
+    out = args.output_dir / f"trip_lengths_{args.mode}.npz"
+    np.savez_compressed(
+        out,
+        origin=ids[trips.origin],
+        destination=ids[trips.destination],
+        demand=trips.demand,
+        length_m=trips.length_m.astype(np.float32),
+    )
+    reached = np.isfinite(trips.length_m)
+    total = float(trips.demand.sum())
+    mean = float((trips.demand * np.where(reached, trips.length_m, 0)).sum()) / max(
+        float(trips.demand[reached].sum()), 1e-12
+    )
+    print(
+        f"Wrote {out} ({trips.demand.size:,} OD pairs; mean network length "
+        f"{mean / 1000:.2f} km over {float(trips.demand[reached].sum()):,.0f} of "
+        f"{total:,.0f} trips)"
+    )
 
 
 def _write_select_link(
@@ -895,7 +929,7 @@ def _write_select_link(
     )
     zones = zones[zones["total"] > 0].sort_values("total", ascending=False)
     zones_path = args.output_dir / f"{stem}_zones.gpkg"
-    zones.to_file(zones_path, layer="zones", driver="GPKG")
+    write_vector(zones, zones_path, layer="zones", driver="GPKG")
 
     # Where the selected link's trips go: loaded in the same pass as the rest.
     flow_path = args.output_dir / f"{stem}.gpkg"
@@ -951,6 +985,48 @@ def cmd_view(args: argparse.Namespace) -> int:
     data = ViewerData(links, mode, runs)
     if args.count_lines.exists() and args.observed.exists():
         data.counters = load_counters(data, args.count_lines, args.observed)
+    if args.municipalities is not None and args.municipalities.exists():
+        from valma_bike_and_walk.viewer.municipalities import load_municipalities
+
+        data.municipalities = load_municipalities(
+            links, args.municipalities, args.municipality_column, cache
+        )
+        print(f"  municipalities: {len(data.municipalities.names)}")
+        share_demand = args.share_demand
+        if share_demand is None and args.demand is not None and args.demand.suffix == ".omx":
+            share_demand = args.demand
+        if share_demand is not None:
+            from valma_bike_and_walk.viewer.municipalities import load_trip_shares
+
+            load_trip_shares(
+                data.municipalities,
+                share_demand,
+                args.demand_matrix or mode,
+                args.demand_mapping,
+                args.municipalities,
+                args.municipality_zone_column,
+                args.municipality_column,
+                cache,
+            )
+            share = data.municipalities.mode_trips.sum() / data.municipalities.all_trips.sum()
+            print(f"  {mode} share of trips: {share:.1%} (from {share_demand.name})")
+        from valma_bike_and_walk.viewer.trip_lengths import (
+            TripLengthGroups,
+            load_regions,
+            load_zone_table,
+        )
+
+        regions = {}
+        if args.regions is not None and args.regions.exists():
+            regions = load_regions(args.regions)
+            print(f"  regions: {len(set(regions.values()))} (from {args.regions.name})")
+        data.trip_lengths = TripLengthGroups(
+            load_zone_table(
+                args.municipalities, args.municipality_zone_column, args.municipality_column
+            ),
+            data.municipalities.names,
+            regions,
+        )
     from valma_bike_and_walk.viewer.route import Router
 
     network = _view_network(args, mode)
@@ -1649,6 +1725,48 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("output/bicycle_counter_annual_averages.csv"),
         help="Observed counter averages (default: %(default)s, if present).",
     )
+    view.add_argument(
+        "--municipalities",
+        type=Path,
+        default=Path("data/2023_zonedata--dev-template.gpkg"),
+        help=(
+            "Polygons naming their municipality, for the per-municipality speed "
+            "table: the municipalities themselves or finer zones "
+            "(default: %(default)s, if present)."
+        ),
+    )
+    view.add_argument(
+        "--municipality-column",
+        default="municipality",
+        help="Column of --municipalities holding the name (default: %(default)s).",
+    )
+    view.add_argument(
+        "--share-demand",
+        type=Path,
+        help=(
+            "OMX file with a demand matrix per mode, for each municipality's "
+            "modal share and its fit against the cycling speed (default: "
+            "--demand, if it is an OMX file). The mode's matrix is "
+            "--demand-matrix, or the mode's name."
+        ),
+    )
+    view.add_argument(
+        "--regions",
+        type=Path,
+        default=Path("data/hlt2016_regions.csv"),
+        help=(
+            "CSV of municipality;region, for trip lengths by region "
+            "(default: %(default)s, the HLT 2016 regional reports, if present)."
+        ),
+    )
+    view.add_argument(
+        "--municipality-zone-column",
+        default="input_zone_id",
+        help=(
+            "Column of --municipalities holding the demand zone id, to put "
+            "--share-demand's zones in municipalities (default: %(default)s)."
+        ),
+    )
     flows = view.add_argument_group(
         "counter flows",
         "Give the settings the run was assigned with, and clicking a counter "
@@ -1669,6 +1787,42 @@ def build_parser() -> argparse.ArgumentParser:
     view.add_argument("--cache-dir", type=Path, default=Path(".cache"))
     _add_output_dir(view)
     view.set_defaults(func=cmd_view)
+
+    pipeline = sub.add_parser(
+        "pipeline",
+        help=(
+            "Run extract, dem, traffic, connect and assign from settings files, "
+            "each only when its inputs or settings changed since it last ran."
+        ),
+        description=(
+            "Each step runs exactly as its own command with the same -c files. "
+            "What each step saw is kept in <output-dir>/pipeline_<mode>.json; a "
+            "step is skipped when its settings, its input files and the pipeline "
+            "files it reads are as they were. traffic is skipped when no volumes "
+            "are configured. A link layer edited by hand re-runs connect and "
+            "assign, never extract, which would overwrite the edit."
+        ),
+    )
+    pipeline.add_argument(
+        "--dry-run", action="store_true", help="Say what would run, and why, without running it."
+    )
+    pipeline.add_argument("--force", action="store_true", help="Run every step regardless.")
+    pipeline.add_argument(
+        "--mark-done",
+        action="store_true",
+        help=(
+            "Record the current outputs as up to date without running anything: "
+            "for results made by running the steps by hand, so the first pipeline "
+            "run does not redo them all."
+        ),
+    )
+    pipeline.add_argument(
+        "--skip",
+        choices=("extract", "dem", "traffic", "connect", "assign"),
+        action="append",
+        help="Leave a step out (repeatable), e.g. --skip dem when no DEM is wanted.",
+    )
+    pipeline.set_defaults(func=cmd_pipeline)
 
     for command in sub.choices.values():
         _add_config(command)
@@ -1715,10 +1869,57 @@ def _record(args: argparse.Namespace, parser, command: str, files: list[Path]) -
     return path
 
 
-def main(argv: list[str] | None = None) -> int:
-    files, show_config, argv = _take_config_options(
-        list(sys.argv[1:] if argv is None else argv)
+def cmd_pipeline(args: argparse.Namespace) -> int:
+    """extract, dem, traffic, connect and assign, each only when its inputs changed."""
+    from valma_bike_and_walk import __version__
+    from valma_bike_and_walk.pipeline import build_plan, run_pipeline
+
+    files: list[Path] = list(getattr(args, "config_files", []))
+    if not files:
+        raise SystemExit("valma pipeline needs settings files: valma pipeline -c scenarios/<name>.toml")
+    flags = [token for path in files for token in ("-c", str(path))]
+
+    def resolve(argv: list[str]) -> argparse.Namespace | None:
+        errors = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(errors):
+                return _parse(argv, files).args
+        except SystemExit:
+            if argv[0] == "traffic":
+                return None  # no volumes configured: nothing to match
+            raise SystemExit(
+                f"valma pipeline: the {argv[0]} step cannot run with these settings:\n"
+                + errors.getvalue().strip()
+            ) from None
+
+    try:
+        plan = build_plan(resolve, skip=set(args.skip or []))
+    except ValueError as error:
+        raise SystemExit(f"valma pipeline: {error}") from None
+    print(f"Pipeline over {plan.files['links']} (state in {plan.state_path.name}):")
+    return run_pipeline(
+        plan,
+        lambda argv: main([*argv, *flags]),
+        __version__,
+        force=args.force,
+        dry_run=args.dry_run,
+        mark_done=args.mark_done,
     )
+
+
+@dataclass
+class _Parsed:
+    args: argparse.Namespace
+    parser: argparse.ArgumentParser
+    command: str
+    files: list[Path]
+    config: config_file.Config | None
+    applied: dict[str, config_file.Setting]
+    given: set[str]
+
+
+def _parse(argv: list[str], files: list[Path], show_config: bool = False) -> _Parsed:
+    """A command's arguments as the settings ``files`` and ``argv`` make them."""
     parser = build_parser()
     command = _command_in(argv, parser)
 
@@ -1733,22 +1934,33 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     command = args.command
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-    )
 
     given: set[str] = set()
     if applied or show_config:
         given = config_file.given_on_command_line(build_parser, argv, command)
     if applied:
         try:
-            config_file.settle(args, parser, command, applied, given)
+            config_file.settle(args, parser, command, applied, given, config)
         except config_file.ConfigError as error:
             parser.exit(2, f"valma: error: {error}\n")
     if getattr(args, "scenario", None):
         args.output_dir = args.output_dir / args.scenario
+    return _Parsed(args, parser, command, files, config, applied, given)
+
+
+def main(argv: list[str] | None = None) -> int:
+    files, show_config, argv = _take_config_options(
+        list(sys.argv[1:] if argv is None else argv)
+    )
+    parsed = _parse(argv, files, show_config)
+    args, parser, command = parsed.args, parsed.parser, parsed.command
+    config, applied, given = parsed.config, parsed.applied, parsed.given
+    args.config_files = files
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
 
     if show_config:
         sources = config_file.sources_of(args, applied, given)

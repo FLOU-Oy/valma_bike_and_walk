@@ -20,6 +20,7 @@ import numpy as np
 from valma_bike_and_walk.links import LINKS_LAYER
 from valma_bike_and_walk.links import read_links as read_links_gpkg
 from valma_bike_and_walk.network import RoutableNetwork
+from valma_bike_and_walk.vector_io import write_vector
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +113,7 @@ def write_edges_gpkg(
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    gdf.to_file(path, driver="GPKG", layer=layer)
+    write_vector(gdf, path, driver="GPKG", layer=layer)
 
     logger.info(
         "Saved %d edges to %s (%.1f MB)", len(gdf), path, path.stat().st_size / 1e6

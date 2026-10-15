@@ -48,9 +48,44 @@
       <div id="route-result"></div>
     </section>
 
+    <section id="muni-box" hidden>
+      <h2>Municipalities <span id="muni-total" class="hint"></span></h2>
+      <p class="hint">Average speed of the run's cyclists: bike-km ÷ bike-hours, with the routed
+        travel time, so signal, crossing and gradient penalties count.</p>
+      <button id="plot-open" hidden>Plot speed vs modal share</button>
+      <input id="muni-search" type="search" placeholder="Search municipalities…">
+      <div class="scroll"><table id="muni-table"></table></div>
+    </section>
+
+    <section id="tl-box" hidden>
+      <h2>Trip lengths</h2>
+      <p class="hint">Share of the run's trips by network length, weighted by trips, grouped by
+        where they start. Intrazonal trips are estimated from their zone's size.</p>
+      <label>Area
+        <select id="tl-group">
+          <option value="country">Whole country</option>
+          <option value="region">HLT 2016 region</option>
+          <option value="municipality">Municipality</option>
+        </select>
+      </label>
+      <label id="tl-name-label" hidden><span id="tl-name-title"></span>
+        <select id="tl-name"></select>
+      </label>
+      <svg id="tl-svg" viewBox="0 0 312 200" role="img"></svg>
+      <div id="tl-stats" class="hint"></div>
+    </section>
+
     <section id="legend"></section>
     <section id="details"><p class="hint">Click a link or a counter for details.</p></section>
   </aside>
+  <div id="plot" hidden>
+    <header>
+      <h2 id="plot-title"></h2>
+      <button id="plot-close" title="Close">×</button>
+    </header>
+    <svg id="plot-svg" viewBox="0 0 600 380" role="img"></svg>
+    <p id="plot-stats" class="hint"></p>
+  </div>
   <div id="status"></div>
   <script src="/static/app.js"></script>
 </body>

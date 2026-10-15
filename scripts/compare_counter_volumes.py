@@ -12,6 +12,8 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import Point
 
+from valma_bike_and_walk.vector_io import read_vector, write_vector
+
 COUNTER_LAYER = "count_lines"
 VOLUME_LAYER = "links"
 EXPANSION_FACTOR = 1 #/ 0.547 * 2 / 0.407589
@@ -35,8 +37,8 @@ def _read_observed(path: Path) -> pd.DataFrame:
 def _modeled_volumes(
     count_lines_path: Path, bike_volumes_path: Path
 ) -> pd.DataFrame:
-    counters = gpd.read_file(count_lines_path, layer=COUNTER_LAYER)
-    volumes = gpd.read_file(bike_volumes_path, layer=VOLUME_LAYER)
+    counters = read_vector(count_lines_path, layer=COUNTER_LAYER)
+    volumes = read_vector(bike_volumes_path, layer=VOLUME_LAYER)
     if "counter" not in counters.columns:
         raise ValueError("count_lines.gpkg must contain a 'counter' column.")
     if "volume" not in volumes.columns:
@@ -44,7 +46,8 @@ def _modeled_volumes(
 
     volumes["volume"] = pd.to_numeric(volumes["volume"], errors="coerce").fillna(0.0)
     volumes["modeled_bike_volume"] = volumes["volume"] * EXPANSION_FACTOR
-    volumes.to_file(
+    write_vector(
+        volumes,
         bike_volumes_path,
         layer=VOLUME_LAYER,
         driver="GPKG",
@@ -227,7 +230,8 @@ def main() -> int:
 
     # GeoPackage point layer
     args.output_gpkg.parent.mkdir(parents=True, exist_ok=True)
-    comparison.to_file(
+    write_vector(
+        comparison,
         args.output_gpkg,
         layer="counter_volume_comparison",
         driver="GPKG",

@@ -205,6 +205,48 @@ def read_demand_omx(
     return ids, matrix
 
 
+def omx_origin_totals(
+    path: Path, mapping_name: str = "zone_number"
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """
+    Every matrix in an OMX file summed over its destinations.
+
+    Returns the zone ids and, per matrix, the trips leaving each zone -- what a
+    modal share needs, read a row-block at a time like :func:`read_demand_omx`.
+    """
+    try:
+        import openmatrix as omx
+    except ImportError as exc:  # pragma: no cover - exercised only without the extra
+        raise ImportError(
+            "Reading OMX demand needs the optional 'openmatrix' package: "
+            "pip install openmatrix (or install this project's 'omx' extra)."
+        ) from exc
+
+    path = Path(path)
+    with omx.open_file(str(path), "r") as f:
+        if mapping_name not in f.list_mappings():
+            raise ValueError(
+                f"{path} has no lookup {mapping_name!r}; available: {f.list_mappings()}"
+            )
+        ids = np.asarray(f.map_entries(mapping_name))
+        totals: dict[str, np.ndarray] = {}
+        for name in f.list_matrices():
+            node = f[name]
+            n = int(node.shape[0])
+            if tuple(node.shape) != (len(ids), len(ids)):
+                raise ValueError(
+                    f"{path}'s {name!r} matrix is {tuple(node.shape)}, but its "
+                    f"{mapping_name!r} lookup has {len(ids)} entries; they should match."
+                )
+            out = np.zeros(n, dtype=np.float64)
+            chunk = _omx_row_chunk(n)
+            for start in range(0, n, chunk):
+                block = np.asarray(node[start : start + chunk, :], dtype=np.float64)
+                out[start : start + block.shape[0]] = block.sum(axis=1)
+            totals[name] = out
+    return ids, totals
+
+
 def write_omx_matrix(
     path: Path,
     ids: np.ndarray,

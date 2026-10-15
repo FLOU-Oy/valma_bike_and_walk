@@ -35,6 +35,7 @@ from valma_bike_and_walk.config import (
     Settings,
     validate_mode,
 )
+from valma_bike_and_walk.vector_io import read_vector, write_vector
 
 logger = logging.getLogger(__name__)
 
@@ -545,7 +546,7 @@ def find_boundary(
 
     if cache_file.exists() and not force_reload:
         logger.info("Loading boundary from cache: %s", cache_file)
-        return gpd.read_file(cache_file)
+        return read_vector(cache_file)
 
     logger.info("Scanning %s for the boundary of %r (slow)", settings.pbf_path, name)
     factory = osmium.geom.WKBFactory()
@@ -593,7 +594,7 @@ def find_boundary(
         boundaries.iloc[0]["name"],
         boundaries.total_bounds,
     )
-    boundaries.to_file(cache_file, driver="GeoJSON")
+    write_vector(boundaries, cache_file, driver="GeoJSON")
     return boundaries
 
 

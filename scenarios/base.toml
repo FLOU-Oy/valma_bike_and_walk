@@ -31,13 +31,13 @@ cache_dir = "../.cache"
 
 # The network. Written out rather than with {scenario}, so variants extending
 # this file route on the base network unless they name a layer of their own.
-links = "../output/base/{mode}_links.gpkg"
-# connectors = "../output/base/{mode}_links_connectors.gpkg"   # from `valma connect`
-# network = "../output/base/{mode}.npz"                        # a built graph instead of links
+links = "../output/{scenario}/{mode}_links.gpkg"
+# connectors = "../output/{scenario}/{mode}_links_connectors.gpkg"   # from `valma connect`
+# network = "../output/{scenario}/{mode}.npz"                        # a built graph instead of links
 
 # Zones: either point centroids or polygon zones (they exclude each other; a
 # variant giving zones replaces centroids from here).
-centroids = "../data/points.csv"
+centroids = "../data/centroids.csv"
 id_column = "id"
 # x_column = "lon"
 # y_column = "lat"
@@ -66,7 +66,7 @@ demand_matrix = "{mode}"
 
 [extract]
 pbf = "../data/finland-260805.osm.pbf"
-bbox = [24.50, 60.10, 25.30, 60.40]     # lon/lat box; much cheaper than area
+# bbox = [24.50, 60.10, 25.30, 60.40]     # lon/lat box; much cheaper than area
 # area = "Espoo"
 # include_construction = true
 # index_storage = "flex_mem"
@@ -77,13 +77,13 @@ bbox = [24.50, 60.10, 25.30, 60.40]     # lon/lat box; much cheaper than area
 # gap_m = 50.0
 
 [dem]
-# dem_resolution = 2.0
+dem_resolution = 10.0
 # dem_tile = 8000
 # dem_workers = 4
 # The NLS API key stays in the MML_API_KEY environment variable, not here.
 
 [traffic]
-# volumes = "../data/link_volumes.gpkg"
+volumes = "../data/link_volumes.gpkg"
 # volume_column = "volume"
 # max_distance = 12.0
 # max_angle = 45.0
@@ -110,5 +110,10 @@ max_minutes = 60.0
 [view]
 # count_lines = "../data/count_lines.gpkg"
 # observed = "../output/bicycle_counter_annual_averages.csv"
+# municipalities = "../data/2023_zonedata--dev-template.gpkg"
+# municipality_column = "municipality"
+# share_demand = "../data/demand_vrk.omx"   # modal shares (default: demand, if .omx)
+# municipality_zone_column = "input_zone_id"
+# regions = "../data/hlt2016_regions.csv"  # trip lengths by HLT 2016 region
 # port = 8765
 # no_browser = false

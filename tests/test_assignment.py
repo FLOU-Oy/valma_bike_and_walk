@@ -455,3 +455,34 @@ def test_select_link_rejects_an_unknown_link():
     net = make_network([(0, 1, 5.0)], 2)
     with pytest.raises(ValueError):
         select_link_assignment(net, [0], np.array([[0.0, 1.0]]), [999], targets=[0, 1])
+
+
+def test_trip_lengths_follow_the_path_the_demand_was_loaded_on():
+    from valma_bike_and_walk.assignment import trip_length_assignment
+
+    # 0->1->2 is quicker but longer (300 + 400 m) than 0->2 direct (500 m):
+    # the length reported is the one the trip was routed along.
+    net = make_network([(0, 1, 10.0), (1, 2, 10.0), (0, 2, 100.0), (2, 3, 5.0)], 5)
+    metres = np.array([300.0, 400.0, 500.0, 50.0], dtype=np.float32)
+    net.length[:] = metres[net.link_id]
+    demand = np.zeros((3, 5))
+    demand[0, 2] = 4.0  # routed via 1
+    demand[0, 0] = 2.0  # to itself: a zero-length trip
+    demand[1, 3] = 1.0
+    demand[2, 4] = 3.0  # node 4 is unreachable
+
+    volume, trips = trip_length_assignment(
+        net, [0, 1, 2], demand, targets=[0, 1, 2, 3, 4]
+    )
+    got = {
+        (int(o), int(d)): float(length)
+        for o, d, length in zip(trips.origin, trips.destination, trips.length_m)
+    }
+    assert got[(0, 2)] == pytest.approx(700.0)
+    assert got[(0, 0)] == 0.0
+    assert got[(1, 3)] == pytest.approx(450.0)
+    assert np.isnan(got[(2, 4)])
+    assert trips.demand.sum() == pytest.approx(10.0)
+    # The volumes are exactly what a plain assignment gives.
+    plain = assign_traffic(net, [0, 1, 2], demand, targets=[0, 1, 2, 3, 4])
+    np.testing.assert_allclose(volume, plain)

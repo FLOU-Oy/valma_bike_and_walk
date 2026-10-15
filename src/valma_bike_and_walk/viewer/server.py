@@ -35,6 +35,15 @@ def create_app(
     app = FastAPI(title="valma view")
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
+    @app.middleware("http")
+    async def revalidate_page(request, call_next):
+        # Without this a browser may keep running an old app.js after valma is
+        # updated; no-cache still lets it reuse the copy when the ETag matches.
+        response = await call_next(request)
+        if request.url.path == "/" or request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     # Tiles depend on the geometry and on which links each zoom keeps.
     key = hashlib.sha1(data.min_zoom.tobytes()).hexdigest()[:12]
     cache = TileCache(Path(tile_dir) / key)
@@ -54,6 +63,8 @@ def create_app(
             "counters": bool(data.counters),
             "select": data.flows is not None and bool(data.counters),
             "route": data.router is not None,
+            "municipalities": data.municipalities is not None,
+            "trip_lengths": data.trip_lengths is not None,
             "measures": {
                 "run": ["volume", "volume_forward", "volume_reverse"],
                 "network": ["speed", "speed_forward", "speed_reverse", "under_construction"],
@@ -154,6 +165,47 @@ def create_app(
         with path.open(encoding="utf-8") as f:
             count = sum(1 for _ in f)
         return {"saved": str(path), "observations": count}
+
+    def _municipalities():
+        if data.municipalities is None:
+            raise HTTPException(404, "Start valma view with --municipalities.")
+        return data.municipalities
+
+    @app.get("/api/municipalities")
+    def municipalities(run: str) -> JSONResponse:
+        """Cyclist-weighted speed, bicycle-km and -hours per municipality."""
+        table = _municipalities()
+        if run not in data.runs:
+            raise HTTPException(404, f"No run {run!r}")
+        try:
+            return JSONResponse(table.stats(data.links, data.runs[run]))
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from None
+
+    @app.get("/api/municipality/{index}")
+    def municipality(index: int) -> JSONResponse:
+        table = _municipalities()
+        if not 0 <= index < len(table.names):
+            raise HTTPException(404)
+        return JSONResponse(table.outline(index))
+
+    @app.get("/api/trip-lengths")
+    def trip_lengths(run: str) -> JSONResponse:
+        """Trips by network length, for the country, each region and municipality."""
+        from valma_bike_and_walk.viewer.trip_lengths import trip_lengths_path
+
+        if data.trip_lengths is None:
+            raise HTTPException(404, "Start valma view with --municipalities.")
+        if run not in data.runs:
+            raise HTTPException(404, f"No run {run!r}")
+        path = trip_lengths_path(data.runs[run].path)
+        if not path.exists():
+            raise HTTPException(
+                409,
+                f"No {path.name} beside this run; run valma assign again (with "
+                "--centroids) to write trip lengths.",
+            )
+        return JSONResponse(data.trip_lengths.histograms(run, path))
 
     @app.get("/api/counters")
     def counters(run: str | None = None) -> JSONResponse:

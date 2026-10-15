@@ -39,6 +39,41 @@ button {
 }
 button:hover { border-color: var(--accent); }
 #flow-status { color: var(--muted); }
+#muni-search {
+  font: inherit; width: 100%; box-sizing: border-box; margin: 2px 0 6px; padding: 4px 6px;
+  background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px;
+}
+.scroll { max-height: 320px; overflow-y: auto; }
+#plot {
+  position: absolute; left: 16px; bottom: 36px; width: min(640px, calc(100% - 372px)); box-sizing: border-box;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.18);
+}
+#plot header { align-items: center; }
+#plot h2 { margin: 0; }
+#plot-close { margin: 0; padding: 0 8px; font-size: 16px; line-height: 22px; }
+#plot-svg { width: 100%; height: auto; display: block; }
+#plot-svg .axis { stroke: var(--muted); }
+#plot-svg .grid { stroke: var(--line); }
+#plot-svg text { fill: var(--muted); font-size: 11px; }
+#plot-svg text.name { fill: var(--fg); font-size: 11px; }
+#plot-svg circle { fill: var(--accent); fill-opacity: 0.45; stroke: var(--accent); stroke-width: 0.8; cursor: pointer; }
+#plot-svg circle:hover { fill-opacity: 0.9; }
+#plot-svg circle.sel { fill: #e8590c; stroke: #e8590c; fill-opacity: 0.9; }
+#plot-svg .fit { stroke: #e8590c; stroke-width: 1.5; stroke-dasharray: 5 4; }
+#plot-stats { margin: 4px 0 0; }
+@media (max-width: 720px) {
+  #plot { left: 8px; right: 8px; width: auto; bottom: calc(45% + 8px); }
+}
+#tl-svg { width: 100%; height: auto; display: block; margin-top: 4px; }
+#tl-svg text { fill: var(--muted); font-size: 10px; }
+#tl-svg text.val { fill: var(--fg); }
+#tl-svg .bar { fill: var(--accent); }
+#tl-svg .bar-b { fill: none; stroke: #e8590c; stroke-width: 1.5; }
+#tl-svg .axis { stroke: var(--muted); }
+#muni-table th { position: sticky; top: 0; background: var(--bg); cursor: pointer; user-select: none; }
+#muni-table tbody tr { cursor: pointer; }
+#muni-table tbody tr:hover, #muni-table tr.sel { background: color-mix(in srgb, var(--accent) 14%, transparent); }
 #flow-status table { color: var(--fg); }
 #status {
   position: absolute; left: 10px; bottom: 10px; padding: 4px 8px; border-radius: 4px;

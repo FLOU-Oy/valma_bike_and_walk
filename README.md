@@ -464,6 +464,30 @@ demand and zones it was assigned with, ready for counter clicks.
 Keep the NLS API key in its environment variable rather than in a file, so
 settings files can be committed.
 
+### The whole chain, only where something changed
+
+```bash
+valma pipeline -c scenarios/bike.toml --dry-run   # what would run, and why
+valma pipeline -c scenarios/bike.toml             # extract, dem, traffic, connect, assign
+```
+
+`valma pipeline` runs the steps from OSM to volumes with the same settings
+files, each exactly as its own command would, and skips any step whose
+settings, input files and upstream results are as they were when it last
+succeeded. A new OSM extract reruns everything; new traffic volumes rerun
+`traffic`, `connect` and `assign`; new demand reruns `assign` alone. What each
+step saw is kept in `<output_dir>/pipeline_<mode>.json`.
+
+The link layer is written in place by `extract`, `dem` and `traffic`, so each
+one's version of it is recorded rather than trusting its timestamp. A layer
+edited by hand afterwards — an override typed in QGIS — reruns `connect` and
+`assign`, never `extract`, which would overwrite the edit. `traffic` is left
+out when no `volumes` are set; `--skip STEP` leaves out any other.
+
+For results already made by running the commands by hand, `--mark-done`
+records them as up to date without running anything, so the first pipeline
+run does not redo them all. `--force` reruns everything.
+
 ## Zones as polygons
 
 Routing every trip from one centroid node per zone is the standard

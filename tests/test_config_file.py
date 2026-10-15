@@ -244,6 +244,29 @@ def test_a_placeholder_follows_a_mode_given_on_the_command_line(tmp_path, capsys
     assert settings["links"] == posix(tmp_path / "walk_links.gpkg")
 
 
+def test_a_command_without_a_mode_option_still_fills_mode_from_the_file(
+    tmp_path, capsys
+):
+    """``traffic`` takes no --mode, but the file's links still name {mode}."""
+    config = write(
+        tmp_path / "run.toml",
+        'mode = "bike"\nscenario = "{mode}_2040"\n'
+        'links = "{scenario}/{mode}_links.gpkg"\nvolumes = "v.gpkg"\n',
+    )
+    settings = show(capsys, "traffic", "-c", str(config))
+    assert settings["links"] == posix(tmp_path / "bike_2040" / "bike_links.gpkg")
+
+
+def test_an_unfillable_placeholder_is_reported_once(tmp_path, capsys):
+    config = write(
+        tmp_path / "run.toml",
+        'links = "{mode}_links.gpkg"\nvolumes = "v.gpkg"\n',
+    )
+    error = refused(capsys, "traffic", "-c", str(config))
+    assert "no mode is set" in error
+    assert error.count(str(config)) == 1
+
+
 @pytest.mark.parametrize(
     ("value", "message"),
     [

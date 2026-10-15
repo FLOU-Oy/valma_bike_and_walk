@@ -53,6 +53,7 @@ from scipy.spatial import cKDTree
 
 from valma_bike_and_walk.config import PROJECTED_CRS, validate_mode
 from valma_bike_and_walk.speeds import profile_for
+from valma_bike_and_walk.vector_io import read_vector, write_vector
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +144,7 @@ def write_links(links: gpd.GeoDataFrame, path: Path, layer: str = LINKS_LAYER) -
     """Write the link layer, replacing any layer of the same name."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    links.to_file(path, driver="GPKG", layer=layer)
+    write_vector(links, path, driver="GPKG", layer=layer)
     logger.info(
         "Wrote %d links to %s (%.1f MB)", len(links), path, path.stat().st_size / 1e6
     )
@@ -153,7 +154,7 @@ def write_links(links: gpd.GeoDataFrame, path: Path, layer: str = LINKS_LAYER) -
 def read_links(path: Path, layer: str = LINKS_LAYER) -> gpd.GeoDataFrame:
     """Read a link layer back, tolerating whatever QGIS did to it."""
     path = Path(path)
-    links = gpd.read_file(path, layer=layer)
+    links = read_vector(path, layer=layer)
     missing = [
         c for c in REQUIRED_COLUMNS if c not in links.columns and c != "geometry"
     ]

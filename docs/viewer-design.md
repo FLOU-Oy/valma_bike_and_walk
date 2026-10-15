@@ -34,6 +34,10 @@ valma view --links output/bike_links.gpkg --run output/ [--compare other/] [--po
    │    GET  /api/attr/{run}/{measure}.bin   Float32 array indexed by link
    │    GET  /api/link/{i}                   tags + speed breakdown, both directions
    │    GET  /api/counters                   observed vs modelled (GeoJSON, small)
+   │    GET  /api/municipalities?run=        bike-km ÷ bike-hours per municipality
+   │    GET  /api/municipality/{i}           its outline and bounds (GeoJSON)
+   │    GET  /api/trip-lengths?run=          trips by network length: country,
+   │                                          HLT 2016 regions, municipalities
    │    GET  /api/zones, /api/od/{zone}      zone totals, desire lines      (phase 3)
    │    POST /api/screenline                 volumes crossing a drawn line  (phase 2)
    │    POST /api/tree                       one-origin Dijkstra: isochrone (phase 2)
