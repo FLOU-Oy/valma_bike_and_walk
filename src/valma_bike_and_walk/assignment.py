@@ -47,6 +47,7 @@ way (see :func:`assign_zone_traffic`'s two tiers).
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
@@ -141,6 +142,64 @@ def assign_traffic(
     return volume
 
 
+@dataclass(frozen=True)
+class TripLengths:
+    """
+    The network length of every OD pair an assignment loaded, as it loaded it.
+
+    ``origin``/``destination`` are positions in the assignment's sources and
+    targets; ``length_m`` is the path the demand was put on (the least-time
+    path), NaN where it found none, and 0 from a node to itself -- which is
+    what an intrazonal trip is when a zone is one node.
+    """
+
+    origin: np.ndarray  # int64
+    destination: np.ndarray  # int64
+    demand: np.ndarray  # float64
+    length_m: np.ndarray  # float64
+
+
+def trip_length_assignment(
+    network: RoutableNetwork,
+    sources: Sequence[int] | np.ndarray,
+    demand: np.ndarray | csr_matrix,
+    targets: Sequence[int] | np.ndarray | None = None,
+    max_seconds: float | None = None,
+    workers: int = 1,
+    chunk_size: int | None = None,
+    progress_every: int = 10,
+) -> tuple[np.ndarray, TripLengths]:
+    """
+    :func:`assign_traffic`, also measuring each OD pair's path on the network.
+
+    The lengths come out of the same searches that load the volumes, so they
+    cost one extra pass over each search's tree rather than a second routing.
+    """
+    sources = np.asarray(sources, dtype=np.int64)
+    targets_ = sources if targets is None else np.asarray(targets, dtype=np.int64)
+    csr = _as_demand_csr(demand, sources.size, targets_.size)
+    od_length = np.full(csr.nnz, np.nan, dtype=np.float64)
+    volume, _ = _assign(
+        network,
+        sources,
+        csr,
+        targets,
+        max_seconds,
+        workers,
+        chunk_size,
+        progress_every,
+        groups=None,
+        od_length=od_length,
+    )
+    origin = np.repeat(np.arange(sources.size, dtype=np.int64), np.diff(csr.indptr))
+    return volume, TripLengths(
+        origin=origin,
+        destination=csr.indices.astype(np.int64),
+        demand=csr.data.astype(np.float64),
+        length_m=od_length,
+    )
+
+
 def select_link_assignment(
     network: RoutableNetwork,
     sources: Sequence[int] | np.ndarray,
@@ -209,6 +268,7 @@ def _assign(
     chunk_size: int | None,
     progress_every: int,
     groups: tuple[np.ndarray, np.ndarray, int] | None,
+    od_length: np.ndarray | None = None,
 ) -> tuple[np.ndarray, csr_matrix | None]:
     """
     The engine behind :func:`assign_traffic`, plus a report of what it could not place.
@@ -265,6 +325,8 @@ def _assign(
         workers=workers,
         chunk_size=chunk_size,
         progress_every=progress_every,
+        edge_length=network.length if od_length is not None else None,
+        od_length=od_length,
     )
     dropped = int(missed.sum())
 

@@ -12,6 +12,7 @@ import pandas as pd
 
 from valma_bike_and_walk.config import PROJECTED_CRS, WGS84
 from valma_bike_and_walk.network import RoutableNetwork
+from valma_bike_and_walk.vector_io import read_vector
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +95,7 @@ def read_points(
             crs=crs,
         )
     else:
-        points = gpd.read_file(path)
+        points = read_vector(path)
         if points.crs is None:
             points = points.set_crs(crs)
 

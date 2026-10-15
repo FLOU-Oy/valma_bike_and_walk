@@ -619,6 +619,31 @@ def test_sampling_reads_a_real_geotiff(tmp_path):
     assert np.isfinite(cache.sample(np.array([382_050.0]), np.array([6_666_000.0]))[0])
 
 
+def test_sampling_picks_the_pixel_rasterio_would(tmp_path):
+    """Whole-tile indexing gives what dataset.sample gives, point for point."""
+    rasterio = pytest.importorskip("rasterio")
+    cache = cache_at(tmp_path, resolution_m=8.0)
+    tiles = [cache.tile_at(380_000.0 + dx, 6_668_000.0 + dy)
+             for dx in (0, 8_000) for dy in (0, 8_000)]
+    for tile in tiles:
+        write_tile(cache, tile, lambda e, n: np.sin(e / 97.0) * 40 + n * 1e-3)
+
+    rng = np.random.default_rng(1)
+    east = rng.uniform(376_000.0, 391_990.0, 4_000)
+    north = rng.uniform(6_664_000.0, 6_679_990.0, 4_000)
+    # Exactly on pixel edges too, where floor vs round would differ.
+    east[:500] = np.round(east[:500] / 8.0) * 8.0
+    north[500:1000] = np.round(north[500:1000] / 8.0) * 8.0
+
+    expected = np.full(east.size, np.nan)
+    for i, (e, n) in enumerate(zip(east, north)):
+        tile = cache.tile_at(e, n)
+        with rasterio.open(cache.path(tile)) as dataset:
+            expected[i] = next(dataset.sample([(e, n)]))[0]
+    for workers in (1, 3):
+        np.testing.assert_array_equal(cache.sample(east, north, workers=workers), expected)
+
+
 def test_add_elevation_over_a_real_tile(tmp_path, server):
     """The whole path end to end: fetch decision, raster read, reduction."""
     cache = cache_at(tmp_path, resolution_m=8.0)

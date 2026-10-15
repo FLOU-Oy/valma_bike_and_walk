@@ -105,6 +105,235 @@ def test_the_api_serves_meta_values_tiles_and_the_inspector(links_path, tmp_path
 
 
 # --------------------------------------------------------------------------
+# Municipalities
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def municipality_data(links_path, tmp_path):
+    """Link 10 in "Alpha" (three zones' worth), link 11 in "Beta"."""
+    import geopandas as gpd
+    import shapely
+
+    from valma_bike_and_walk.viewer.municipalities import load_municipalities
+
+    zones = gpd.GeoDataFrame(
+        {"municipality": ["Alpha", "Alpha", "Beta"]},
+        geometry=[
+            shapely.box(23.99, 59.99, 24.0015, 60.0),
+            shapely.box(23.99, 60.0, 24.0015, 60.01),
+            shapely.box(24.0015, 59.99, 24.01, 60.01),
+        ],
+        crs="EPSG:4326",
+    )
+    zones_path = tmp_path / "zones.gpkg"
+    zones.to_file(zones_path)
+
+    links = prepare_links(links_path, tmp_path / "cache")
+    run_path = tmp_path / "run" / "link_volumes_bike.npz"
+    run_path.parent.mkdir()
+    np.savez(
+        run_path, u=np.array([1, 2, 2]), v=np.array([2, 1, 3]),
+        link_id=np.array([10, 10, 11]), direction=np.array([1, -1, 1]),
+        volume=np.array([10.0, 30.0, 5.0]),
+        # The way back over link 10 is slower: a climb, or a signal.
+        travel_time_s=np.array([20.0, 60.0, 15.0]),
+    )
+    run = load_run(run_path, links)
+    data = ViewerData(links, "bike", {run.name: run})
+    data.municipalities = load_municipalities(
+        links, zones_path, "municipality", tmp_path / "cache"
+    )
+    return data, run
+
+
+def test_links_fall_in_the_municipality_of_their_midpoint(municipality_data):
+    data, _ = municipality_data
+    assert data.municipalities.names == ["Alpha", "Beta"]
+    assert data.municipalities.of_link.tolist() == [0, 1]
+
+
+def test_municipality_speed_is_bike_km_over_bike_hours(municipality_data):
+    data, run = municipality_data
+    stats = data.municipalities.stats(data.links, run)
+    length = data.links["length_m"].to_numpy()
+    alpha, beta = stats["rows"]
+
+    km = (10.0 + 30.0) * length[0] / 1000
+    hours = (10.0 * 20.0 + 30.0 * 60.0) / 3600
+    assert alpha["bike_km"] == pytest.approx(km)
+    assert alpha["bike_hours"] == pytest.approx(hours)
+    # Weighted by trips each way, with each direction's own time: not the
+    # mean of the two directions' speeds.
+    assert alpha["speed_kmh"] == pytest.approx(km / hours)
+    assert beta["speed_kmh"] == pytest.approx(length[1] / 15.0 * 3.6)
+    assert stats["total"]["links"] == 2
+
+
+def test_the_municipality_api_serves_the_table_and_outlines(municipality_data, tmp_path):
+    data, run = municipality_data
+    client = TestClient(create_app(data, tmp_path / "tiles"))
+    assert client.get("/api/meta").json()["municipalities"] is True
+
+    table = client.get("/api/municipalities", params={"run": run.name}).json()
+    assert [r["name"] for r in table["rows"]] == ["Alpha", "Beta"]
+    outline = client.get("/api/municipality/0").json()
+    assert outline["properties"]["name"] == "Alpha"
+    west, south, east, north = outline["properties"]["bounds"]
+    assert west == pytest.approx(23.99) and north == pytest.approx(60.01)
+    assert client.get("/api/municipality/5").status_code == 404
+    assert client.get("/api/municipalities", params={"run": "nope"}).status_code == 404
+
+
+def test_modal_shares_count_the_trips_leaving_each_municipality(municipality_data, tmp_path):
+    omx = pytest.importorskip("openmatrix")
+    from valma_bike_and_walk.viewer.municipalities import load_trip_shares
+
+    data, run = municipality_data
+    # Zones 1 and 2 are Alpha, zone 3 Beta; zone 9 is in no municipality.
+    zones = tmp_path / "zones.gpkg"
+    import geopandas as gpd
+
+    frame = gpd.read_file(zones)
+    frame["input_zone_id"] = [1, 2, 3]
+    frame.to_file(zones)
+    path = tmp_path / "demand.omx"
+    bike = np.array([[1, 1, 0, 0], [0, 2, 0, 0], [1, 0, 0, 0], [5, 0, 0, 0]], dtype="float32")
+    car = np.array([[3, 3, 2, 0], [4, 4, 0, 0], [0, 0, 1, 0], [9, 0, 0, 0]], dtype="float32")
+    with omx.open_file(str(path), "w") as f:
+        f.create_mapping("zone_number", [1, 2, 3, 9])
+        f.create_matrix("bike", obj=bike)
+        f.create_matrix("car", obj=car)
+
+    for _ in range(2):  # computed, then read back from the cache
+        load_trip_shares(data.municipalities, path, "bike", "zone_number", zones,
+                         "input_zone_id", "municipality", tmp_path / "cache")
+        stats = data.municipalities.stats(data.links, run)
+        alpha, beta = stats["rows"]
+        assert alpha["mode_trips"] == 4 and alpha["all_trips"] == 4 + 16
+        assert beta["mode_share"] == pytest.approx(1 / 2)
+        assert stats["total"]["mode_share"] == pytest.approx(5 / 22)
+        # Two municipalities are too few for a fit.
+        assert stats["fit"] is None
+
+
+def test_the_share_fit_is_least_squares_with_both_r2s():
+    from valma_bike_and_walk.viewer.municipalities import share_fit
+
+    rows = [
+        {"speed_kmh": s, "mode_share": m, "all_trips": t}
+        for s, m, t in [(10, 0.05, 100), (12, 0.07, 100), (14, 0.08, 1000), (16, 0.12, 10)]
+    ]
+    fit = share_fit(rows)
+    x = np.array([10, 12, 14, 16.0])
+    y = np.array([0.05, 0.07, 0.08, 0.12])
+    slope, intercept = np.polyfit(x, y, 1)
+    assert fit["slope"] == pytest.approx(slope)
+    assert fit["intercept"] == pytest.approx(intercept)
+    assert fit["r2"] == pytest.approx(np.corrcoef(x, y)[0, 1] ** 2)
+    # Weighting by trips lets the 1000-trip municipality dominate, so the two
+    # measures differ.
+    assert fit["r2_weighted"] != pytest.approx(fit["r2"])
+    assert fit["n"] == 4
+    rows.append({"speed_kmh": None, "mode_share": 0.5, "all_trips": 1})
+    assert share_fit(rows)["n"] == 4
+
+
+def test_trip_lengths_are_binned_by_origin_with_intrazonal_estimates(tmp_path):
+    import geopandas as gpd
+    import shapely
+
+    from valma_bike_and_walk.viewer.trip_lengths import (
+        DISC_MEAN_DISTANCE,
+        TripLengthGroups,
+        load_regions,
+        load_zone_table,
+    )
+
+    # Zone 1 is a 2 km square in Alpha; zones 2 and 3 are in Beta and Gamma.
+    zones = gpd.GeoDataFrame(
+        {"input_zone_id": [1, 2, 3], "municipality": ["Alpha", "Beta", "Gamma"]},
+        geometry=[shapely.box(0, 0, 2000, 2000), shapely.box(2000, 0, 3000, 1000),
+                  shapely.box(3000, 0, 4000, 1000)],
+        crs="EPSG:3067",
+    )
+    zones.to_file(tmp_path / "zones.gpkg")
+    (tmp_path / "regions.csv").write_text(
+        "municipality;region\nAlpha;Seutu\nBeta;Seutu\n", encoding="utf-8"
+    )
+    table = load_zone_table(tmp_path / "zones.gpkg", "input_zone_id", "municipality")
+    groups = TripLengthGroups(table, ["Alpha", "Beta", "Gamma"],
+                              load_regions(tmp_path / "regions.csv"))
+
+    path = tmp_path / "trip_lengths_bike.npz"
+    np.savez(
+        path,
+        origin=np.array([1, 1, 1, 2, 3, 3]),
+        destination=np.array([1, 2, 3, 1, 1, 2]),
+        demand=np.array([10.0, 4.0, 1.0, 5.0, 2.0, 3.0]),
+        length_m=np.array([0.0, 1500.0, 25000.0, 4000.0, np.nan, 800.0], dtype=np.float32),
+    )
+    result = groups.histograms("run", path)
+    assert result["labels"][0] == "0–1" and len(result["labels"]) == 8
+
+    alpha = result["municipalities"]["Alpha"]
+    # Intrazonal: 0.905 * sqrt(4 km² / pi) = 1.02 km, so the 1-2 km bin.
+    estimate = DISC_MEAN_DISTANCE * np.sqrt(2000.0**2 / np.pi)
+    assert 1000 < estimate < 2000
+    assert alpha["trips"] == [0, 14, 0, 0, 0, 0, 0, 1]
+    assert alpha["intrazonal"] == 10
+    assert alpha["mean_km"] == pytest.approx((10 * estimate + 4 * 1500 + 25000) / 15 / 1000)
+
+    gamma = result["municipalities"]["Gamma"]
+    assert gamma["trips"][0] == 3 and gamma["unreached"] == 2 and gamma["total"] == 3
+
+    region = result["regions"]["Seutu"]
+    assert region["municipalities"] == ["Alpha", "Beta"]
+    assert region["total"] == 20 and region["trips"][3] == 5  # Beta's 4 km trip
+    assert result["country"]["total"] == 23
+    assert sum(result["country"]["shares"]) == pytest.approx(1.0)
+
+
+def test_the_trip_length_api_needs_the_runs_file(municipality_data, tmp_path):
+    from valma_bike_and_walk.viewer.trip_lengths import TripLengthGroups, load_zone_table
+
+    data, run = municipality_data
+    zones = tmp_path / "zones.gpkg"
+    import geopandas as gpd
+
+    frame = gpd.read_file(zones)
+    frame["input_zone_id"] = [1, 2, 3]
+    frame.to_file(zones)
+    data.trip_lengths = TripLengthGroups(
+        load_zone_table(zones, "input_zone_id", "municipality"), data.municipalities.names
+    )
+    client = TestClient(create_app(data, tmp_path / "tiles"))
+    assert client.get("/api/meta").json()["trip_lengths"] is True
+    assert client.get("/api/trip-lengths", params={"run": run.name}).status_code == 409
+
+    np.savez(run.path.with_name("trip_lengths_bike.npz"), origin=np.array([1]),
+             destination=np.array([3]), demand=np.array([2.0]),
+             length_m=np.array([2500.0], dtype=np.float32))
+    body = client.get("/api/trip-lengths", params={"run": run.name}).json()
+    assert body["municipalities"]["Alpha"]["trips"][2] == 2.0
+    assert body["regions"] == {}
+
+
+def test_a_run_without_travel_times_says_so(links_path, tmp_path):
+    links = prepare_links(links_path, tmp_path / "cache")
+    run_path = tmp_path / "old" / "link_volumes_bike.npz"
+    run_path.parent.mkdir()
+    np.savez(run_path, u=np.array([1]), v=np.array([2]), link_id=np.array([10]),
+             direction=np.array([1]), volume=np.array([4.0]))
+    run = load_run(run_path, links)
+    from valma_bike_and_walk.viewer.municipalities import Municipalities
+
+    table = Municipalities(["A"], np.array([0, 0], dtype=np.int32), [{}], [[0, 0, 0, 0]])
+    with pytest.raises(ValueError, match="without travel times"):
+        table.stats(links, run)
+
+
+# --------------------------------------------------------------------------
 # Counter flows (select-link on click)
 # --------------------------------------------------------------------------
 

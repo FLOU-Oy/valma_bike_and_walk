@@ -31,7 +31,6 @@ import time
 from pathlib import Path
 from typing import Callable
 
-import geopandas as gpd
 import numpy as np
 import psutil
 from scipy.sparse import coo_matrix, csr_matrix
@@ -47,6 +46,7 @@ from valma_bike_and_walk.network import (  # noqa: E402
     network_for_links,
 )
 from valma_bike_and_walk.zones import Zones, load_zones  # noqa: E402
+from valma_bike_and_walk.vector_io import read_vector
 
 logger = logging.getLogger("bench")
 
@@ -283,7 +283,7 @@ def main() -> int:
     zone_sets = {"new": zones, "old": remap_zones(zones, osm_index)}
     zone_sets["new-osm"] = zone_sets["old"]
 
-    frame = gpd.read_file(args.zones, columns=[args.population_column])
+    frame = read_vector(args.zones, columns=[args.population_column])
     population = frame[args.population_column].to_numpy(dtype=float)[zones.ids]
     demand = gravity_demand(
         zones, population, args.demand_reach_km * 1000.0, 3_000.0, 0.5

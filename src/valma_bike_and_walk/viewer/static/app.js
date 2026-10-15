@@ -11,6 +11,9 @@ const state = {
   flowIndex: null, flowName: "", pollToken: 0,
   map: null, routeMode: false, origin: null, destination: null, route: null,
   vias: [], alternative: null, calibration: null, calibToken: 0,
+  munis: null, muniCompare: null, muniSort: { key: "bike_km", desc: true },
+  muniSelected: -1, muniOutline: null, muniToken: 0,
+  tl: null, tlCompare: null, tlGroup: "country", tlName: "", tlToken: 0,
 };
 const arrays = new Map();
 
@@ -138,7 +141,15 @@ function ratioColor(r) {
 const overlay = new deck.MapboxOverlay({ interleaved: false, layers: [], getTooltip: tooltip });
 
 function render() {
-  const layers = [
+  const layers = [];
+  if (state.muniOutline) {
+    layers.push(new deck.GeoJsonLayer({
+      id: "municipality", data: state.muniOutline, stroked: true, filled: true,
+      getFillColor: [11, 114, 133, 18], getLineColor: [11, 114, 133, 255],
+      lineWidthUnits: "pixels", getLineWidth: 2.5,
+    }));
+  }
+  layers.push(
     new deck.MVTLayer({
       id: "links",
       data: `${location.origin}/tiles/links/{z}/{x}/{y}.mvt`,
@@ -157,7 +168,7 @@ function render() {
       updateTriggers: { getLineColor: [state.version, state.minValue], getLineWidth: [state.version, state.minValue] },
       onClick: (info) => !state.routeMode && info.object && inspectLink(info.object.properties.i),
     }),
-  ];
+  );
   if (state.alternative) {
     layers.push(new deck.PathLayer({
       id: "alt-casing", data: [state.alternative], getPath: (f) => f.geometry.coordinates,
@@ -484,6 +495,283 @@ function showCalibration(c) {
   });
 }
 
+// -- municipalities ------------------------------------------------------
+
+const ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+function esc(s) { return String(s).replace(/[&<>"']/g, (c) => ESCAPES[c]); }
+
+async function fetchMunicipalities(run) {
+  const res = await fetch(`/api/municipalities?run=${encodeURIComponent(run)}`);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.detail || res.status);
+  return body;
+}
+
+async function loadMunicipalities() {
+  if (!state.meta.municipalities || !state.run) { $("muni-box").hidden = true; return; }
+  $("muni-box").hidden = false;
+  const token = ++state.muniToken;
+  const compare = state.compare && state.compare !== state.run ? state.compare : "";
+  try {
+    const [a, b] = await Promise.all([
+      fetchMunicipalities(state.run), compare ? fetchMunicipalities(compare) : null,
+    ]);
+    if (token !== state.muniToken) return;
+    state.munis = a;
+    state.muniCompare = b;
+  } catch (err) {
+    if (token !== state.muniToken) return;
+    state.munis = state.muniCompare = null;
+    $("muni-total").textContent = "";
+    $("muni-table").innerHTML = `<tr><td class="hint">${esc(err.message)}</td></tr>`;
+    return;
+  }
+  municipalityTable();
+  $("plot-open").hidden = !state.munis.fit;
+  if (!state.munis.fit) $("plot").hidden = true;
+  else if (!$("plot").hidden) drawPlot();
+  if (state.muniSelected >= 0) showMunicipality(state.muniSelected);
+}
+
+// Modal share against speed, one dot per municipality, sized by its trips.
+function drawPlot() {
+  const { rows, fit, run } = state.munis;
+  const mode = state.meta.mode;
+  const pts = rows.filter((r) => r.speed_kmh != null && r.mode_share != null);
+  const W = 600, H = 380, L = 48, R = 14, T = 12, B = 40;
+  const xs = pts.map((r) => r.speed_kmh), ys = pts.map((r) => 100 * r.mode_share);
+  const x0 = Math.floor(Math.min(...xs)), x1 = Math.ceil(Math.max(...xs));
+  const yStep = Math.max(...ys) > 25 ? 5 : 2;
+  const y1 = Math.ceil(Math.max(...ys) / yStep) * yStep;
+  const sx = (v) => L + ((v - x0) / (x1 - x0)) * (W - L - R);
+  const sy = (v) => H - B - (v / y1) * (H - T - B);
+  const maxTrips = Math.max(...pts.map((r) => r.all_trips));
+  const radius = (r) => 2.5 + 11 * Math.sqrt(r.all_trips / maxTrips);
+
+  let svg = "";
+  for (let v = x0; v <= x1; v++) {
+    svg += `<line class="grid" x1="${sx(v)}" x2="${sx(v)}" y1="${T}" y2="${H - B}"/>
+      <text x="${sx(v)}" y="${H - B + 15}" text-anchor="middle">${v}</text>`;
+  }
+  for (let v = 0; v <= y1; v += yStep) {
+    svg += `<line class="grid" x1="${L}" x2="${W - R}" y1="${sy(v)}" y2="${sy(v)}"/>
+      <text x="${L - 6}" y="${sy(v) + 4}" text-anchor="end">${v} %</text>`;
+  }
+  svg += `<line class="axis" x1="${L}" x2="${W - R}" y1="${H - B}" y2="${H - B}"/>
+    <line class="axis" x1="${L}" x2="${L}" y1="${T}" y2="${H - B}"/>
+    <text x="${(L + W - R) / 2}" y="${H - 6}" text-anchor="middle">Average ${esc(mode)} speed, km/h (bike-km ÷ bike-hours)</text>
+    <text transform="translate(12 ${(T + H - B) / 2}) rotate(-90)" text-anchor="middle">${esc(mode)} share of trips</text>`;
+  const fy = (v) => 100 * (fit.intercept + fit.slope * v);
+  svg += `<line class="fit" x1="${sx(x0)}" y1="${sy(fy(x0))}" x2="${sx(x1)}" y2="${sy(fy(x1))}"/>`;
+  // Big ones first so the small dots stay clickable on top.
+  const order = [...pts].sort((a, b) => b.all_trips - a.all_trips);
+  for (const r of order) {
+    svg += `<circle data-i="${r.index}" class="${r.index === state.muniSelected ? "sel" : ""}"
+      cx="${sx(r.speed_kmh)}" cy="${sy(100 * r.mode_share)}" r="${radius(r)}">
+      <title>${esc(r.name)}: ${fmt(r.speed_kmh, 2)} km/h, ${pct(r.mode_share)} of ${fmt(r.all_trips)} trips</title></circle>`;
+  }
+  const labelled = new Set(order.slice(0, 6).map((r) => r.index));
+  if (state.muniSelected >= 0) labelled.add(state.muniSelected);
+  for (const r of pts.filter((p) => labelled.has(p.index))) {
+    svg += `<text class="name" x="${sx(r.speed_kmh) + radius(r) + 3}" y="${sy(100 * r.mode_share) + 4}">${esc(r.name)}</text>`;
+  }
+  $("plot-svg").innerHTML = svg;
+  $("plot-svg").querySelectorAll("circle").forEach((c) =>
+    c.addEventListener("click", () => selectMunicipality(Number(c.dataset.i))));
+  $("plot-title").textContent = `${mode} share vs speed · ${run}`;
+  $("plot-stats").innerHTML = `<b>R² = ${fmt(fit.r2, 3)}</b> (each municipality once) ·
+    R² = ${fmt(fit.r2_weighted, 3)} weighted by trips · n = ${fit.n} ·
+    slope ${signed(100 * fit.slope, 2)} percentage points per km/h. Dot size: trips, all modes.`;
+}
+
+function speedDelta(i) {
+  const a = state.munis.rows[i].speed_kmh, b = state.muniCompare?.rows[i].speed_kmh;
+  return a != null && b != null ? a - b : null;
+}
+
+function pct(v, d = 1) { return v == null ? "–" : `${fmt(100 * v, d)} %`; }
+
+function signed(v, d) { return v == null ? "–" : `${v >= 0 ? "+" : ""}${fmt(v, d)}`; }
+
+function municipalityTable() {
+  const { rows, total } = state.munis;
+  const cmp = !!state.muniCompare;
+  const shares = total.mode_share != null;
+  $("muni-total").textContent = `· Finland ${fmt(total.speed_kmh, 2)} km/h`;
+  const q = $("muni-search").value.trim().toLocaleLowerCase();
+  const { key, desc } = state.muniSort;
+  const get = (r) => (key === "delta" ? speedDelta(r.index) : r[key]);
+  const shown = rows
+    .filter((r) => !q || r.name.toLocaleLowerCase().includes(q))
+    .sort((a, b) => {
+      if (key === "name") return (desc ? -1 : 1) * a.name.localeCompare(b.name, "fi");
+      const x = get(a), y = get(b);
+      if (x == null || y == null) return (x == null) - (y == null);  // blanks last
+      return desc ? y - x : x - y;
+    });
+  const head = (k, label, num = true) =>
+    `<th class="${num ? "num" : ""}" data-key="${k}">${label}${key === k ? (desc ? " ▾" : " ▴") : ""}</th>`;
+  const body = shown.map((r) => `<tr data-i="${r.index}" class="${r.index === state.muniSelected ? "sel" : ""}">
+      <td>${esc(r.name)}</td><td class="num">${fmt(r.speed_kmh, 2)}</td>
+      ${cmp ? `<td class="num">${signed(speedDelta(r.index), 2)}</td>` : ""}
+      ${shares ? `<td class="num">${pct(r.mode_share)}</td>` : ""}
+      <td class="num">${fmt(r.bike_km)}</td></tr>`).join("");
+  $("muni-table").innerHTML = `<thead><tr>${head("name", "Municipality", false)}${head("speed_kmh", "km/h")}
+      ${cmp ? head("delta", "Δ vs B") : ""}${shares ? head("mode_share", "share") : ""}${head("bike_km", "bike-km")}</tr></thead>
+    <tbody>${body || `<tr><td class="hint" colspan="5">No match.</td></tr>`}</tbody>`;
+  $("muni-table").querySelectorAll("th").forEach((th) => th.addEventListener("click", () => {
+    const k = th.dataset.key;
+    state.muniSort = { key: k, desc: state.muniSort.key === k ? !state.muniSort.desc : k !== "name" };
+    municipalityTable();
+  }));
+  $("muni-table").querySelectorAll("tbody tr[data-i]").forEach((tr) =>
+    tr.addEventListener("click", () => selectMunicipality(Number(tr.dataset.i))));
+}
+
+async function selectMunicipality(i) {
+  state.muniSelected = i;
+  municipalityTable();
+  if (state.tlGroup === "municipality" && state.munis) {
+    state.tlName = state.munis.rows[i].name;
+    tripLengthOptions();
+    drawTripLengths();
+  }
+  if (!$("plot").hidden) drawPlot();
+  showMunicipality(i);
+  const res = await fetch(`/api/municipality/${i}`);
+  if (!res.ok || state.muniSelected !== i) return;
+  state.muniOutline = await res.json();
+  const [w, s, e, n] = state.muniOutline.properties.bounds;
+  state.map.fitBounds([[w, s], [e, n]], { padding: 40, duration: 600 });
+  render();
+}
+
+function clearMunicipality() {
+  state.muniSelected = -1;
+  state.muniOutline = null;
+  $("details").innerHTML = `<p class="hint">Click a link or a counter for details.</p>`;
+  if (state.munis) municipalityTable();
+  if (!$("plot").hidden) drawPlot();
+  render();
+}
+
+function showMunicipality(i) {
+  if (!state.munis) return;
+  const r = state.munis.rows[i], total = state.munis.total;
+  const ranked = state.munis.rows.filter((x) => x.speed_kmh != null)
+    .sort((a, b) => b.speed_kmh - a.speed_kmh);
+  const rank = ranked.findIndex((x) => x.index === i) + 1;
+  const b = state.muniCompare?.rows[i];
+  const colB = (v, d) => (b ? `<td class="num">${fmt(v, d)}</td>` : "");
+  const line = (label, key, d, unit = "") =>
+    `<tr><td>${label}</td><td class="num">${fmt(r[key], d)}${unit}</td>${colB(b?.[key], d)}</tr>`;
+  $("details").innerHTML = `
+    <h2>${esc(r.name)}</h2>
+    <table>
+      ${b ? `<tr><th></th><th class="num">${esc(state.run)}</th><th class="num">${esc(state.compare)}</th></tr>` : ""}
+      ${line("Average speed", "speed_kmh", 2, " km/h")}
+      ${line("Bike-km / day", "bike_km", 0)}
+      ${line("Bike-hours / day", "bike_hours", 1)}
+      ${line("Links ridden", "links", 0)}
+      ${r.mode_share != null ? `<tr><td>${esc(state.meta.mode)} share of trips</td><td class="num">${pct(r.mode_share, 2)}</td>${b ? "<td></td>" : ""}</tr>
+        <tr><td>Trips / day, all modes</td><td class="num">${fmt(r.all_trips)}</td>${b ? "<td></td>" : ""}</tr>` : ""}
+      <tr><td>Rank by speed</td><td class="num">${rank ? `${rank} / ${ranked.length}` : "–"}</td>${b ? "<td></td>" : ""}</tr>
+      <tr><td>Finland average</td><td class="num">${fmt(total.speed_kmh, 2)} km/h</td>${colB(state.muniCompare?.total.speed_kmh, 2)}</tr>
+    </table>
+    <button id="muni-clear">Clear selection</button>`;
+  $("muni-clear").addEventListener("click", clearMunicipality);
+}
+
+// -- trip lengths --------------------------------------------------------
+
+async function fetchTripLengths(run) {
+  const res = await fetch(`/api/trip-lengths?run=${encodeURIComponent(run)}`);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.detail || res.status);
+  return body;
+}
+
+async function loadTripLengths() {
+  if (!state.meta.trip_lengths || !state.run) { $("tl-box").hidden = true; return; }
+  $("tl-box").hidden = false;
+  const token = ++state.tlToken;
+  const compare = state.compare && state.compare !== state.run ? state.compare : "";
+  try {
+    const [a, b] = await Promise.all([
+      fetchTripLengths(state.run), compare ? fetchTripLengths(compare).catch(() => null) : null,
+    ]);
+    if (token !== state.tlToken) return;
+    state.tl = a;
+    state.tlCompare = b;
+  } catch (err) {
+    if (token !== state.tlToken) return;
+    state.tl = state.tlCompare = null;
+    $("tl-svg").innerHTML = "";
+    $("tl-stats").textContent = err.message;
+    return;
+  }
+  $("tl-group").querySelector('option[value="region"]').disabled = !Object.keys(state.tl.regions).length;
+  tripLengthOptions();
+  drawTripLengths();
+}
+
+function tripLengthOptions() {
+  const group = state.tlGroup;
+  $("tl-name-label").hidden = group === "country";
+  if (group === "country" || !state.tl) return;
+  const names = group === "region"
+    ? Object.keys(state.tl.regions)
+    : Object.keys(state.tl.municipalities).sort((a, b) => a.localeCompare(b, "fi"));
+  if (!names.includes(state.tlName)) state.tlName = names[0] || "";
+  $("tl-name-title").textContent = group === "region" ? "Region" : "Municipality";
+  $("tl-name").innerHTML = names.map((n) =>
+    `<option${n === state.tlName ? " selected" : ""}>${esc(n)}</option>`).join("");
+}
+
+function tripLengthGroup(d) {
+  if (!d) return null;
+  if (state.tlGroup === "region") return d.regions[state.tlName] || null;
+  if (state.tlGroup === "municipality") return d.municipalities[state.tlName] || null;
+  return d.country;
+}
+
+function drawTripLengths() {
+  if (!state.tl) return;
+  const a = tripLengthGroup(state.tl), b = tripLengthGroup(state.tlCompare);
+  const labels = state.tl.labels;
+  if (!a || !a.total) {
+    $("tl-svg").innerHTML = "";
+    $("tl-stats").textContent = "No trips start here in this run.";
+    return;
+  }
+  const W = 312, H = 200, L = 6, R = 6, T = 16, B = 30;
+  const top = Math.max(...a.shares, ...(b ? b.shares : [0])) * 1.12 || 1;
+  const slot = (W - L - R) / labels.length;
+  const y = (v) => H - B - (v / top) * (H - T - B);
+  let svg = `<line class="axis" x1="${L}" x2="${W - R}" y1="${H - B}" y2="${H - B}"/>`;
+  labels.forEach((label, i) => {
+    const x = L + i * slot, v = a.shares[i];
+    svg += `<rect class="bar" x="${x + slot * 0.14}" y="${y(v)}" width="${slot * 0.72}" height="${H - B - y(v)}">
+        <title>${label} km: ${pct(v)} (${fmt(a.trips[i])} trips)</title></rect>
+      <text class="val" x="${x + slot / 2}" y="${y(v) - 3}" text-anchor="middle">${fmt(100 * v, 0)}</text>
+      <text x="${x + slot / 2}" y="${H - B + 13}" text-anchor="middle">${label}</text>`;
+    if (b) {
+      const w = b.shares[i];
+      svg += `<rect class="bar-b" x="${x + slot * 0.14}" y="${y(w)}" width="${slot * 0.72}" height="${H - B - y(w)}">
+        <title>${esc(state.compare)}: ${pct(w)}</title></rect>`;
+    }
+  });
+  svg += `<text x="${W / 2}" y="${H - 3}" text-anchor="middle">km on the network · bars: % of trips</text>`;
+  $("tl-svg").innerHTML = svg;
+  const where = state.tlGroup === "country" ? "Whole country" : state.tlName;
+  const all = a.total + a.unreached;
+  const members = a.municipalities ? ` (${a.municipalities.length} municipalities)` : "";
+  $("tl-stats").innerHTML = `<b>${esc(where)}</b>${esc(members)}: ${fmt(a.total)} trips/day,
+    mean ${fmt(a.mean_km, 2)} km${b && b.mean_km != null ? ` (B: ${fmt(b.mean_km, 2)} km)` : ""}.
+    Intrazonal (estimated) ${pct(a.intrazonal / all)} · beyond the cutoff ${pct(a.unreached / all)}.
+    ${b ? `<br><span style="color:#e8590c">▭</span> outline: ${esc(state.compare)}` : ""}`;
+}
+
 function clearFlow() {
   state.flowIndex = null;
   state.flowName = "";
@@ -577,9 +865,25 @@ async function loadCounters() {
     $("route-box").hidden = true;
   }
 
-  $("run").addEventListener("change", async (e) => { state.run = e.target.value; await loadCounters(); refresh(); });
+  $("run").addEventListener("change", async (e) => {
+    state.run = e.target.value; await loadCounters(); refresh(); loadMunicipalities(); loadTripLengths();
+  });
   $("measure").addEventListener("change", (e) => { state.measure = e.target.value; refresh(); });
-  $("compare").addEventListener("change", (e) => { state.compare = e.target.value; refresh(); });
+  $("compare").addEventListener("change", (e) => {
+    state.compare = e.target.value; refresh(); loadMunicipalities(); loadTripLengths();
+  });
+  $("tl-group").addEventListener("change", (e) => {
+    state.tlGroup = e.target.value;
+    if (state.tlGroup === "municipality" && state.muniSelected >= 0 && state.munis) {
+      state.tlName = state.munis.rows[state.muniSelected].name;
+    }
+    tripLengthOptions();
+    drawTripLengths();
+  });
+  $("tl-name").addEventListener("change", (e) => { state.tlName = e.target.value; drawTripLengths(); });
+  $("muni-search").addEventListener("input", () => state.munis && municipalityTable());
+  $("plot-open").addEventListener("click", () => { $("plot").hidden = false; drawPlot(); });
+  $("plot-close").addEventListener("click", () => { $("plot").hidden = true; });
   $("minvalue").addEventListener("input", (e) => {
     state.minValue = Number(e.target.value);
     $("minvalue-out").textContent = e.target.value;
@@ -589,4 +893,6 @@ async function loadCounters() {
 
   await loadCounters();
   await refresh();
+  loadMunicipalities();
+  loadTripLengths();
 })().catch((err) => status(`Error: ${err.message}`));

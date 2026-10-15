@@ -32,6 +32,7 @@ from valma_bike_and_walk.speeds import (
     carriageway_divisor,
     profile_for,
 )
+from valma_bike_and_walk.vector_io import read_vector
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,10 @@ class Run:
     path: Path
     forward: np.ndarray  # float32, one per link row
     reverse: np.ndarray
+    #: The routed travel time each way, seconds, penalties included; None for
+    #: files written before ``travel_time_s`` was saved. NaN where unrouted.
+    forward_time: np.ndarray | None = None
+    reverse_time: np.ndarray | None = None
 
     @property
     def total(self) -> np.ndarray:
@@ -150,6 +155,7 @@ def load_run(path: Path, links: gpd.GeoDataFrame, name: str | None = None) -> Ru
     n = len(links)
     forward = np.zeros(n, dtype=np.float64)
     reverse = np.zeros(n, dtype=np.float64)
+    forward_time = reverse_time = None
 
     if "link_id" in data.files:
         position = pd.Index(links["link_id"].to_numpy()).get_indexer(data["link_id"])
@@ -157,6 +163,12 @@ def load_run(path: Path, links: gpd.GeoDataFrame, name: str | None = None) -> Ru
         ok = position >= 0
         np.add.at(forward, position[ok & along], volume[ok & along])
         np.add.at(reverse, position[ok & ~along], volume[ok & ~along])
+        if "travel_time_s" in data.files:
+            time = np.asarray(data["travel_time_s"], dtype=np.float32)
+            forward_time = np.full(n, np.nan, dtype=np.float32)
+            reverse_time = np.full(n, np.nan, dtype=np.float32)
+            forward_time[position[ok & along]] = time[ok & along]
+            reverse_time[position[ok & ~along]] = time[ok & ~along]
     else:
         ends = pd.MultiIndex.from_arrays(
             [links["u"].to_numpy(np.int64), links["v"].to_numpy(np.int64)]
@@ -187,6 +199,8 @@ def load_run(path: Path, links: gpd.GeoDataFrame, name: str | None = None) -> Ru
         path=Path(path),
         forward=forward.astype(np.float32),
         reverse=reverse.astype(np.float32),
+        forward_time=forward_time,
+        reverse_time=reverse_time,
     )
 
 
@@ -232,6 +246,10 @@ class ViewerData:
     flows: object | None = None
     #: Point-to-point router (viewer.route.Router), when the graph is loaded.
     router: object | None = None
+    #: Municipality of each link (viewer.municipalities.Municipalities).
+    municipalities: object | None = None
+    #: Trip length histograms (viewer.trip_lengths.TripLengthGroups).
+    trip_lengths: object | None = None
     _speeds: tuple[np.ndarray, np.ndarray] | None = None
 
     def __post_init__(self) -> None:
@@ -409,7 +427,7 @@ def load_counters(
     Matching follows ``scripts/compare_counter_volumes.py``: the observed
     counter with the same name (minus a "PP" suffix), nearest the line.
     """
-    lines = gpd.read_file(count_lines_path, layer=layer).to_crs(WEB_MERCATOR)
+    lines = read_vector(count_lines_path, layer=layer).to_crs(WEB_MERCATOR)
     observed = pd.read_csv(observed_path, encoding="utf-8-sig")
     points = gpd.GeoDataFrame(
         observed,

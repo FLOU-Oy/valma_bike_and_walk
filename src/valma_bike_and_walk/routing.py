@@ -469,6 +469,9 @@ def _aon_rows(
     volume,
     missed,
     flow,
+    edge_length,
+    od_length,
+    tree_length,
     stamp,
     serial,
     dist,
@@ -490,7 +493,13 @@ def _aon_rows(
     Demand to an unreached destination sets ``missed`` at its position in the
     demand arrays. Demand to the source itself is a zero-length trip: neither
     loaded nor missed.
+
+    When ``od_length`` is not empty, each demand entry's position in it gets the
+    length of the path its demand was loaded on (``edge_length`` summed along
+    the tree, settling order, so a node's predecessor is always done first),
+    NaN if unreached and 0 to the source itself. ``tree_length`` is scratch.
     """
+    lengths = od_length.shape[0] > 0
     for r in range(sources.shape[0]):
         row = row_offset + r
         lo = demand_indptr[row]
@@ -524,14 +533,27 @@ def _aon_rows(
             heap_node,
         )
 
+        if lengths:
+            tree_length[source] = 0.0
+            for s in range(1, n_settled):
+                node = settled[s]
+                edge = pred_edge[node]
+                tree_length[node] = tree_length[edge_tail[edge]] + edge_length[edge]
+
         for k in range(lo, hi):
             node = targets[demand_indices[k]]
             if node == source:
+                if lengths:
+                    od_length[k] = 0.0
                 continue
             if dist[node] == np.inf:
                 missed[k] = True
+                if lengths:
+                    od_length[k] = np.nan
             else:
                 flow[node] += demand_data[k]
+                if lengths:
+                    od_length[k] = tree_length[node]
 
         # settled[0] is the source, which has no edge to push flow onto.
         for s in range(n_settled - 1, 0, -1):
@@ -771,7 +793,12 @@ class _Workspace:
     """One thread's scratch arrays. About 32 bytes per node, plus a heap."""
 
     def __init__(
-        self, n_nodes: int, flow: bool = False, n_edges: int = 0, select: bool = False
+        self,
+        n_nodes: int,
+        flow: bool = False,
+        n_edges: int = 0,
+        select: bool = False,
+        lengths: bool = False,
     ) -> None:
         self.dist = np.full(n_nodes, np.inf, dtype=np.float64)
         self.pred_edge = np.empty(n_nodes, dtype=np.int64)
@@ -787,6 +814,8 @@ class _Workspace:
         self.via = np.zeros(n_nodes if select else 0, dtype=np.bool_)
         self.select_flow = np.zeros(n_nodes if select else 0, dtype=np.float64)
         self.select_volume = np.zeros(n_edges if select else 0, dtype=np.float64)
+        # Path lengths along the tree: only allocated when a run asks for them.
+        self.tree_length = np.zeros(n_nodes if lengths else 0, dtype=np.float64)
 
 
 def workspace_bytes(n_nodes: int, n_edges: int, flow: bool = False) -> int:
@@ -1052,13 +1081,27 @@ def aon(
     workers: int = 1,
     chunk_size: int | None = None,
     progress_every: int = 10,
+    edge_length: np.ndarray | None = None,
+    od_length: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     All-or-nothing assignment of a CSR demand matrix (rows = sources).
 
     Returns ``(volume, missed)``: volume per directed edge, and a mask over the
     demand's nonzeros marking the ones with no path within ``limit``.
+
+    Given ``edge_length`` (per edge) and ``od_length`` (float64, one per demand
+    nonzero), each nonzero's path length is written into ``od_length`` from the
+    same searches: NaN where unreached, 0 from a source to itself.
     """
+    lengths = od_length is not None
+    if lengths:
+        if edge_length is None or od_length.shape != demand_data.shape:
+            raise ValueError("od_length needs edge_length and one slot per demand nonzero.")
+        edge_length = np.ascontiguousarray(edge_length, dtype=np.float64)
+    else:
+        edge_length = np.zeros(0, dtype=np.float64)
+        od_length = np.zeros(0, dtype=np.float64)
     sources = np.ascontiguousarray(sources, dtype=np.int32)
     targets = np.ascontiguousarray(targets, dtype=np.int32)
     demand_indptr = np.ascontiguousarray(demand_indptr, dtype=np.int64)
@@ -1095,6 +1138,9 @@ def aon(
             ws.volume,
             missed,
             ws.flow,
+            edge_length,
+            od_length,
+            ws.tree_length,
             ws.stamp,
             ws.serial,
             ws.dist,
@@ -1108,7 +1154,9 @@ def aon(
     workspaces = _run(
         tasks,
         solve,
-        lambda: _Workspace(graph.n_nodes, flow=True, n_edges=graph.n_edges),
+        lambda: _Workspace(
+            graph.n_nodes, flow=True, n_edges=graph.n_edges, lengths=lengths
+        ),
         workers,
         progress_every,
     )

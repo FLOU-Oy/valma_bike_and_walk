@@ -366,8 +366,16 @@ def settle(
     command: str,
     applied: dict[str, Setting],
     given: set[str],
+    config: Config | None = None,
 ) -> None:
-    """Finish what parsing alone cannot: exclusive options and placeholders."""
+    """
+    Finish what parsing alone cannot: exclusive options and placeholders.
+
+    ``{mode}`` and ``{scenario}`` come from the command's own options where it
+    has them. A command without one -- ``traffic`` takes no ``--mode`` -- still
+    reads it from ``config``, so a shared ``links = "{mode}_links.gpkg"`` means
+    the same layer to every command the file serves.
+    """
     # --zones on the command line displaces centroids from a file.
     for group in subparsers(parser)[command]._mutually_exclusive_groups:
         dests = {action.dest for action in group._group_actions}
@@ -381,15 +389,43 @@ def settle(
         for dest in applied
         if dest not in given and getattr(args, dest, None) is not None
     ]
+    mode = _not_an_option(args, config, command, "mode")
+    if mode is not None:
+        mode = mode.value
+    scenario = _not_an_option(args, config, command, "scenario")
+    if scenario is not None:
+        # No option of this command holds it, so the loop below will not fill it.
+        scenario = _fill(
+            scenario.value,
+            _Fields(
+                mode=getattr(args, "mode", mode),
+                scenario=None,
+                dest="scenario",
+                source=scenario.source,
+            ),
+        )
+
     # The scenario's own name may say which mode it is for, so fill it first.
     for dest in sorted(from_files, key=lambda d: d != "scenario"):
         fields = _Fields(
-            mode=getattr(args, "mode", None),
-            scenario=getattr(args, "scenario", None),
+            mode=getattr(args, "mode", mode),
+            scenario=getattr(args, "scenario", scenario),
             dest=dest,
             source=applied[dest].source,
         )
         setattr(args, dest, _fill(getattr(args, dest), fields))
+
+
+def _not_an_option(
+    args: argparse.Namespace, config: Config | None, command: str, name: str
+) -> Setting | None:
+    """The files' ``name``, for a command that has no option of that name."""
+    if hasattr(args, name) or config is None:
+        return None
+    setting = config.sections.get(command, {}).get(name) or config.shared.get(name)
+    if setting is not None and not isinstance(setting.value, str):
+        raise ConfigError(f"{setting.source}: {name} should be a string.")
+    return setting
 
 
 class _Fields(dict):
@@ -420,6 +456,8 @@ def _fill(value: Any, fields: _Fields) -> Any:
     if isinstance(value, (str, Path)):
         try:
             filled = str(value).format_map(fields)
+        except ConfigError:
+            raise  # already says what is wrong, and where
         except (ValueError, IndexError, AttributeError) as error:
             raise ConfigError(
                 f"{fields.source}: {fields.dest}: {error}. Write {{{{ and }}}} for "

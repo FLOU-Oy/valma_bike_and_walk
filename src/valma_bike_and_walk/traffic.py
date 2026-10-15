@@ -70,6 +70,7 @@ import shapely
 from valma_bike_and_walk.config import PROJECTED_CRS
 from valma_bike_and_walk.links import ONEWAY_VALUES, geometry_lengths
 from valma_bike_and_walk.progress import Progress
+from valma_bike_and_walk.vector_io import read_vector
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +235,7 @@ def read_volumes(
     along as noise.
     """
     path = Path(path)
-    volumes = gpd.read_file(path, layer=layer) if layer else gpd.read_file(path)
+    volumes = read_vector(path, layer=layer) if layer else read_vector(path)
     if column not in volumes.columns:
         raise ValueError(
             f"{path} has no {column!r} column; it has "

@@ -607,12 +607,17 @@ class DemCache:
 
     # -- reading ----------------------------------------------------------
 
-    def sample(self, east: np.ndarray, north: np.ndarray) -> np.ndarray:
+    def sample(
+        self, east: np.ndarray, north: np.ndarray, workers: int | None = None
+    ) -> np.ndarray:
         """
         Height at each projected point, NaN where the DEM does not cover it.
 
-        Points are grouped by tile so each raster is opened once, however the
-        caller happened to order them.
+        Points are grouped by tile -- one sort, however the caller ordered them --
+        and each tile is read whole and indexed with numpy: the pixel a point
+        falls in, as ``dataset.sample`` would pick, without a read per point.
+        Tiles are read on ``workers`` threads (default: all cores but two);
+        GDAL releases the GIL while it reads and decompresses.
         """
         rasterio = _require_rasterio()
 
@@ -624,40 +629,63 @@ class DemCache:
 
         cols = np.floor(east / self.tile_m).astype(np.int64)
         rows = np.floor(north / self.tile_m).astype(np.int64)
-        keys = np.column_stack([cols, rows])
-        unique, inverse = np.unique(keys, axis=0, return_inverse=True)
+        # One integer per tile: np.unique over rows (axis=0) is ~20x slower on
+        # tens of millions of points. Tile rows stay far below 2**31 in metres.
+        key, inverse = np.unique((cols << 32) + (rows - rows.min()), return_inverse=True)
+        inverse = inverse.ravel()
+        unique = np.column_stack([key >> 32, (key & 0xFFFFFFFF) + rows.min()])
+        # Each tile's points as one contiguous run of `order`.
+        order = np.argsort(inverse, kind="stable")
+        bounds = np.searchsorted(inverse[order], np.arange(len(unique) + 1))
 
-        logger.info("Reading %d height(s) from %d DEM tile(s)", east.size, len(unique))
+        def read(i: int) -> str | None:
+            col, row = unique[i]
+            tile = Tile(int(col), int(row), self.tile_m, self.resolution_m)
+            path = self.path(tile)
+            if not path.exists():
+                return tile.filename
+            selected = order[bounds[i] : bounds[i + 1]]
+            with rasterio.open(path) as dataset:
+                band = dataset.read(1)
+                nodata = dataset.nodata
+                pixel_col, pixel_row = ~dataset.transform * (east[selected], north[selected])
+            pixel_col = np.floor(pixel_col).astype(np.int64)
+            pixel_row = np.floor(pixel_row).astype(np.int64)
+            inside = (
+                (pixel_row >= 0)
+                & (pixel_row < band.shape[0])
+                & (pixel_col >= 0)
+                & (pixel_col < band.shape[1])
+            )
+            values = np.full(selected.size, np.nan)
+            values[inside] = band[pixel_row[inside], pixel_col[inside]]
+            values[values == NODATA] = np.nan
+            if nodata is not None:
+                values[values == nodata] = np.nan
+            heights[selected] = values
+            return None
+
+        workers = max(1, (os.cpu_count() or 4) - 2) if workers is None else max(1, workers)
+        logger.info(
+            "Reading %d height(s) from %d DEM tile(s) on %d thread(s)",
+            east.size,
+            len(unique),
+            workers,
+        )
+        missing: list[str] = []
         with Progress(len(unique), "  reading tiles") as progress:
-            for i, (col, row) in enumerate(unique):
-                tile = Tile(int(col), int(row), self.tile_m, self.resolution_m)
-                path = self.path(tile)
-                if not path.exists():
-                    logger.warning(
-                        "No cached DEM tile for %s; leaving those NaN", tile.filename
-                    )
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for absent in pool.map(read, range(len(unique))):
+                    if absent is not None:
+                        missing.append(absent)
                     progress.advance()
-                    continue
-
-                selected = np.flatnonzero(inverse == i)
-                with rasterio.open(path) as dataset:
-                    values = np.fromiter(
-                        (
-                            v[0]
-                            for v in dataset.sample(
-                                zip(east[selected], north[selected])
-                            )
-                        ),
-                        dtype=float,
-                        count=selected.size,
-                    )
-                    nodata = dataset.nodata
-                values[values == NODATA] = np.nan
-                if nodata is not None:
-                    values[values == nodata] = np.nan
-                heights[selected] = values
-                progress.advance()
-
+        if missing:
+            logger.warning(
+                "No cached DEM tile for %d of %d tile(s) (e.g. %s); leaving those NaN",
+                len(missing),
+                len(unique),
+                ", ".join(missing[:3]),
+            )
         return heights
 
 
@@ -839,11 +867,53 @@ def _sample_positions(
     # on its endpoints and z_u/z_v come out of the same pass.
     fraction = within / (np.repeat(counts, counts) - 1)
 
-    points = shapely.line_interpolate_point(
-        np.repeat(geometry, counts), fraction * np.repeat(length, counts)
+    distance = fraction * np.repeat(length, counts)
+    plain_lines = np.all(
+        (shapely.get_type_id(geometry) == shapely.GeometryType.LINESTRING)
+        & (shapely.get_num_coordinates(geometry) >= 2)
     )
+    if plain_lines:
+        east, north = _interpolate_lines(geometry, link_index, distance)
+    else:
+        points = shapely.line_interpolate_point(np.repeat(geometry, counts), distance)
+        east, north = shapely.get_x(points), shapely.get_y(points)
     step_m = length / (counts - 1)
-    return link_index, shapely.get_x(points), shapely.get_y(points), counts, step_m
+    return link_index, east, north, counts, step_m
+
+
+def _interpolate_lines(
+    geometry: np.ndarray, link_index: np.ndarray, distance: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    ``shapely.line_interpolate_point`` for LineStrings, in numpy alone.
+
+    The same points, without making a geometry object for each of tens of
+    millions of samples: every vertex gets its distance along one running
+    total over all the lines, a sample's distance is looked up in it with a
+    binary search kept inside its own line, and the point is interpolated on
+    the segment found.
+    """
+    coords, owner = shapely.get_coordinates(geometry, return_index=True)
+    n_lines = geometry.shape[0]
+    first = np.searchsorted(owner, np.arange(n_lines))
+    last = np.searchsorted(owner, np.arange(n_lines), side="right") - 1
+
+    segment = np.hypot(np.diff(coords[:, 0]), np.diff(coords[:, 1]))
+    segment[owner[1:] != owner[:-1]] = 0.0  # no segment from one line to the next
+    along = np.zeros(coords.shape[0])
+    np.cumsum(segment, out=along[1:])
+
+    target = along[first[link_index]] + distance
+    start = np.searchsorted(along, target, side="right") - 1
+    # Kept on one of the line's own segments, so the end lands on its last vertex.
+    start = np.clip(start, first[link_index], np.maximum(last[link_index] - 1, first[link_index]))
+    end = np.minimum(start + 1, last[link_index])
+    span = along[end] - along[start]
+    t = np.divide(target - along[start], span, out=np.zeros_like(span), where=span > 0)
+    t = np.clip(t, 0.0, 1.0)
+    east = coords[start, 0] + t * (coords[end, 0] - coords[start, 0])
+    north = coords[start, 1] + t * (coords[end, 1] - coords[start, 1])
+    return east, north
 
 
 def _remove_grid_spikes(
@@ -1048,10 +1118,13 @@ def add_elevation(
     ``grade_override`` added -- the same "an empty column is an invitation"
     convention ``speed_override_kmh`` follows.
     """
-    cache.ensure(tiles_for_links(links, cache.resolution_m, cache.tile_m), workers)
+    # Projected once here: each step below would otherwise reproject the whole
+    # layer itself, which on a country is a quarter of a minute each time.
+    projected = _projected(links)
+    cache.ensure(tiles_for_links(projected, cache.resolution_m, cache.tile_m), workers)
 
     links = links.copy()
-    profile = link_profiles(links, cache.sample, spacing_m=spacing_m)
+    profile = link_profiles(projected, cache.sample, spacing_m=spacing_m)
     for column in ("z_u", "z_v", "ascent_m", "descent_m"):
         links[column] = profile[column].to_numpy()
     if "grade_override" not in links.columns:
