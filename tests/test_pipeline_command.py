@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 
+import pytest
 
 from valma_bike_and_walk.pipeline import build_plan, run_pipeline
 
@@ -164,8 +165,25 @@ def test_skipped_steps_are_left_out(tmp_path):
     assert world.go(skip={"dem"})[1] == ["extract", "traffic", "connect", "assign"]
 
 
-def test_the_real_commands_run_once_and_then_stay_up_to_date(tmp_path, capsys):
-    """extract -> connect -> assign through `valma pipeline`, on a tiny OSM file."""
+BASE_SETTINGS = """\
+mode = "walk"
+scenario = "base"
+output_dir = "../output"
+cache_dir = "../cache"
+links = "../output/{scenario}/{mode}_links.gpkg"
+centroids = "../data/points.csv"
+id_column = "id"
+demand = "../data/od.csv"
+workers = 1
+
+[extract]
+pbf = "../data/chain.osm.pbf"
+"""
+
+
+@pytest.fixture
+def real_project(tmp_path, capsys):
+    """A tiny OSM file, zones and demand, and `valma pipeline` over them."""
     from valma_bike_and_walk.cli import main
 
     from .conftest import write_pbf
@@ -173,25 +191,35 @@ def test_the_real_commands_run_once_and_then_stay_up_to_date(tmp_path, capsys):
 
     (tmp_path / "data").mkdir()
     write_pbf(tmp_path / "data" / "chain.osm.pbf", NODES, WAYS)
-    (tmp_path / "data" / "points.csv").write_text("id,lon,lat\n1,24.000,60.000\n2,24.004,60.000\n")
+    (tmp_path / "data" / "points.csv").write_text(
+        "id,lon,lat\n1,24.000,60.000\n2,24.004,60.000\n"
+    )
     (tmp_path / "data" / "od.csv").write_text("origin_id,destination_id,demand\n1,2,10\n")
     settings = tmp_path / "scenarios" / "base.toml"
     settings.parent.mkdir()
-    settings.write_text(
-        'mode = "walk"\nscenario = "base"\noutput_dir = "../output"\ncache_dir = "../cache"\n'
-        'links = "../output/{scenario}/{mode}_links.gpkg"\ncentroids = "../data/points.csv"\n'
-        'id_column = "id"\ndemand = "../data/od.csv"\nworkers = 1\n'
-        '[extract]\npbf = "../data/chain.osm.pbf"\n',
-        encoding="utf-8",
-    )
 
-    def pipeline(*extra):
+    def write_settings(extra: str = "") -> None:
+        """The base settings, plus ``extra`` -- more lines or sections."""
+        settings.write_text(BASE_SETTINGS + extra, encoding="utf-8")
+
+    def pipeline(*flags):
+        """Run it; return each step's status line, e.g. {"dem": "skipped (--skip)"}."""
         capsys.readouterr()
-        assert main(["pipeline", "-c", str(settings), "--skip", "dem", *extra]) == 0
+        assert main(["pipeline", "-c", str(settings), "--skip", "dem", *flags]) == 0
         lines = capsys.readouterr().out.splitlines()
-        return {line.split(":")[0].strip(): line.split(":", 1)[1].strip()
-                for line in lines if line.startswith("  ")}
+        return {
+            line.split(":")[0].strip(): line.split(":", 1)[1].strip()
+            for line in lines
+            if line.startswith("  ")
+        }
 
+    write_settings()
+    return write_settings, pipeline
+
+
+def test_the_real_commands_run_once_and_then_stay_up_to_date(real_project, tmp_path):
+    """extract -> connect -> assign through `valma pipeline`, on a tiny OSM file."""
+    _, pipeline = real_project
     first = pipeline()
     assert first["traffic"] == "skipped (not configured)"
     assert all(first[s].startswith("running") for s in ("extract", "connect", "assign"))
@@ -206,4 +234,51 @@ def test_the_real_commands_run_once_and_then_stay_up_to_date(tmp_path, capsys):
     touch(tmp_path / "data" / "od.csv", "origin_id,destination_id,demand\n1,2,20\n")
     third = pipeline()
     assert third["extract"] == "up to date" and third["connect"] == "up to date"
-    assert third["assign"].startswith("running")
+    assert third["assign"] == "running (inputs changed)"
+
+
+def test_an_edited_settings_section_reruns_from_that_step(real_project, tmp_path):
+    """Editing [assign], [connect] or [extract] in the file reruns from that step."""
+    write_settings, pipeline = real_project
+    pipeline()
+
+    write_settings("[assign]\nmax_minutes = 30.0\n")
+    run = pipeline()
+    assert run["extract"] == run["connect"] == "up to date"
+    assert run["assign"] == "running (settings changed: max_minutes None -> 30.0)"
+
+    write_settings("[assign]\nmax_minutes = 30.0\n[connect]\nmin_nodes = 5\n")
+    run = pipeline()
+    assert run["extract"] == "up to date"
+    assert run["connect"].startswith("running (settings changed: min_nodes")
+    # assign's own settings are unchanged, but it reads what connect wrote.
+    assert run["assign"].startswith("running")
+
+    # The base settings end inside [extract], so its new key comes first.
+    sections = "[assign]\nmax_minutes = 30.0\n[connect]\nmin_nodes = 5\n"
+    write_settings("include_construction = false\n" + sections)
+    links = tmp_path / "output" / "base" / "walk_links.gpkg"
+    before = links.stat().st_mtime_ns
+    # Marked so a reuse of the old file, rather than a rebuild, would show.
+    from valma_bike_and_walk import links as links_module
+
+    layer = links_module.read_links(links)
+    layer["speed_override_kmh"] = 1.0
+    links_module.write_links(layer, links)
+    run = pipeline()
+    assert run["extract"].startswith("running (settings changed: include_construction")
+    # Really re-extracted from the PBF, not the existing layer reused as it stood.
+    rebuilt = links_module.read_links(links)
+    assert links.stat().st_mtime_ns != before
+    assert rebuilt["speed_override_kmh"].isna().all()
+    assert run["connect"].startswith("running") and run["assign"].startswith("running")
+
+    # A comment, or a setting that only changes how fast it runs, reruns nothing.
+    write_settings(
+        "include_construction = false\n# a note\n"
+        "[assign]\nmax_minutes = 30.0\nworkers = 3\n"
+        "[connect]\nmin_nodes = 5\n"
+    )
+    statuses = set(pipeline().values()) - {"skipped (--skip)", "skipped (not configured)"}
+    assert statuses == {"up to date"}
+

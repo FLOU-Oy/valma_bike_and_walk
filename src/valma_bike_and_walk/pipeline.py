@@ -147,7 +147,12 @@ def build_plan(
         steps.append(step)
         return args
 
-    extract = add("extract", ["extract", "--out", str(links)], writes=["links"])
+    # --force-reload: given an existing --out, extract reuses it as the user's
+    # own layer. When the pipeline runs extract it is because the layer must
+    # be rebuilt, so it has to say so.
+    extract = add(
+        "extract", ["extract", "--out", str(links), "--force-reload"], writes=["links"]
+    )
     if extract is not None:
         if extract.pbf is None:
             raise ValueError("The extract step needs pbf (an OSM extract) in the settings.")
@@ -217,6 +222,18 @@ def _remove(path: Path) -> None:
     """Delete a pipeline output and the SQLite side files a GeoPackage may leave."""
     for target in (path, *(path.with_name(path.name + s) for s in ("-wal", "-shm", "-journal"))):
         target.unlink(missing_ok=True)
+
+
+def _what_changed(before: dict[str, Any] | None, now: dict[str, Any]) -> str:
+    """Name the settings that differ from the last run, or say it was an input."""
+    if before is None:
+        return "inputs or settings changed"
+    changed = sorted(k for k in before.keys() | now.keys() if before.get(k) != now.get(k))
+    if not changed:
+        return "inputs changed"
+    shown = ", ".join(f"{k} {before.get(k)!r} -> {now.get(k)!r}" for k in changed[:3])
+    more = f" and {len(changed) - 3} more" if len(changed) > 3 else ""
+    return f"settings changed: {shown}{more}"
 
 
 def _signature(step: Step, read_versions: dict[str, Any], version: str) -> str:
@@ -306,7 +323,7 @@ def run_pipeline(
             if reason is None and missing:
                 reason = f"{Path(missing[0]).name} missing"
             if reason is None and previous.get("signature") != signature:
-                reason = "inputs or settings changed"
+                reason = _what_changed(previous.get("settings"), settings_of(step.args))
 
         if mark_done:
             # As a run would leave it: the files as they are now are this
@@ -314,7 +331,7 @@ def run_pipeline(
             for file in step.writes:
                 if plan.files[file].exists():
                     files_state.setdefault(file, {})[step.name] = file_stamp(plan.files[file])
-            state["steps"][step.name] = {"signature": signature}
+            state["steps"][step.name] = {"signature": signature, "settings": settings_of(step.args)}
             report(f"  {step.name}: marked done")
             continue
         if reason is None:
@@ -342,7 +359,7 @@ def run_pipeline(
             rewritten[file] = step.name
         # Signed with what it read before it ran, so an edit saved meanwhile
         # still shows up next time.
-        state["steps"][step.name] = {"signature": signature}
+        state["steps"][step.name] = {"signature": signature, "settings": settings_of(step.args)}
         _save_state(plan.state_path, state)
 
     if not dry_run:
