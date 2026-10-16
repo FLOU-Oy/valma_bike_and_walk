@@ -694,8 +694,9 @@ def add_volumes(
 
     links = links.copy()
     if VOLUME_COLUMN in links.columns:
+        # A copy: pandas 3 hands out read-only views, and this array is filled in.
         volume = pd.to_numeric(links[VOLUME_COLUMN], errors="coerce").to_numpy(
-            dtype=float
+            dtype=float, copy=True
         )
     else:
         volume = np.full(len(links), np.nan)

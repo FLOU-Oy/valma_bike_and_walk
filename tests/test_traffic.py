@@ -89,6 +89,26 @@ def test_the_road_takes_the_volume_and_the_cycleway_beside_it_does_not():
     assert np.isnan(volume_of(matched, 1))
 
 
+def test_matching_again_over_volumes_from_an_earlier_run():
+    """A layer that already has car_volume -- a rerun of `valma traffic`."""
+    links = link_layer(
+        [
+            {"highway": "residential", "coords": [(0, 0), (200, 0)]},
+            {"highway": "residential", "coords": [(0, 500), (200, 500)]},
+        ]
+    )
+    links["car_volume"] = [100.0, 42.0]
+    volumes = volume_layer([{"volume": 5000, "coords": [(0, 2), (200, 2)]}])
+
+    matched, _ = add_volumes(links, volumes)
+
+    assert volume_of(matched, 0) == 5000 / 16
+    # Where nothing matches this time, the earlier value is kept.
+    assert volume_of(matched, 1) == 42.0
+    # The caller's frame is untouched.
+    assert links["car_volume"].tolist() == [100.0, 42.0]
+
+
 def test_a_source_over_nothing_but_a_cycleway_matches_nothing():
     links = link_layer([{"highway": "cycleway", "coords": [(0, 0), (200, 0)]}])
     volumes = volume_layer([{"volume": 5000, "coords": [(0, 1), (200, 1)]}])
