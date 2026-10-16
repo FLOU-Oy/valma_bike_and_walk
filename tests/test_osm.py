@@ -145,9 +145,11 @@ def test_signal_crossing_tag_is_carried_onto_links(tmp_path):
     )
     links = read_links(settings_for(pbf, tmp_path), "bike")
     row = links.iloc[0]
-    assert row["crossing"] == "traffic_signals"
+    # The way's own crossing tag is left as mapped (none); the node has its flag.
+    assert row["crossing"] is None
     assert row["traffic_signal_at_end"]
     assert not row["traffic_signal_at_start"]
+    assert not row["crossing_node_at_end"]
 
 
 def test_traffic_signal_intersection_node_is_carried_onto_links(tmp_path):
@@ -159,8 +161,63 @@ def test_traffic_signal_intersection_node_is_carried_onto_links(tmp_path):
         node_tags={2: {"highway": "traffic_signals"}},
     )
     links = read_links(settings_for(pbf, tmp_path), "bike")
-    assert links.iloc[0]["crossing"] == "traffic_signals"
+    assert links.iloc[0]["crossing"] is None
     assert links.iloc[0]["traffic_signal_at_end"]
+
+
+@pytest.mark.parametrize(
+    ("tags", "unsignalled"),
+    [
+        ({"highway": "crossing", "crossing": "marked"}, True),
+        ({"highway": "crossing", "crossing": "uncontrolled"}, True),
+        ({"highway": "crossing", "crossing": "zebra"}, True),
+        ({"highway": "crossing", "crossing": "unmarked"}, True),
+        ({"highway": "crossing"}, True),
+        ({"crossing": "marked"}, True),
+        ({"highway": "crossing", "crossing": "traffic_signals", "crossing:signals": "no"}, True),
+        ({"highway": "crossing", "crossing": "no"}, False),
+        ({"highway": "crossing", "crossing": "traffic_signals"}, False),
+    ],
+)
+def test_crossing_nodes_split_the_way_and_are_flagged(tmp_path, tags, unsignalled):
+    """A crossing mid-way becomes a link end, so its passage can be charged."""
+    nodes = {1: (24.000, 60.000), 2: (24.001, 60.000), 3: (24.002, 60.000)}
+    pbf = write_pbf(
+        tmp_path / "crossing.osm.pbf",
+        nodes,
+        [(1, [1, 2, 3], {"highway": "cycleway"})],
+        node_tags={2: tags},
+    )
+    links = read_links(settings_for(pbf, tmp_path), "bike").sort_values("u")
+    flagged = list(links["crossing_node_at_end"]) + list(links["crossing_node_at_start"])
+    if unsignalled:
+        assert len(links) == 2
+        assert links.iloc[0]["crossing_node_at_end"] and links.iloc[1]["crossing_node_at_start"]
+    else:
+        assert not any(flagged)
+
+
+def test_a_crossing_way_shares_its_charge_by_length_unless_a_node_carries_it(tmp_path):
+    # Way 2 crosses road 1 at node 5; it is split there into two pieces.
+    nodes = {1: (24.000, 60.000), 5: (24.001, 60.000), 2: (24.002, 60.000),
+             3: (24.001, 59.9995), 4: (24.001, 60.0010)}
+    road = (1, [1, 5, 2], {"highway": "residential"})
+    crossing = (2, [3, 5, 4], {"highway": "footway", "footway": "crossing", "crossing": "marked"})
+    pbf = write_pbf(tmp_path / "way.osm.pbf", nodes, [road, crossing])
+    links = read_links(settings_for(pbf, tmp_path), "bike")
+    pieces = links[links["osm_way_id"] == 2]
+    assert len(pieces) == 2
+    assert pieces["crossing_way_share"].sum() == pytest.approx(1.0)
+    assert pieces["crossing_way_share"].max() > 0.6  # the longer piece pays more
+    assert (links.loc[links["osm_way_id"] == 1, "crossing_way_share"] == 0).all()
+
+    # The same crossing also mapped as a node: the node is charged, not the way.
+    pbf = write_pbf(tmp_path / "node.osm.pbf", nodes, [road, crossing],
+                    node_tags={5: {"highway": "crossing", "crossing": "marked"}})
+    links = read_links(settings_for(pbf, tmp_path), "bike")
+    pieces = links[links["osm_way_id"] == 2]
+    assert (pieces["crossing_way_share"] == 0).all()
+    assert pieces["crossing_node_at_start"].sum() + pieces["crossing_node_at_end"].sum() == 2
 
 
 def test_a_bbox_keeps_only_ways_that_reach_into_it(grid_pbf, tmp_path):

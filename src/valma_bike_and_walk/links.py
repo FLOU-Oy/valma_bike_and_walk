@@ -93,6 +93,12 @@ WALK_TRAFFIC_LIGHT_PENALTY_SECONDS = 10
 #: Slowing down and yielding at a crossing without lights, on a bike.
 UNSIGNALLED_CROSSING_PENALTY_SECONDS = 2.5
 
+#: Each link's share of its crossing way's charge, written at extract time
+#: (``osm._crossing_way_share``): the way's length on this link over its whole
+#: length, or 0 where a crossing node on the way is charged instead. A layer
+#: without the column is charged a whole crossing per link, as before.
+CROSSING_SHARE_COLUMN = "crossing_way_share"
+
 #: ``crossing`` values that are not an unsignalled crossing: lights are charged
 #: separately, and ``no`` says there is no crossing at all.
 _NOT_UNSIGNALLED_CROSSING = frozenset({"", "traffic_signals", "no"})
@@ -303,37 +309,63 @@ def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
         "bike": TRAFFIC_LIGHT_PENALTY_SECONDS,
         "walk": WALK_TRAFFIC_LIGHT_PENALTY_SECONDS,
     }.get(mode, 0.0)
+    # Crossings are charged once per *passage*. A node -- a light, or a crossing
+    # where a path meets the road -- is always a link end, and passing it means
+    # riding one link in and another out, so each link touching it pays half.
+    # A crossing way (footway=crossing) is split where it meets the road, so its
+    # pieces share its one charge by length (CROSSING_SHARE_COLUMN, worked out at
+    # extract time); a way whose crossing is also mapped as a node pays nothing
+    # itself, the node is charged instead.
+    path = links["highway"].isin(_BICYCLE_CROSSING_HIGHWAYS).to_numpy(dtype=bool)
+    crossing = (
+        links["crossing"].fillna("").astype(str).str.strip()
+        if "crossing" in links.columns
+        else pd.Series("", index=links.index)
+    )
+    signal_ends = (
+        _signal_flag(links, "traffic_signal_at_start").astype(int)
+        + _signal_flag(links, "traffic_signal_at_end").astype(int)
+    ).to_numpy()
+    has_share = CROSSING_SHARE_COLUMN in links.columns
+    share = (
+        pd.to_numeric(links[CROSSING_SHARE_COLUMN], errors="coerce").fillna(0.0).to_numpy()
+        if has_share
+        else None
+    )
     if wait:
-        signal_crossing = (
-            links["crossing"].eq("traffic_signals")
-            if "crossing" in links.columns
-            else pd.Series(False, index=links.index)
-        )
-        adjacent_signal = _signal_flag(links, "traffic_signal_at_start") | _signal_flag(
-            links, "traffic_signal_at_end"
-        )
-        # On a cycleway or footway the crossing tag is the whole story; on a car
-        # lane the tag may be a crossing the cyclist or walker passes by, so
-        # only a signal node counts.
-        bicycle_signal = signal_crossing & links["highway"].isin(
-            _BICYCLE_CROSSING_HIGHWAYS
-        )
-        car_signal = adjacent_signal & links["highway"].isin(
-            _CAR_LANE_CROSSING_HIGHWAYS
-        )
-        signal_penalty = (bicycle_signal | car_signal).to_numpy(dtype=bool) * wait
+        # A light stops whoever passes it, on a path or along the road.
+        at_light = links["highway"].isin(
+            _BICYCLE_CROSSING_HIGHWAYS | _CAR_LANE_CROSSING_HIGHWAYS
+        ).to_numpy(dtype=bool)
+        signal_penalty = wait * 0.5 * signal_ends * at_light
+        # A crossing way tagged with signals the nodes do not carry.
+        signal_way = crossing.str.split(";").map(lambda v: "traffic_signals" in v).to_numpy(
+            dtype=bool
+        ) & path
+        if has_share:
+            signal_penalty = signal_penalty + wait * share * signal_way
+        else:
+            # A layer from before the share column: per link, as it was charged,
+            # where no signal node on it is charged already.
+            signal_penalty = signal_penalty + wait * (signal_way & (signal_ends == 0))
         forward_penalty += signal_penalty
         reverse_penalty += signal_penalty
 
-    if mode == "bike" and "crossing" in links.columns:
-        # A crossing way (footway=crossing, cycleway=crossing) carries the
-        # crossing tag itself, so each one ridden over is charged once.
-        crossing = links["crossing"].fillna("").astype(str).str.strip()
-        unsignalled = ~crossing.isin(_NOT_UNSIGNALLED_CROSSING) & links[
-            "highway"
-        ].isin(_BICYCLE_CROSSING_HIGHWAYS)
-        crossing_penalty = (
-            unsignalled.to_numpy(dtype=bool) * UNSIGNALLED_CROSSING_PENALTY_SECONDS
+    if mode == "bike":
+        # Yielding at a crossing without lights -- only for the cyclist crossing
+        # the road on the path; riding along the road past a zebra costs nothing.
+        crossing_ends = (
+            _signal_flag(links, "crossing_node_at_start").astype(int)
+            + _signal_flag(links, "crossing_node_at_end").astype(int)
+        ).to_numpy()
+        unsignalled_way = (~crossing.isin(_NOT_UNSIGNALLED_CROSSING)).to_numpy(
+            dtype=bool
+        ) & ~crossing.str.split(";").map(lambda v: "traffic_signals" in v).to_numpy(
+            dtype=bool
+        ) & path
+        crossing_penalty = UNSIGNALLED_CROSSING_PENALTY_SECONDS * (
+            0.5 * crossing_ends * path
+            + (share * unsignalled_way if has_share else unsignalled_way)
         )
         forward_penalty += crossing_penalty
         reverse_penalty += crossing_penalty

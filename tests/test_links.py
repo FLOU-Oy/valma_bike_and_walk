@@ -134,6 +134,7 @@ def test_walking_pays_the_traffic_light_penalty_both_ways():
 
 
 def test_walking_along_a_road_pays_at_a_signalled_junction():
+    """Half on the link into the light; the link out of it pays the other half."""
     signalled = normalise(
         links_frame(
             [{**CHAIN[0], "highway": "primary", "traffic_signal_at_end": True}]
@@ -143,7 +144,7 @@ def test_walking_along_a_road_pays_at_a_signalled_junction():
     plain = normalise(links_frame([{**CHAIN[0], "highway": "primary"}]), "walk")
     assert signalled["travel_time_s"].iloc[0] == pytest.approx(
         plain["travel_time_s"].iloc[0]
-        + links_module.WALK_TRAFFIC_LIGHT_PENALTY_SECONDS
+        + links_module.WALK_TRAFFIC_LIGHT_PENALTY_SECONDS / 2
     )
 
 
@@ -194,8 +195,56 @@ def test_adjacent_signal_gets_penalty_without_crossing_tag():
     )
     plain = normalise(links_frame([CHAIN[0]]), "bike")
     assert links["travel_time_s"].iloc[0] == pytest.approx(
-        plain["travel_time_s"].iloc[0] + links_module.TRAFFIC_LIGHT_PENALTY_SECONDS
+        plain["travel_time_s"].iloc[0] + links_module.TRAFFIC_LIGHT_PENALTY_SECONDS / 2
     )
+
+
+def _passage(rows, mode="bike"):
+    """Penalty for riding the two links of CHAIN in turn, through node 2."""
+    timed = normalise(links_frame(rows), mode)
+    plain = normalise(
+        links_frame([{**r, "traffic_signal_at_start": False, "traffic_signal_at_end": False,
+                      "crossing_node_at_start": False, "crossing_node_at_end": False,
+                      "crossing": None, "crossing_way_share": 0.0} for r in rows]),
+        mode,
+    )
+    return float(timed["travel_time_s"].sum() - plain["travel_time_s"].sum())
+
+
+@pytest.mark.parametrize("highway", ["cycleway", "primary"])
+def test_passing_a_light_costs_one_wait_not_two(highway):
+    rows = [
+        {**CHAIN[0], "highway": highway, "traffic_signal_at_end": True},
+        {**CHAIN[1], "highway": highway, "traffic_signal_at_start": True},
+    ]
+    assert _passage(rows) == pytest.approx(links_module.TRAFFIC_LIGHT_PENALTY_SECONDS)
+
+
+def test_passing_a_crossing_node_on_the_path_costs_one_yield():
+    rows = [
+        {**CHAIN[0], "highway": "cycleway", "crossing_node_at_end": True},
+        {**CHAIN[1], "highway": "cycleway", "crossing_node_at_start": True},
+    ]
+    assert _passage(rows) == pytest.approx(links_module.UNSIGNALLED_CROSSING_PENALTY_SECONDS)
+
+
+def test_riding_along_the_road_past_a_zebra_costs_nothing():
+    rows = [
+        {**CHAIN[0], "highway": "secondary", "crossing_node_at_end": True},
+        {**CHAIN[1], "highway": "secondary", "crossing_node_at_start": True},
+    ]
+    assert _passage(rows) == pytest.approx(0.0)
+    assert _passage(rows, mode="walk") == pytest.approx(0.0)
+
+
+def test_a_crossing_way_split_at_the_road_is_charged_once_by_length():
+    rows = [
+        {**CHAIN[0], "highway": "footway", "crossing": "marked", "crossing_way_share": 0.3},
+        {**CHAIN[1], "highway": "footway", "crossing": "marked", "crossing_way_share": 0.7},
+    ]
+    assert _passage(rows) == pytest.approx(links_module.UNSIGNALLED_CROSSING_PENALTY_SECONDS)
+    signalled = [{**r, "crossing": "traffic_signals"} for r in rows]
+    assert _passage(signalled) == pytest.approx(links_module.TRAFFIC_LIGHT_PENALTY_SECONDS)
 
 
 def test_car_lane_gets_adjacent_signal_penalty():

@@ -35,6 +35,7 @@ from valma_bike_and_walk.config import (
     Settings,
     validate_mode,
 )
+from valma_bike_and_walk.links import CROSSING_SHARE_COLUMN
 from valma_bike_and_walk.vector_io import read_vector, write_vector
 
 logger = logging.getLogger(__name__)
@@ -209,7 +210,9 @@ class _WayBuffer:
     would cost several times what the finished network does.
     """
 
-    def __init__(self, signal_nodes: set[int] | None = None) -> None:
+    def __init__(
+        self, signal_nodes: set[int] | None = None, crossing_nodes: set[int] | None = None
+    ) -> None:
         self.way_ids = array.array("q")
         self.refs = array.array("q")
         self.x = array.array("i")  # osmium's native 1e-7 degree integers
@@ -218,6 +221,7 @@ class _WayBuffer:
         self.tags: list[list[str | None]] = [[] for _ in WAY_TAGS]
         self.under_construction = array.array("b")
         self.signal_nodes = signal_nodes or set()
+        self.crossing_nodes = crossing_nodes or set()
 
     def add(
         self,
@@ -260,12 +264,20 @@ def _iter_ways(pbf_path, index_storage: str) -> Iterator[osmium.osm.Way]:
     return cast(Iterator[osmium.osm.Way], iter(processor))
 
 
-def _signal_nodes(pbf_path) -> set[int]:
-    """Ids of the nodes a cyclist has to stop at: signalled crossings and lights.
+def _crossing_nodes(pbf_path) -> tuple[set[int], set[int]]:
+    """
+    Ids of the nodes a cyclist stops or yields at: (signalled, unsignalled).
 
-    Both kinds cost the same wait, so they land in one set. ``crossing:signals=no``
-    is the mapper saying the signals are for pedestrians only, so it wins over an
-    inherited ``crossing=traffic_signals``.
+    Signalled: signalled crossings and traffic lights, which cost the same wait.
+    ``crossing:signals=no`` is the mapper saying the signals are for pedestrians
+    only, so it wins over an inherited ``crossing=traffic_signals`` -- the node
+    is then an unsignalled crossing.
+
+    Unsignalled: every other crossing node -- ``crossing=marked``,
+    ``uncontrolled``, ``zebra``, ``unmarked``, ``informal``... and a bare
+    ``highway=crossing`` -- but not ``crossing=no``, which says there is none.
+    Most crossings in Finland are mapped this way only, as the node where a
+    path meets the road, with no separate crossing way.
     """
     processor = (
         osmium.FileProcessor(str(pbf_path))
@@ -273,22 +285,26 @@ def _signal_nodes(pbf_path) -> set[int]:
         .with_filter(osmium.filter.KeyFilter("crossing", "highway"))
     )
     signal_nodes: set[int] = set()
+    crossing_nodes: set[int] = set()
     for node in processor:
+        highway = node.tags.get("highway")
         crossing = node.tags.get("crossing", "") or ""
         is_crossing_signal = (
             "traffic_signals" in crossing.split(";")
             and node.tags.get("crossing:signals") != "no"
         )
-        if is_crossing_signal or node.tags.get("highway") == "traffic_signals":
+        if is_crossing_signal or highway == "traffic_signals":
             signal_nodes.add(int(node.id))
-    return signal_nodes
+        elif (crossing or highway == "crossing") and crossing != "no":
+            crossing_nodes.add(int(node.id))
+    return signal_nodes, crossing_nodes
 
 
 def _read_ways(
     settings: Settings, mode: str, clip_bounds: Sequence[float] | None
 ) -> _WayBuffer:
     way_filter = filter_for(mode)
-    buffer = _WayBuffer(_signal_nodes(settings.require_pbf()))
+    buffer = _WayBuffer(*_crossing_nodes(settings.require_pbf()))
     seen = 0
 
     if clip_bounds is None:
@@ -343,6 +359,47 @@ def _read_ways(
             f"No {mode} network found in {settings.pbf_path} for this extent."
         )
     return buffer
+
+
+def _crossing_way_share(
+    crossing: np.ndarray,
+    way_of_position: np.ndarray,
+    way_of_link: np.ndarray,
+    signal_at_position: np.ndarray,
+    crossing_at_position: np.ndarray,
+    length_m: np.ndarray,
+    n_ways: int,
+) -> np.ndarray:
+    """
+    Each link's share of its crossing way's charge: its length over the way's.
+
+    A crossing way (``footway=crossing`` with ``crossing=marked``, say) is split
+    where it meets the road, and charging its tag on every piece charged one
+    crossing twice; shared by length, the pieces add up to one. A way that
+    carries a crossing *node* of the same kind gets 0, because the node is
+    charged instead -- a signalled way by a signal node; an unsignalled way by
+    any crossing or signal node. Ways without a crossing tag get 0.
+    """
+    tag = np.array(
+        ["" if v is None or v != v else str(v).strip() for v in crossing], dtype=object
+    )
+    has_signal = np.bincount(
+        way_of_position, weights=signal_at_position, minlength=n_ways
+    ) > 0
+    has_any = has_signal | (
+        np.bincount(way_of_position, weights=crossing_at_position, minlength=n_ways) > 0
+    )
+    signalled = np.array(["traffic_signals" in t.split(";") for t in tag])
+    unsignalled = (tag != "") & (tag != "no") & ~signalled
+    charged = (signalled & ~has_signal[way_of_link]) | (unsignalled & ~has_any[way_of_link])
+    way_length = np.bincount(way_of_link, weights=length_m, minlength=n_ways)[way_of_link]
+    share = np.divide(
+        length_m, way_length, out=np.zeros_like(length_m, dtype=float), where=way_length > 0
+    )
+    # A zero-length crossing way still counts once, spread evenly.
+    pieces = np.bincount(way_of_link, minlength=n_ways)[way_of_link]
+    share = np.where(way_length > 0, share, 1.0 / np.maximum(pieces, 1))
+    return np.where(charged, share, 0.0)
 
 
 def _junction_positions(
@@ -414,7 +471,11 @@ def read_links(
     lon = np.frombuffer(buffer.x, dtype=np.int32) * 1e-7
     lat = np.frombuffer(buffer.y, dtype=np.int32) * 1e-7
 
-    boundary = _junction_positions(refs, counts, buffer.signal_nodes)
+    # Split at every crossing too, so a crossing is always a link end and its
+    # penalty can be charged per passage (see links._set_travel_times).
+    boundary = _junction_positions(
+        refs, counts, buffer.signal_nodes | buffer.crossing_nodes
+    )
     marks = np.flatnonzero(boundary)
 
     # Consecutive marks bound a link -- unless they straddle the end of one way
@@ -462,18 +523,28 @@ def read_links(
         columns[_column_name(key)] = np.repeat(
             np.asarray(values, dtype=object), links_per_way
         )
-    # A link is split at every signal node (see _junction_positions), so a signal
-    # can only ever sit on an endpoint -- which end it is decides nothing yet, but
-    # the graph builder wants both flags to stay direction-aware.
+    # A link is split at every signal and crossing node (see _junction_positions),
+    # so one can only ever sit on an endpoint -- which end it is decides nothing
+    # yet, but the graph builder wants both flags to stay direction-aware. The
+    # way's own `crossing` tag is kept as mapped; nodes have their own columns.
     signal_ids = np.fromiter(
         buffer.signal_nodes, dtype=np.int64, count=len(buffer.signal_nodes)
     )
-    signal_start = np.isin(refs[starts], signal_ids)
-    signal_end = np.isin(refs[ends], signal_ids)
-    columns["traffic_signal_at_start"] = signal_start
-    columns["traffic_signal_at_end"] = signal_end
-    columns["crossing"] = np.where(
-        signal_start | signal_end, "traffic_signals", columns["crossing"]
+    crossing_ids = np.fromiter(
+        buffer.crossing_nodes, dtype=np.int64, count=len(buffer.crossing_nodes)
+    )
+    columns["traffic_signal_at_start"] = np.isin(refs[starts], signal_ids)
+    columns["traffic_signal_at_end"] = np.isin(refs[ends], signal_ids)
+    columns["crossing_node_at_start"] = np.isin(refs[starts], crossing_ids)
+    columns["crossing_node_at_end"] = np.isin(refs[ends], crossing_ids)
+    columns[CROSSING_SHARE_COLUMN] = _crossing_way_share(
+        columns["crossing"],
+        way_of_position,
+        way_of_position[starts],
+        np.isin(refs, signal_ids),
+        np.isin(refs, crossing_ids),
+        length_m,
+        counts.shape[0],
     )
     columns[CONSTRUCTION_COLUMN] = np.repeat(
         np.frombuffer(buffer.under_construction, dtype=np.int8).astype(bool),

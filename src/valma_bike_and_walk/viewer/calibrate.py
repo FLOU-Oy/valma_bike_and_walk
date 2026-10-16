@@ -57,9 +57,13 @@ def _times(frame: pd.DataFrame, forward: np.ndarray, mode: str, **drop) -> np.nd
                 frame[column] = False
         if "crossing" in frame.columns:
             frame.loc[frame["crossing"] == "traffic_signals", "crossing"] = None
-    if drop.get("crossings") and "crossing" in frame.columns:
-        signal = frame["crossing"] == "traffic_signals"
-        frame.loc[~signal, "crossing"] = None
+    if drop.get("crossings"):
+        if "crossing" in frame.columns:
+            signal = frame["crossing"] == "traffic_signals"
+            frame.loc[~signal, "crossing"] = None
+        for column in ("crossing_node_at_start", "crossing_node_at_end"):
+            if column in frame.columns:
+                frame[column] = False
     fwd, rev = links_module.link_speeds_by_direction(frame, mode)
     frame["speed_kmh"], frame["speed_reverse_kmh"] = fwd, rev
     links_module._set_travel_times(frame, mode)

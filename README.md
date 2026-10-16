@@ -1042,13 +1042,25 @@ Where it differs from cycling, and why:
   road beside them, so the walk network keeps cycleways unless they say
   `foot=no` or `foot=use_sidepath`.
 - **No car traffic term, but traffic lights count.** `car_volume` only
-  affects cycling. A red light costs a walker the same 15 s wait as a cyclist
-  (`WALK_TRAFFIC_LIGHT_PENALTY_SECONDS` in `links.py`), on the same links: a
-  footway or path tagged `crossing=traffic_signals`, or a road with a signal
-  node at either end. The walking speeds are pace in motion and leave it out.
-  Crossings without lights cost only cyclists: 10 s
-  (`UNSIGNALLED_CROSSING_PENALTY_SECONDS`) on a cycleway, footway or path
-  carrying any other `crossing` value except `no`.
+  affects cycling. A red light costs a walker a wait too
+  (`WALK_TRAFFIC_LIGHT_PENALTY_SECONDS` in `links.py`; cyclists'
+  `TRAFFIC_LIGHT_PENALTY_SECONDS`). The walking speeds are pace in motion and
+  leave it out. Crossings without lights cost only cyclists
+  (`UNSIGNALLED_CROSSING_PENALTY_SECONDS`).
+- **Each crossing is charged once per passage.** Every crossing node -- a
+  light, or a `crossing=marked`, `uncontrolled`, `zebra`, `unmarked` or bare
+  `highway=crossing` node, but not `crossing=no` -- is made a link end by
+  `valma extract` and flagged on the links that touch it
+  (`traffic_signal_at_start`/`_end`, `crossing_node_at_start`/`_end`).
+  Passing one means riding a link in and a link out, so each pays half. A
+  light is paid on paths and along roads alike; a crossing without lights only
+  on a cycleway, footway or path -- riding along the road past a zebra costs
+  nothing. A crossing *way* (`footway=crossing` with a `crossing` tag) is
+  split where it meets the road, so its pieces share one charge by length
+  (`crossing_way_share`); where the same crossing is also mapped as a node,
+  the node is charged and the way is not. The `crossing` column keeps the
+  way's own tag as mapped. A layer extracted before these columns existed is
+  still read: lights are charged per passage, crossing ways per link.
 - **Hills cost the same as for cycling**, and only uphill: after `valma dem`
   the climb is charged in whichever direction climbs, even though every way is
   two-way.
