@@ -35,7 +35,8 @@ from valma_bike_and_walk.config import (
     Settings,
     validate_mode,
 )
-from valma_bike_and_walk.links import CROSSING_SHARE_COLUMN
+from valma_bike_and_walk.links import CROSSING_SHARE_COLUMN, PATH_HIGHWAYS
+from valma_bike_and_walk.signals import signal_codes
 from valma_bike_and_walk.vector_io import read_vector, write_vector
 
 logger = logging.getLogger(__name__)
@@ -211,7 +212,10 @@ class _WayBuffer:
     """
 
     def __init__(
-        self, signal_nodes: set[int] | None = None, crossing_nodes: set[int] | None = None
+        self,
+        signal_nodes: set[int] | None = None,
+        crossing_nodes: set[int] | None = None,
+        light_nodes: set[int] | None = None,
     ) -> None:
         self.way_ids = array.array("q")
         self.refs = array.array("q")
@@ -222,6 +226,7 @@ class _WayBuffer:
         self.under_construction = array.array("b")
         self.signal_nodes = signal_nodes or set()
         self.crossing_nodes = crossing_nodes or set()
+        self.light_nodes = light_nodes or set()
 
     def add(
         self,
@@ -264,9 +269,12 @@ def _iter_ways(pbf_path, index_storage: str) -> Iterator[osmium.osm.Way]:
     return cast(Iterator[osmium.osm.Way], iter(processor))
 
 
-def _crossing_nodes(pbf_path) -> tuple[set[int], set[int]]:
+def _crossing_nodes(pbf_path) -> tuple[set[int], set[int], set[int]]:
     """
-    Ids of the nodes a cyclist stops or yields at: (signalled, unsignalled).
+    Ids of the nodes a cyclist stops or yields at: (signalled, unsignalled,
+    road lights). Road lights (``highway=traffic_signals``) are also in the
+    signalled set; they are kept apart too because a junction with one is a
+    real junction, not a mid-block pedestrian light (see :mod:`signals`).
 
     Signalled: signalled crossings and traffic lights, which cost the same wait.
     ``crossing:signals=no`` is the mapper saying the signals are for pedestrians
@@ -286,6 +294,7 @@ def _crossing_nodes(pbf_path) -> tuple[set[int], set[int]]:
     )
     signal_nodes: set[int] = set()
     crossing_nodes: set[int] = set()
+    light_nodes: set[int] = set()
     for node in processor:
         highway = node.tags.get("highway")
         crossing = node.tags.get("crossing", "") or ""
@@ -295,9 +304,11 @@ def _crossing_nodes(pbf_path) -> tuple[set[int], set[int]]:
         )
         if is_crossing_signal or highway == "traffic_signals":
             signal_nodes.add(int(node.id))
+            if highway == "traffic_signals":
+                light_nodes.add(int(node.id))
         elif (crossing or highway == "crossing") and crossing != "no":
             crossing_nodes.add(int(node.id))
-    return signal_nodes, crossing_nodes
+    return signal_nodes, crossing_nodes, light_nodes
 
 
 def _read_ways(
@@ -545,6 +556,28 @@ def read_links(
         np.isin(refs, crossing_ids),
         length_m,
         counts.shape[0],
+    )
+    # Which signalled junction each link enters, and how much green it gets
+    # (see signals.py): worked out on the whole network, once, here.
+    first_vertex = np.concatenate([[0], np.cumsum(lengths)[:-1]])
+    last_vertex = first_vertex + lengths - 1
+    end_ids, end_at = np.unique(
+        np.concatenate([refs[starts], refs[ends]]), return_index=True
+    )
+    end_x = np.concatenate([px[first_vertex], px[last_vertex]])[end_at]
+    end_y = np.concatenate([py[first_vertex], py[last_vertex]])[end_at]
+    columns.update(
+        signal_codes(
+            refs[starts],
+            refs[ends],
+            columns["highway"],
+            np.isin(columns["highway"], list(PATH_HIGHWAYS)),
+            end_ids,
+            end_x,
+            end_y,
+            signal_ids,
+            np.fromiter(buffer.light_nodes, dtype=np.int64, count=len(buffer.light_nodes)),
+        )
     )
     columns[CONSTRUCTION_COLUMN] = np.repeat(
         np.frombuffer(buffer.under_construction, dtype=np.int8).astype(bool),

@@ -55,6 +55,11 @@ def _times(frame: pd.DataFrame, forward: np.ndarray, mode: str, **drop) -> np.nd
         for column in ("traffic_signal_at_start", "traffic_signal_at_end"):
             if column in frame.columns:
                 frame[column] = False
+        for column in (
+            "signal_entry", "signal_entry_reverse", "signal_cross_start", "signal_cross_end"
+        ):
+            if column in frame.columns:
+                frame[column] = 0
         if "crossing" in frame.columns:
             frame.loc[frame["crossing"] == "traffic_signals", "crossing"] = None
     if drop.get("crossings"):
@@ -204,9 +209,21 @@ def parameters(mode: str, frames: list[pd.DataFrame]) -> list[Parameter]:
     profile = speeds_module.profile_for(mode)
     highways = sorted(set().union(*[set(f["highway"].astype(str)) for f in frames]))
     surfaces = sorted(set().union(*[set(f["surface"].dropna().astype(str)) for f in frames if "surface" in f]))
-    light = "TRAFFIC_LIGHT_PENALTY_SECONDS" if mode == "bike" else "WALK_TRAFFIC_LIGHT_PENALTY_SECONDS"
+    if any("signal_entry" in f.columns for f in frames):
+        # Signalled junctions: the cycle and the green shares set every wait.
+        lights = [
+            _module_param(links_module, "SIGNAL_CYCLE_S", 20.0, 240.0),
+            _module_param(links_module, "SIGNAL_GREEN_SHARE_MAIN", 0.05, 0.95),
+            _module_param(links_module, "SIGNAL_GREEN_SHARE_MINOR", 0.05, 0.95),
+            _module_param(links_module, "SIGNAL_GREEN_SHARE_EQUAL", 0.05, 0.95),
+            _module_param(links_module, "MIDBLOCK_ROAD_WAIT_S", 0.0, 60.0),
+            _module_param(links_module, "MIDBLOCK_CROSSING_WAIT_S", 0.0, 120.0),
+        ]
+    else:
+        light = "TRAFFIC_LIGHT_PENALTY_SECONDS" if mode == "bike" else "WALK_TRAFFIC_LIGHT_PENALTY_SECONDS"
+        lights = [_module_param(links_module, light, 0.0, 120.0)]
     params = [
-        _module_param(links_module, light, 0.0, 120.0),
+        *lights,
         _module_param(links_module, "UNSIGNALLED_CROSSING_PENALTY_SECONDS", 0.0, 60.0),
         _module_param(links_module, "GRADE_LOW_FACTOR", 0.0, 60.0),
         _module_param(links_module, "GRADE_MODERATE_FACTOR", 0.0, 60.0),

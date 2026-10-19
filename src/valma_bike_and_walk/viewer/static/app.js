@@ -278,7 +278,8 @@ async function inspectLink(i) {
   const tagOrder = ["link_id", "highway", "name", "surface", "segregated", "cycleway", "cycleway_left",
     "cycleway_right", "cycleway_both", "oneway", "oneway_bicycle", "car_volume", "crossing",
     "traffic_signal_at_start", "traffic_signal_at_end", "crossing_node_at_start",
-    "crossing_node_at_end", "crossing_way_share", "ascent_m", "descent_m", "under_construction",
+    "crossing_node_at_end", "crossing_way_share", "signal_entry", "signal_entry_reverse",
+    "signal_cross_start", "signal_cross_end", "ascent_m", "descent_m", "under_construction",
     "speed_override_kmh", "bridge", "osm_way_id"];
   const tags = tagOrder.filter((k) => k in d.tags).map((k) => row(k, d.tags[k])).join("");
   const dir = (k) => dirs[k] || {};

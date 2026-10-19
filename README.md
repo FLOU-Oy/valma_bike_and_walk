@@ -1042,25 +1042,42 @@ Where it differs from cycling, and why:
   road beside them, so the walk network keeps cycleways unless they say
   `foot=no` or `foot=use_sidepath`.
 - **No car traffic term, but traffic lights count.** `car_volume` only
-  affects cycling. A red light costs a walker a wait too
-  (`WALK_TRAFFIC_LIGHT_PENALTY_SECONDS` in `links.py`; cyclists'
-  `TRAFFIC_LIGHT_PENALTY_SECONDS`). The walking speeds are pace in motion and
-  leave it out. Crossings without lights cost only cyclists
-  (`UNSIGNALLED_CROSSING_PENALTY_SECONDS`).
-- **Each crossing is charged once per passage.** Every crossing node -- a
-  light, or a `crossing=marked`, `uncontrolled`, `zebra`, `unmarked` or bare
-  `highway=crossing` node, but not `crossing=no` -- is made a link end by
+  affects cycling. A red light costs a walker the same wait as a cyclist; the
+  walking speeds are pace in motion and leave it out. Crossings without lights
+  cost only cyclists (`UNSIGNALLED_CROSSING_PENALTY_SECONDS`).
+- **Lights are charged per junction, by how much green you get.** OSM maps a
+  signalled junction as many nodes — a light at each stop line, a signalled
+  crossing on each arm — so `valma extract` groups signal nodes within 30 m
+  into junctions (`signals.py`). On the road, the wait is charged once, on the
+  link that *enters* the junction (`signal_entry` / `signal_entry_reverse`);
+  on a path, at each signalled crossing actually crossed
+  (`signal_cross_start` / `_end`), since crossing two arms is two waits. The
+  wait is the average for a random arrival, red² / (2 × cycle): about 9 s on
+  the junction's main road or crossing a side road with it
+  (`SIGNAL_GREEN_SHARE_MAIN`), about 25 s from a side road or crossing the main
+  road (`SIGNAL_GREEN_SHARE_MINOR`), over a `SIGNAL_CYCLE_S` of 90 s. At a
+  junction of equals — its top road class arriving from three or more
+  directions, a divided road's two carriageways counting as one — every
+  approach and crossing shares the green (`SIGNAL_GREEN_SHARE_EQUAL`, about
+  16 s). A
+  mid-block pedestrian light — signalled crossings with no road light and no
+  side road — costs road traffic `MIDBLOCK_ROAD_WAIT_S` and someone crossing
+  `MIDBLOCK_CROSSING_WAIT_S`. The constants are read at routing time, so they
+  can be tuned (and are, by the viewer's route calibration) without
+  re-extracting.
+- **Each unsignalled crossing is charged once per passage.** Every crossing
+  node — a `crossing=marked`, `uncontrolled`, `zebra`, `unmarked` or bare
+  `highway=crossing` node, but not `crossing=no` — is made a link end by
   `valma extract` and flagged on the links that touch it
-  (`traffic_signal_at_start`/`_end`, `crossing_node_at_start`/`_end`).
-  Passing one means riding a link in and a link out, so each pays half. A
-  light is paid on paths and along roads alike; a crossing without lights only
-  on a cycleway, footway or path -- riding along the road past a zebra costs
-  nothing. A crossing *way* (`footway=crossing` with a `crossing` tag) is
-  split where it meets the road, so its pieces share one charge by length
-  (`crossing_way_share`); where the same crossing is also mapped as a node,
-  the node is charged and the way is not. The `crossing` column keeps the
-  way's own tag as mapped. A layer extracted before these columns existed is
-  still read: lights are charged per passage, crossing ways per link.
+  (`crossing_node_at_start`/`_end`). Passing one means riding a link in and a
+  link out, so each pays half; only on a cycleway, footway or path — riding
+  along the road past a zebra costs nothing. A crossing *way*
+  (`footway=crossing` with a `crossing` tag) is split where it meets the road,
+  so its pieces share one charge by length (`crossing_way_share`); where the
+  same crossing is also mapped as a node, the node is charged and the way is
+  not. The `crossing` column keeps the way's own tag as mapped. A layer
+  extracted before these columns existed is still read, with a flat wait per
+  signal node (`TRAFFIC_LIGHT_PENALTY_SECONDS`).
 - **Hills cost the same as for cycling**, and only uphill: after `valma dem`
   the climb is charged in whichever direction climbs, even though every way is
   two-way.

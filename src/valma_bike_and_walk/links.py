@@ -84,11 +84,40 @@ DERIVED_COLUMNS = (
 
 OVERRIDE_COLUMN = "speed_override_kmh"
 
+#: Wait at a light, per signal node passed, for a layer extracted before
+#: signalled junctions (``signal_entry`` and friends) were worked out.
 TRAFFIC_LIGHT_PENALTY_SECONDS = 10
 
-#: The same wait on foot. The walk speeds are walking pace in motion, so the
-#: time spent standing at a red light is not in them and is charged here.
+#: The same wait on foot, on such a layer. The walk speeds are walking pace in
+#: motion, so the time spent standing at a red light is not in them.
 WALK_TRAFFIC_LIGHT_PENALTY_SECONDS = 10
+
+# Signalled junctions (valma_bike_and_walk.signals): the wait is the average
+# for someone arriving at a random moment, red**2 / (2 * cycle), with red the
+# part of the cycle the movement does not have green. Walking and cycling wait
+# alike: a light does not care who is waiting at it.
+
+#: Signal cycle length, seconds. Finnish urban junctions run roughly 60-120 s.
+SIGNAL_CYCLE_S = 90.0
+
+#: Share of the cycle that is green for the junction's main road, and for a
+#: path crossing a side road (it gets green with the main road).
+SIGNAL_GREEN_SHARE_MAIN = 0.55
+
+#: Share of the cycle that is green for a side road's approach, and for a path
+#: crossing the main road.
+SIGNAL_GREEN_SHARE_MINOR = 0.25
+
+#: Share of the cycle that is green for any approach, or crossing, at a junction
+#: of equals (signals.EQUAL): no one main road, the green is shared.
+SIGNAL_GREEN_SHARE_EQUAL = 0.4
+
+#: Wait for road traffic passing a mid-block pedestrian light: it turns red only
+#: when someone has pushed the button.
+MIDBLOCK_ROAD_WAIT_S = 3.0
+
+#: Wait to cross at a mid-block pedestrian light: push, and wait for its turn.
+MIDBLOCK_CROSSING_WAIT_S = 15.0
 
 #: Slowing down and yielding at a crossing without lights, on a bike.
 UNSIGNALLED_CROSSING_PENALTY_SECONDS = 2.5
@@ -122,6 +151,9 @@ _BICYCLE_CROSSING_HIGHWAYS = frozenset(
         "elevator",
     }
 )
+
+#: Path-like classes: where a crossing is crossed rather than passed by.
+PATH_HIGHWAYS = _BICYCLE_CROSSING_HIGHWAYS
 
 _CAR_LANE_CROSSING_HIGHWAYS = frozenset(
     {
@@ -332,7 +364,28 @@ def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
         if has_share
         else None
     )
-    if wait:
+    if "signal_entry" in links.columns:
+        # Signalled junctions (signals.py): once per junction on the road, on
+        # the link entering it; once per signalled crossing on a path.
+        road_wait, cross_wait = signal_waits()
+        entry = _codes(links, "signal_entry")
+        entry_reverse = _codes(links, "signal_entry_reverse")
+        forward_penalty += road_wait[entry]
+        reverse_penalty += road_wait[entry_reverse]
+        crossings = 0.5 * (
+            cross_wait[_codes(links, "signal_cross_start")]
+            + cross_wait[_codes(links, "signal_cross_end")]
+        )
+        # A crossing way tagged with signals no node carries: across the main road.
+        signal_way = crossing.str.split(";").map(lambda v: "traffic_signals" in v).to_numpy(
+            dtype=bool
+        ) & path
+        if has_share:
+            crossings = crossings + cross_wait[2] * share * signal_way
+        forward_penalty += crossings
+        reverse_penalty += crossings
+    elif wait:
+        # A layer from before signalled junctions: a wait per signal node.
         # A light stops whoever passes it, on a path or along the road.
         at_light = links["highway"].isin(
             _BICYCLE_CROSSING_HIGHWAYS | _CAR_LANE_CROSSING_HIGHWAYS
@@ -380,6 +433,36 @@ def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
 
     links["travel_time_s"] = base.to_numpy(dtype=float) + forward_penalty
     links["travel_time_reverse_s"] = reverse_base.to_numpy(dtype=float) + reverse_penalty
+
+
+def signal_waits() -> tuple[np.ndarray, np.ndarray]:
+    """
+    Seconds of wait per signal code (signals.NONE, MAIN, MINOR, MIDBLOCK, EQUAL):
+    (on the road, entering a junction; on a path, at a signalled crossing).
+
+    Read from the module constants on every call, so a calibration that
+    varies them sees the change.
+    """
+
+    def expected(green_share: float) -> float:
+        red = (1.0 - min(max(green_share, 0.0), 1.0)) * SIGNAL_CYCLE_S
+        return red * red / (2.0 * SIGNAL_CYCLE_S)
+
+    main, minor = expected(SIGNAL_GREEN_SHARE_MAIN), expected(SIGNAL_GREEN_SHARE_MINOR)
+    equal = expected(SIGNAL_GREEN_SHARE_EQUAL)
+    road = np.array([0.0, main, minor, MIDBLOCK_ROAD_WAIT_S, equal])
+    # A path crossing a side road goes with the main road's green, and one
+    # crossing the main road waits like a side road does.
+    cross = np.array([0.0, main, minor, MIDBLOCK_CROSSING_WAIT_S, equal])
+    return road, cross
+
+
+def _codes(links: gpd.GeoDataFrame, column: str) -> np.ndarray:
+    """A signal-code column as indices into :func:`signal_waits`, 0 if absent."""
+    if column not in links.columns:
+        return np.zeros(len(links), dtype=np.int64)
+    codes = pd.to_numeric(links[column], errors="coerce").fillna(0).to_numpy(dtype=np.int64)
+    return np.clip(codes, 0, 4)
 
 
 def _signal_flag(links: gpd.GeoDataFrame, column: str) -> pd.Series:
