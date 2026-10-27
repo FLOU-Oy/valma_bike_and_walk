@@ -56,6 +56,9 @@ WAY_TAGS: tuple[str, ...] = (
     "crossing",
     "oneway",
     "oneway:bicycle",
+    "bicycle",
+    "bicycle:forward",
+    "bicycle:backward",
     "junction",
     "name",
     "bridge",
@@ -557,8 +560,8 @@ def read_links(
         length_m,
         counts.shape[0],
     )
-    # Which signalled junction each link enters, and how much green it gets
-    # (see signals.py): worked out on the whole network, once, here.
+    # Which links pay at signalled junctions (see signals.py): worked out on the
+    # whole network, once, here.
     first_vertex = np.concatenate([[0], np.cumsum(lengths)[:-1]])
     last_vertex = first_vertex + lengths - 1
     end_ids, end_at = np.unique(
@@ -577,6 +580,7 @@ def read_links(
             end_y,
             signal_ids,
             np.fromiter(buffer.light_nodes, dtype=np.int64, count=len(buffer.light_nodes)),
+            crossing_ids,
         )
     )
     columns[CONSTRUCTION_COLUMN] = np.repeat(

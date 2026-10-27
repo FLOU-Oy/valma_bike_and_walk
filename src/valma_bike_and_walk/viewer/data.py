@@ -22,15 +22,14 @@ from valma_bike_and_walk import links as links_module
 from valma_bike_and_walk.connectors import island_link_ids, merge_connectors
 from valma_bike_and_walk.osm import CONSTRUCTION_COLUMN
 from valma_bike_and_walk.speeds import (
-    AVG_BASE_DISUTIL,
-    AVG_ROUTE_LENGTH_KM,
     CYCLE_LANE_FACTOR,
     CYCLE_TRACK_FACTOR,
     MIXED_TRAFFIC_FACTOR,
     ROAD_CLASS_BETA,
-    TRAFFIC_COEFFICIENT,
     carriageway_divisor,
+    link_disutility,
     profile_for,
+    traffic_factor,
 )
 from valma_bike_and_walk.vector_io import read_vector
 
@@ -367,14 +366,9 @@ def _speed_breakdown(row: gpd.GeoDataFrame, mode: str) -> dict:
     directions: dict = {}
     if mode == "bike":
         segregated = float(_segregation_of(row))
-        volume = pd.to_numeric(pd.Series([r.get("car_volume")]), errors="coerce").iloc[0]
-        traffic = (
-            AVG_BASE_DISUTIL
-            / (AVG_BASE_DISUTIL + TRAFFIC_COEFFICIENT * volume / AVG_ROUTE_LENGTH_KM)
-            if pd.notna(volume)
-            else 1.0
-        )
-        steps.update(segregated_factor=segregated, car_volume=_plain(volume), traffic_factor=float(traffic))
+        volumes = links_module.car_volumes(row)
+        volume = np.nan if volumes is None else volumes.iloc[0]
+        steps.update(segregated_factor=segregated, car_volume=_plain(volume))
         forward_cw, reverse_cw = links_module._cycleway_by_direction(row)
         for label, cw in (("forward", forward_cw), ("reverse", reverse_cw)):
             values = "" if cw is None else str(cw.iloc[0])
@@ -385,9 +379,11 @@ def _speed_breakdown(row: gpd.GeoDataFrame, mode: str) -> dict:
                 else ("mixed traffic", MIXED_TRAFFIC_FACTOR)
             )
             on_road = highway in ROAD_CLASS_BETA
+            disutility = link_disutility(row["highway"], np.array([factor]))
             directions[label] = {
                 "facility": facility if on_road else "not a carriageway",
                 "carriageway_divisor": carriageway_divisor(highway, factor) if on_road else 1.0,
+                "traffic_factor": float(traffic_factor(disutility, [volume])[0]),
             }
 
     forward, reverse = links_module.link_speeds_by_direction(row, mode)

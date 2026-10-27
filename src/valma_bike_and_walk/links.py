@@ -23,15 +23,25 @@ What the columns mean
 ``speed_reverse_kmh``  the same against the digitised direction. Differs only
                    where a cycle lane or track serves one direction of a road.
 ``travel_time_s``  derived forward-direction travel time, including the
-                   bicycle traffic-light penalty when applicable.
+                   wait at traffic lights.
 ``travel_time_reverse_s``  derived reverse-direction travel time.
+``signal_wait_s``, ``signal_wait_reverse_s``  derived, informational -- the
+                   part of each travel time spent waiting at traffic lights.
 ``speed_override_kmh``  empty for you to fill in. Where it is set, it wins over
                    ``highway``/``surface`` entirely.
+``bicycle``, ``bicycle_forward``, ``bicycle_backward``  the OSM tags. A road
+                   with ``use_sidepath`` -- or ``cycleway*=separate`` -- in a
+                   direction rides :data:`SIDEPATH_FACTOR` slower that way.
+``ascent_override_m``, ``descent_override_m``  empty for you to fill in (added
+                   by ``valma dem``). Where set, each wins over the DEM's
+                   ``ascent_m``/``descent_m`` on that link.
 
 Editing rules
 -------------
 * Change ``highway`` or ``surface`` and the speed follows on the next build.
 * Set ``speed_override_kmh`` to force a speed regardless of the tags.
+* Set ``ascent_override_m``/``descent_override_m`` where the DEM is wrong. A
+  link with both set is left alone by ``valma dem``.
 * Move or reshape a geometry and ``length_m`` follows.
 * Delete a row and the link is gone.
 * Draw a new row and leave ``u``/``v`` empty: the build snaps each end to the
@@ -80,9 +90,36 @@ DERIVED_COLUMNS = (
     "speed_reverse_kmh",
     "travel_time_s",
     "travel_time_reverse_s",
+    "signal_wait_s",
+    "signal_wait_reverse_s",
 )
 
+#: Seconds of the forward travel time spent waiting at traffic lights.
+SIGNAL_WAIT_COLUMN = "signal_wait_s"
+SIGNAL_WAIT_REVERSE_COLUMN = "signal_wait_reverse_s"
+
 OVERRIDE_COLUMN = "speed_override_kmh"
+
+#: A road whose cyclists are told to use the path alongside -- ``bicycle=
+#: use_sidepath`` (or ``:forward`` / ``:backward``), or a ``cycleway*=separate``
+#: pointing at that path -- takes this many times as long to ride, in the
+#: direction it applies to. A penalty, not a ban: an address on the road stays
+#: reachable, but a long stretch loses to the path even with its crossings.
+SIDEPATH_FACTOR = 2
+
+#: Hand-set cars per hour (the unit of ``car_volume``, written by ``valma
+#: traffic``) that wins over the matched volume wherever it is filled in.
+CAR_VOLUME_COLUMN = "car_volume"
+CAR_VOLUME_OVERRIDE_COLUMN = "car_volume_override"
+
+#: On a path running beside a road, that road's cars per hour (``valma
+#: traffic``): charged as if the path carried them itself.
+ADJACENT_CAR_VOLUME_COLUMN = "adjacent_car_volume"
+
+#: Hand-set climb in metres, along the digitised direction, that wins over the
+#: DEM's ``ascent_m`` / ``descent_m`` wherever it is filled in.
+ASCENT_OVERRIDE_COLUMN = "ascent_override_m"
+DESCENT_OVERRIDE_COLUMN = "descent_override_m"
 
 #: Wait at a light, per signal node passed, for a layer extracted before
 #: signalled junctions (``signal_entry`` and friends) were worked out.
@@ -92,35 +129,23 @@ TRAFFIC_LIGHT_PENALTY_SECONDS = 10
 #: motion, so the time spent standing at a red light is not in them.
 WALK_TRAFFIC_LIGHT_PENALTY_SECONDS = 10
 
-# Signalled junctions (valma_bike_and_walk.signals): the wait is the average
-# for someone arriving at a random moment, red**2 / (2 * cycle), with red the
-# part of the cycle the movement does not have green. Walking and cycling wait
-# alike: a light does not care who is waiting at it.
+# Signalled junctions (valma_bike_and_walk.signals): a road pays entering one, a
+# path pays stepping onto a signalled crossing. Walking and cycling wait alike:
+# a light does not care who is waiting at it.
 
-#: Signal cycle length, seconds. Finnish urban junctions run roughly 60-120 s.
-SIGNAL_CYCLE_S = 90.0
+#: Wait at a signalled junction, seconds. The average for someone arriving at a
+#: random moment is red**2 / (2 * cycle): with a 90 s cycle and 40 % of it
+#: green for the way you are going, 16 s. One number for every approach and
+#: every crossing: if the road waited longer than a crossing, stepping onto the
+#: crossing and turning onto the road there would be the cheap way in.
+SIGNAL_WAIT_S = 14.0
 
-#: Share of the cycle that is green for the junction's main road, and for a
-#: path crossing a side road (it gets green with the main road).
-SIGNAL_GREEN_SHARE_MAIN = 0.55
-
-#: Share of the cycle that is green for a side road's approach, and for a path
-#: crossing the main road.
-SIGNAL_GREEN_SHARE_MINOR = 0.25
-
-#: Share of the cycle that is green for any approach, or crossing, at a junction
-#: of equals (signals.EQUAL): no one main road, the green is shared.
-SIGNAL_GREEN_SHARE_EQUAL = 0.4
-
-#: Wait for road traffic passing a mid-block pedestrian light: it turns red only
-#: when someone has pushed the button.
-MIDBLOCK_ROAD_WAIT_S = 3.0
-
-#: Wait to cross at a mid-block pedestrian light: push, and wait for its turn.
-MIDBLOCK_CROSSING_WAIT_S = 15.0
+#: Wait at a mid-block pedestrian light, seconds: it turns red for the road only
+#: when someone has pushed the button, and the one crossing waits for its turn.
+MIDBLOCK_SIGNAL_WAIT_S = 8.0
 
 #: Slowing down and yielding at a crossing without lights, on a bike.
-UNSIGNALLED_CROSSING_PENALTY_SECONDS = 2.5
+UNSIGNALLED_CROSSING_PENALTY_SECONDS = 2
 
 #: Each link's share of its crossing way's charge, written at extract time
 #: (``osm._crossing_way_share``): the way's length on this link over its whole
@@ -335,74 +360,21 @@ def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
         else links["speed_kmh"]
     )
     reverse_base = links["length_m"] / (reverse_speed / 3.6)
-    forward_penalty = np.zeros(len(links), dtype=float)
-    reverse_penalty = np.zeros(len(links), dtype=float)
-    wait = {
-        "bike": TRAFFIC_LIGHT_PENALTY_SECONDS,
-        "walk": WALK_TRAFFIC_LIGHT_PENALTY_SECONDS,
-    }.get(mode, 0.0)
-    # Crossings are charged once per *passage*. A node -- a light, or a crossing
-    # where a path meets the road -- is always a link end, and passing it means
-    # riding one link in and another out, so each link touching it pays half.
-    # A crossing way (footway=crossing) is split where it meets the road, so its
-    # pieces share its one charge by length (CROSSING_SHARE_COLUMN, worked out at
-    # extract time); a way whose crossing is also mapped as a node pays nothing
-    # itself, the node is charged instead.
+    forward_penalty, reverse_penalty = traffic_light_waits(links, mode)
+    # Written out with the layer, so the wait each link is charged can be
+    # styled and checked in QGIS. Informational: rebuilt on every read.
+    links[SIGNAL_WAIT_COLUMN] = forward_penalty
+    links[SIGNAL_WAIT_REVERSE_COLUMN] = reverse_penalty
+    forward_penalty = forward_penalty.copy()
+    reverse_penalty = reverse_penalty.copy()
     path = links["highway"].isin(_BICYCLE_CROSSING_HIGHWAYS).to_numpy(dtype=bool)
-    crossing = (
-        links["crossing"].fillna("").astype(str).str.strip()
-        if "crossing" in links.columns
-        else pd.Series("", index=links.index)
-    )
-    signal_ends = (
-        _signal_flag(links, "traffic_signal_at_start").astype(int)
-        + _signal_flag(links, "traffic_signal_at_end").astype(int)
-    ).to_numpy()
+    crossing = _crossing_tags(links)
     has_share = CROSSING_SHARE_COLUMN in links.columns
     share = (
         pd.to_numeric(links[CROSSING_SHARE_COLUMN], errors="coerce").fillna(0.0).to_numpy()
         if has_share
         else None
     )
-    if "signal_entry" in links.columns:
-        # Signalled junctions (signals.py): once per junction on the road, on
-        # the link entering it; once per signalled crossing on a path.
-        road_wait, cross_wait = signal_waits()
-        entry = _codes(links, "signal_entry")
-        entry_reverse = _codes(links, "signal_entry_reverse")
-        forward_penalty += road_wait[entry]
-        reverse_penalty += road_wait[entry_reverse]
-        crossings = 0.5 * (
-            cross_wait[_codes(links, "signal_cross_start")]
-            + cross_wait[_codes(links, "signal_cross_end")]
-        )
-        # A crossing way tagged with signals no node carries: across the main road.
-        signal_way = crossing.str.split(";").map(lambda v: "traffic_signals" in v).to_numpy(
-            dtype=bool
-        ) & path
-        if has_share:
-            crossings = crossings + cross_wait[2] * share * signal_way
-        forward_penalty += crossings
-        reverse_penalty += crossings
-    elif wait:
-        # A layer from before signalled junctions: a wait per signal node.
-        # A light stops whoever passes it, on a path or along the road.
-        at_light = links["highway"].isin(
-            _BICYCLE_CROSSING_HIGHWAYS | _CAR_LANE_CROSSING_HIGHWAYS
-        ).to_numpy(dtype=bool)
-        signal_penalty = wait * 0.5 * signal_ends * at_light
-        # A crossing way tagged with signals the nodes do not carry.
-        signal_way = crossing.str.split(";").map(lambda v: "traffic_signals" in v).to_numpy(
-            dtype=bool
-        ) & path
-        if has_share:
-            signal_penalty = signal_penalty + wait * share * signal_way
-        else:
-            # A layer from before the share column: per link, as it was charged,
-            # where no signal node on it is charged already.
-            signal_penalty = signal_penalty + wait * (signal_way & (signal_ends == 0))
-        forward_penalty += signal_penalty
-        reverse_penalty += signal_penalty
 
     if mode == "bike":
         # Yielding at a crossing without lights -- only for the cyclist crossing
@@ -423,10 +395,9 @@ def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
         forward_penalty += crossing_penalty
         reverse_penalty += crossing_penalty
 
-    if "ascent_m" in links.columns:
+    if {"ascent_m", ASCENT_OVERRIDE_COLUMN, DESCENT_OVERRIDE_COLUMN} & set(links.columns):
         length = links["length_m"].to_numpy(dtype=float)
-        ascent = _metres(links, "ascent_m")
-        descent = _metres(links, "descent_m")
+        ascent, descent = link_climb(links)
         # Reverse is the same link read backwards, so its climb is the descent.
         forward_penalty += _grade_penalty(ascent, length)
         reverse_penalty += _grade_penalty(descent, length)
@@ -435,26 +406,81 @@ def _set_travel_times(links: gpd.GeoDataFrame, mode: str) -> None:
     links["travel_time_reverse_s"] = reverse_base.to_numpy(dtype=float) + reverse_penalty
 
 
-def signal_waits() -> tuple[np.ndarray, np.ndarray]:
+def traffic_light_waits(links: gpd.GeoDataFrame, mode: str) -> tuple[np.ndarray, np.ndarray]:
     """
-    Seconds of wait per signal code (signals.NONE, MAIN, MINOR, MIDBLOCK, EQUAL):
-    (on the road, entering a junction; on a path, at a signalled crossing).
+    Seconds of wait at traffic lights charged on each link: (forward, reverse).
 
-    Read from the module constants on every call, so a calibration that
-    varies them sees the change.
+    The part of ``travel_time_s`` / ``travel_time_reverse_s`` spent standing at
+    red lights, worked out from the module constants as they are now.
     """
+    forward = np.zeros(len(links), dtype=float)
+    reverse = np.zeros(len(links), dtype=float)
+    if "signal_entry" in links.columns:
+        # Signalled junctions (signals.py): a road entering one, a path stepping
+        # onto a signalled crossing, or either getting onto the junction's
+        # roads inside it -- each in the direction of travel that does it.
+        waits = signal_waits()
+        forward += waits[_codes(links, "signal_entry")]
+        reverse += waits[_codes(links, "signal_entry_reverse")]
+        forward += waits[_codes(links, "signal_cross_end")]
+        reverse += waits[_codes(links, "signal_cross_start")]
+        return forward, reverse
 
-    def expected(green_share: float) -> float:
-        red = (1.0 - min(max(green_share, 0.0), 1.0)) * SIGNAL_CYCLE_S
-        return red * red / (2.0 * SIGNAL_CYCLE_S)
+    # A layer from before signalled junctions: a wait per signal node, charged
+    # once per *passage*. A signal node is always a link end, and passing it
+    # means riding one link in and another out, so each link touching it pays
+    # half. A light stops whoever passes it, on a path or along the road.
+    wait = {
+        "bike": TRAFFIC_LIGHT_PENALTY_SECONDS,
+        "walk": WALK_TRAFFIC_LIGHT_PENALTY_SECONDS,
+    }.get(mode, 0.0)
+    if not wait:
+        return forward, reverse
+    signal_ends = (
+        _signal_flag(links, "traffic_signal_at_start").astype(int)
+        + _signal_flag(links, "traffic_signal_at_end").astype(int)
+    ).to_numpy()
+    at_light = links["highway"].isin(
+        _BICYCLE_CROSSING_HIGHWAYS | _CAR_LANE_CROSSING_HIGHWAYS
+    ).to_numpy(dtype=bool)
+    signal_penalty = wait * 0.5 * signal_ends * at_light
+    # A crossing way tagged with signals the nodes do not carry. It is split
+    # where it meets the road, so its pieces share one charge by length
+    # (CROSSING_SHARE_COLUMN, worked out at extract time).
+    path = links["highway"].isin(_BICYCLE_CROSSING_HIGHWAYS).to_numpy(dtype=bool)
+    signal_way = _crossing_tags(links).str.split(";").map(
+        lambda v: "traffic_signals" in v
+    ).to_numpy(dtype=bool) & path
+    if CROSSING_SHARE_COLUMN in links.columns:
+        share = pd.to_numeric(links[CROSSING_SHARE_COLUMN], errors="coerce").fillna(0.0)
+        signal_penalty = signal_penalty + wait * share.to_numpy() * signal_way
+    else:
+        # A layer from before the share column: per link, as it was charged,
+        # where no signal node on it is charged already.
+        signal_penalty = signal_penalty + wait * (signal_way & (signal_ends == 0))
+    forward += signal_penalty
+    reverse += signal_penalty
+    return forward, reverse
 
-    main, minor = expected(SIGNAL_GREEN_SHARE_MAIN), expected(SIGNAL_GREEN_SHARE_MINOR)
-    equal = expected(SIGNAL_GREEN_SHARE_EQUAL)
-    road = np.array([0.0, main, minor, MIDBLOCK_ROAD_WAIT_S, equal])
-    # A path crossing a side road goes with the main road's green, and one
-    # crossing the main road waits like a side road does.
-    cross = np.array([0.0, main, minor, MIDBLOCK_CROSSING_WAIT_S, equal])
-    return road, cross
+
+def _crossing_tags(links: gpd.GeoDataFrame) -> pd.Series:
+    """The ``crossing`` column as stripped strings, empty where absent."""
+    if "crossing" not in links.columns:
+        return pd.Series("", index=links.index)
+    return links["crossing"].fillna("").astype(str).str.strip()
+
+
+def signal_waits() -> np.ndarray:
+    """
+    Seconds of wait per signal code (signals.NONE, JUNCTION, MIDBLOCK).
+
+    Indexed by code: 2 and 4, from an earlier scheme, wait as JUNCTION. Read
+    from the module constants on every call, so a calibration that varies them
+    sees the change.
+    """
+    return np.array(
+        [0.0, SIGNAL_WAIT_S, SIGNAL_WAIT_S, MIDBLOCK_SIGNAL_WAIT_S, SIGNAL_WAIT_S]
+    )
 
 
 def _codes(links: gpd.GeoDataFrame, column: str) -> np.ndarray:
@@ -479,6 +505,32 @@ def _metres(links: gpd.GeoDataFrame, column: str) -> np.ndarray:
     return (
         pd.to_numeric(links[column], errors="coerce").fillna(0.0).to_numpy(dtype=float)
     )
+
+
+def link_climb(links: gpd.GeoDataFrame) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Metres climbed and dropped along each link's digitised direction.
+
+    The DEM's ``ascent_m`` / ``descent_m``, except where ``ascent_override_m``
+    or ``descent_override_m`` is filled in: each override wins on its own, so
+    fixing only the climb leaves the DEM's descent in place.
+    """
+    climb = []
+    for column, override_column in (
+        ("ascent_m", ASCENT_OVERRIDE_COLUMN),
+        ("descent_m", DESCENT_OVERRIDE_COLUMN),
+    ):
+        metres = _metres(links, column)
+        if override_column in links.columns:
+            override = pd.to_numeric(links[override_column], errors="coerce").to_numpy(
+                dtype=float
+            )
+            forced = np.isfinite(override)
+            if forced.any():
+                logger.info("Using %s on %d link(s)", override_column, int(forced.sum()))
+                metres = np.where(forced, np.maximum(override, 0.0), metres)
+        climb.append(metres)
+    return climb[0], climb[1]
 
 
 def _grade_penalty(ascent_m: np.ndarray, length_m: np.ndarray) -> np.ndarray:
@@ -544,7 +596,9 @@ def link_speeds_by_direction(
 
     The profile's answer, unless ``speed_override_kmh`` is set, which then
     holds both ways. The two directions differ only for bikes, where a cycle
-    lane or track serves one side of a road; see :func:`_cycleway_by_direction`.
+    lane or track serves one side of a road; see :func:`_cycleway_by_direction`
+    -- and where a road tells cyclists to use the path alongside in only one
+    direction, see :func:`_sidepath_by_direction`.
     """
     profile = profile_for(mode)
     forward_cycleway = reverse_cycleway = None
@@ -557,7 +611,7 @@ def link_speeds_by_direction(
             links["surface"] if "surface" in links.columns else None,
             links["segregated"] if "segregated" in links.columns else None,
             cycleway,
-            links["car_volume"] if "car_volume" in links.columns else None,
+            car_volumes(links),
         )
 
     forward = speeds(forward_cycleway)
@@ -566,6 +620,16 @@ def link_speeds_by_direction(
         if forward_cycleway is None or forward_cycleway.equals(reverse_cycleway)
         else speeds(reverse_cycleway)
     )
+    if mode == "bike":
+        along, against = _sidepath_by_direction(links, forward_cycleway, reverse_cycleway)
+        if along.any() or against.any():
+            logger.info(
+                "Riding %d link direction(s) %g times slower for a sidepath",
+                int(along.sum() + against.sum()),
+                SIDEPATH_FACTOR,
+            )
+            forward = np.where(along, forward / SIDEPATH_FACTOR, forward)
+            reverse = np.where(against, reverse / SIDEPATH_FACTOR, reverse)
     if OVERRIDE_COLUMN in links.columns:
         override = pd.to_numeric(links[OVERRIDE_COLUMN], errors="coerce").to_numpy(
             dtype=float
@@ -579,6 +643,70 @@ def link_speeds_by_direction(
 
 
 _CYCLEWAY_COLUMNS = ("cycleway", "cycleway_left", "cycleway_right", "cycleway_both")
+
+
+def car_volumes(links: gpd.GeoDataFrame) -> pd.Series | None:
+    """
+    Cars per hour on each link: ``car_volume_override`` where it is filled in,
+    else ``car_volume``, else -- on a path beside a road -- that road's
+    ``adjacent_car_volume``. None when the layer carries none of them.
+    """
+    columns = [
+        c
+        for c in (CAR_VOLUME_COLUMN, CAR_VOLUME_OVERRIDE_COLUMN, ADJACENT_CAR_VOLUME_COLUMN)
+        if c in links.columns
+    ]
+    if not columns:
+        return None
+    volume = (
+        pd.to_numeric(links[CAR_VOLUME_COLUMN], errors="coerce")
+        if CAR_VOLUME_COLUMN in links.columns
+        else pd.Series(np.nan, index=links.index)
+    )
+    if ADJACENT_CAR_VOLUME_COLUMN in links.columns:
+        adjacent = pd.to_numeric(links[ADJACENT_CAR_VOLUME_COLUMN], errors="coerce")
+        volume = volume.where(volume.notna(), adjacent)
+    if CAR_VOLUME_OVERRIDE_COLUMN in links.columns:
+        override = pd.to_numeric(links[CAR_VOLUME_OVERRIDE_COLUMN], errors="coerce")
+        volume = override.where(override.notna(), volume)
+    return volume
+
+
+def _sidepath_by_direction(
+    links: gpd.GeoDataFrame,
+    forward_cycleway: pd.Series | None,
+    reverse_cycleway: pd.Series | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Roads whose cyclists are told to use the path alongside: along, against.
+
+    ``bicycle=use_sidepath`` holds both ways, ``bicycle:forward`` /
+    ``bicycle:backward`` along / against the digitised direction. A
+    ``separate`` among the cycleway values serving a direction (see
+    :func:`_cycleway_by_direction`) says the same: that side's cycleway is
+    mapped as its own way. Paths themselves are never penalised.
+    """
+    road = ~links["highway"].isin(PATH_HIGHWAYS).to_numpy(dtype=bool)
+
+    def says(column: str) -> np.ndarray:
+        if column not in links.columns:
+            return np.zeros(len(links), dtype=bool)
+        values = links[column].fillna("").astype(str).str.lower().str.split(";")
+        return values.map(lambda parts: "use_sidepath" in [p.strip() for p in parts]).to_numpy(
+            dtype=bool
+        )
+
+    def separate(cycleway: pd.Series | None) -> np.ndarray:
+        if cycleway is None:
+            return np.zeros(len(links), dtype=bool)
+        return cycleway.str.contains(r"(?:^|;)\s*separate\s*(?:;|$)", regex=True).to_numpy(
+            dtype=bool
+        )
+
+    both = says("bicycle")
+    along = road & (both | says("bicycle_forward") | separate(forward_cycleway))
+    against = road & (both | says("bicycle_backward") | separate(reverse_cycleway))
+    return along, against
 
 
 def _cycleway_by_direction(

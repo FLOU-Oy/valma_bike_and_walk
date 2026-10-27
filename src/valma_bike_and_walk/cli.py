@@ -136,6 +136,7 @@ from valma_bike_and_walk.osm import resolve_clip
 from valma_bike_and_walk.speeds import profile_for
 from valma_bike_and_walk.overlay import overlay, read_model_minutes, read_omx_dense
 from valma_bike_and_walk.traffic import (
+    DEFAULT_ADJACENT_DISTANCE_M,
     DEFAULT_MAX_ANGLE_DEG,
     DEFAULT_MAX_DISTANCE_M,
     DEFAULT_MIN_COVERAGE,
@@ -565,13 +566,15 @@ def cmd_dem(args: argparse.Namespace) -> int:
     if args.links is not None:
         logger.info("Reading link layer from %s", args.links)
         links = links_module.read_links(args.links)
-        links = add_elevation(links, cache, workers=args.dem_workers)
+        links = add_elevation(
+            links, cache, workers=args.dem_workers, remeasure=args.remeasure_all
+        )
         links = links_module.normalise(links, _links_mode(args))
         out = args.out or args.links
         logger.info("Writing link layer to %s", out)
         links_module.write_links(links, out)
         print(f"Elevation written to {out} ({len(links):,} links)")
-        rise = links["ascent_m"].to_numpy()
+        rise, _ = links_module.link_climb(links)
         print(f"  total ascent: {np.nansum(rise):,.0f} m")
         print(f"  steepest link: {np.nanmax(rise):,.1f} m of climb")
     else:
@@ -603,6 +606,7 @@ def cmd_traffic(args: argparse.Namespace) -> int:
         min_coverage=args.min_coverage,
         spacing_m=args.sample_spacing,
         split_divided=not args.no_split_divided,
+        adjacent_distance_m=args.adjacent_distance,
     )
 
     links, match = add_volumes(links, volumes, settings)
@@ -1450,6 +1454,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Where to write the elevated link layer (default: in place).",
     )
+    dem.add_argument(
+        "--remeasure-all",
+        action="store_true",
+        help=(
+            "Read every link's height from the DEM again, not only those with "
+            "ascent_m/descent_m empty -- after a link was moved, or the DEM "
+            "settings changed. Links with both overrides set are still skipped."
+        ),
+    )
     dem.set_defaults(func=cmd_dem)
 
     traffic = sub.add_parser(
@@ -1544,6 +1557,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Give both carriageways of a divided road the source's full volume "
             "instead of half each. Right only if the source layer already holds "
             "one directed link per carriageway."
+        ),
+    )
+    traffic.add_argument(
+        "--adjacent-distance",
+        type=float,
+        default=DEFAULT_ADJACENT_DISTANCE_M,
+        help=(
+            "A path within this many metres of a road, and running alongside "
+            "it, takes that road's volume as adjacent_car_volume and is charged "
+            "for it like the road (default: %(default)s; 0 turns it off)."
         ),
     )
     traffic.set_defaults(func=cmd_traffic)

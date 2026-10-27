@@ -16,8 +16,9 @@ from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 
-from valma_bike_and_walk.links import LINKS_LAYER
+from valma_bike_and_walk.links import LINKS_LAYER, traffic_light_waits
 from valma_bike_and_walk.links import read_links as read_links_gpkg
 from valma_bike_and_walk.network import RoutableNetwork
 from valma_bike_and_walk.vector_io import write_vector
@@ -80,6 +81,9 @@ def edges_to_geodataframe(
         "length_m": length_m,
         "travel_time_s": travel_time_s,
         "speed_kmh": speed_kmh,
+        "signal_wait_s": _signal_wait_per_edge(
+            links, network.mode, link_id, network.direction[keep]
+        ),
     }
     if extra_columns:
         columns.update({k: np.asarray(v)[keep] for k, v in extra_columns.items()})
@@ -89,6 +93,15 @@ def edges_to_geodataframe(
         geometry=geometry_by_link.loc[link_id].to_numpy(),
         crs=links.crs,
     )
+
+
+def _signal_wait_per_edge(
+    links: gpd.GeoDataFrame, mode: str, link_id: np.ndarray, direction: np.ndarray
+) -> np.ndarray:
+    """Seconds of each edge's ``travel_time_s`` spent waiting at traffic lights."""
+    forward, reverse = traffic_light_waits(links, mode)
+    row = pd.Index(links["link_id"]).get_indexer(link_id)
+    return np.where(direction >= 0, forward[row], reverse[row])
 
 
 def write_edges_gpkg(

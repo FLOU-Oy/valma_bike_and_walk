@@ -65,7 +65,7 @@ _NOT_SETTINGS = frozenset({"help", "config", "show_config"})
 
 #: About this invocation rather than its result, so left out of a record.
 #: ``scenario`` is already folded into ``output_dir`` by then.
-_NOT_RECORDED = frozenset({"force_reload", "scenario", "verbose"})
+_NOT_RECORDED = frozenset({"force_reload", "remeasure_all", "scenario", "verbose"})
 
 #: Shared by several commands but meaning something different in each.
 _NEVER_SHARED = frozenset({"out"})

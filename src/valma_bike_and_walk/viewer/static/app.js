@@ -276,10 +276,10 @@ async function inspectLink(i) {
   const d = await res.json();
   const s = d.speed, dirs = s.directions || {};
   const tagOrder = ["link_id", "highway", "name", "surface", "segregated", "cycleway", "cycleway_left",
-    "cycleway_right", "cycleway_both", "oneway", "oneway_bicycle", "car_volume", "crossing",
+    "cycleway_right", "cycleway_both", "oneway", "oneway_bicycle", "bicycle", "bicycle_forward", "bicycle_backward", "car_volume", "adjacent_car_volume", "crossing",
     "traffic_signal_at_start", "traffic_signal_at_end", "crossing_node_at_start",
     "crossing_node_at_end", "crossing_way_share", "signal_entry", "signal_entry_reverse",
-    "signal_cross_start", "signal_cross_end", "ascent_m", "descent_m", "under_construction",
+    "signal_cross_start", "signal_cross_end", "signal_wait_s", "signal_wait_reverse_s", "ascent_m", "descent_m", "ascent_override_m", "descent_override_m", "under_construction",
     "speed_override_kmh", "bridge", "osm_way_id"];
   const tags = tagOrder.filter((k) => k in d.tags).map((k) => row(k, d.tags[k])).join("");
   const dir = (k) => dirs[k] || {};
@@ -294,13 +294,14 @@ async function inspectLink(i) {
       ${row("Nominal speed", `${fmt(s.nominal_kmh, 1)} km/h (${s.highway})`, "num")}
       ${row("Surface factor", fmt(s.surface_factor, 2), "num")}
       ${s.segregated_factor != null ? row("Segregation factor", fmt(s.segregated_factor, 2), "num") : ""}
-      ${s.traffic_factor != null ? row("Traffic factor", `${fmt(s.traffic_factor, 3)} (car_volume ${fmt(s.car_volume)})`, "num") : ""}
+      ${s.car_volume != null ? row("Car volume", `${fmt(s.car_volume)} veh/h`, "num") : ""}
       ${row("Length", `${fmt(s.length_m, 1)} m`, "num")}
     </table>
     <table>
       <tr><th></th><th class="num">digitised</th><th class="num">against</th></tr>
       ${facility}
       ${both("Carriageway divisor", "carriageway_divisor", 3)}
+      ${s.car_volume != null ? both("Traffic factor", "traffic_factor", 3) : ""}
       ${both("Speed", "speed_kmh", 1, " km/h")}
       ${both("Moving time", "moving_time_s", 1, " s")}
       ${both("Penalties", "penalties_s", 1, " s")}

@@ -65,7 +65,7 @@ demand_matrix = "{mode}"
 # --------------------------------------------------------------------------
 
 [extract]
-pbf = "../data/finland-260805.osm.pbf"
+pbf = "../data/finland.osm.pbf"
 # bbox = [24.50, 60.10, 25.30, 60.40]     # lon/lat box; much cheaper than area
 # area = "Espoo"
 # include_construction = true
@@ -77,7 +77,7 @@ pbf = "../data/finland-260805.osm.pbf"
 # gap_m = 50.0
 
 [dem]
-dem_resolution = 10.0
+dem_resolution = 2.0
 # dem_tile = 8000
 # dem_workers = 4
 # The NLS API key stays in the MML_API_KEY environment variable, not here.

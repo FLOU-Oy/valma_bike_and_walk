@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import re
+import time
 from pathlib import Path
 
 import geopandas as gpd
@@ -184,8 +186,24 @@ def plot_comparison(data: pd.DataFrame, path: Path, title: str | None = None) ->
         axis.legend(title="City", fontsize=7, title_fontsize=8, loc="best")
     axis.grid(True, alpha=0.25)
     figure.tight_layout()
-    figure.savefig(path, dpi=180)
+    _save(figure, path)
     plt.close(figure)
+
+
+def _save(figure: plt.Figure, path: Path, attempts: int = 5) -> None:
+    """Save, retrying while Windows briefly refuses to replace the file.
+
+    Antivirus or a thumbnail indexer holding a freshly written image makes
+    replacing it fail with EINVAL for a moment.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            figure.savefig(path, dpi=180)
+            return
+        except OSError as error:
+            if error.errno != errno.EINVAL or attempt == attempts:
+                raise
+            time.sleep(0.5 * attempt)
 
 
 def main() -> int:

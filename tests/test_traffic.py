@@ -15,6 +15,7 @@ from valma_bike_and_walk.links import LINKS_LAYER, write_links
 from valma_bike_and_walk.traffic import (
     OFFSET_COLUMN,
     OVERRIDE_COLUMN,
+    SOURCE_VOLUME_TO_HOUR,
     VOLUME_COLUMN,
     MatchSettings,
     add_volumes,
@@ -85,7 +86,7 @@ def test_the_road_takes_the_volume_and_the_cycleway_beside_it_does_not():
 
     matched, _ = add_volumes(links, volumes)
 
-    assert volume_of(matched, 0) == 5000 / 16
+    assert volume_of(matched, 0) == 5000 / SOURCE_VOLUME_TO_HOUR
     assert np.isnan(volume_of(matched, 1))
 
 
@@ -102,7 +103,7 @@ def test_matching_again_over_volumes_from_an_earlier_run():
 
     matched, _ = add_volumes(links, volumes)
 
-    assert volume_of(matched, 0) == 5000 / 16
+    assert volume_of(matched, 0) == 5000 / SOURCE_VOLUME_TO_HOUR
     # Where nothing matches this time, the earlier value is kept.
     assert volume_of(matched, 1) == 42.0
     # The caller's frame is untouched.
@@ -154,7 +155,7 @@ def test_lowering_the_coverage_threshold_lets_that_partial_match_through():
 
     matched, _ = add_volumes(links, volumes, MatchSettings(min_coverage=0.1))
 
-    assert volume_of(matched, 0) == 30000 / 16
+    assert volume_of(matched, 0) == 30000 / SOURCE_VOLUME_TO_HOUR
 
 
 def test_unmatched_sources_come_back_with_the_share_that_found_a_road():
@@ -187,7 +188,7 @@ def test_one_source_link_covers_every_link_of_the_road_it_follows():
 
     matched, _ = add_volumes(links, volumes)
 
-    assert [volume_of(matched, i) for i in range(3)] == [4200 / 16] * 3
+    assert [volume_of(matched, i) for i in range(3)] == [4200 / SOURCE_VOLUME_TO_HOUR] * 3
 
 
 def test_a_road_crossing_at_a_right_angle_takes_none_of_the_volume():
@@ -201,7 +202,7 @@ def test_a_road_crossing_at_a_right_angle_takes_none_of_the_volume():
 
     matched, _ = add_volumes(links, volumes)
 
-    assert volume_of(matched, 0) == 9000 / 16
+    assert volume_of(matched, 0) == 9000 / SOURCE_VOLUME_TO_HOUR
     assert volume_of(matched, 1) == 25
 
 
@@ -234,7 +235,7 @@ def test_a_source_layer_covering_the_whole_country_is_not_all_a_failed_match():
 
     matched, match = add_volumes(links, volumes)
 
-    assert volume_of(matched, 0) == 9000 / 16
+    assert volume_of(matched, 0) == 9000 / SOURCE_VOLUME_TO_HOUR
     assert list(match.source_in_extent) == [True, False]
     assert np.isnan(match.source_coverage[1])
     # The far-away source is somewhere else, not a match that failed.
@@ -253,7 +254,7 @@ def test_the_nearer_of_two_sources_wins_the_link_outright():
 
     matched, _ = add_volumes(links, volumes)
 
-    assert volume_of(matched, 0) == 1000 / 16
+    assert volume_of(matched, 0) == 1000 / SOURCE_VOLUME_TO_HOUR
 
 
 # --------------------------------------------------------------------------
@@ -278,8 +279,8 @@ def test_a_divided_roads_carriageways_get_half_the_volume_each():
 
     matched, match = add_volumes(links, volumes)
 
-    assert volume_of(matched, 0) == 4000 / 16
-    assert volume_of(matched, 1) == 4000 / 16
+    assert volume_of(matched, 0) == 4000 / SOURCE_VOLUME_TO_HOUR
+    assert volume_of(matched, 1) == 4000 / SOURCE_VOLUME_TO_HOUR
     assert match.divided.all()
 
 
@@ -288,8 +289,8 @@ def test_the_split_can_be_turned_off_for_an_already_directed_source():
 
     matched, match = add_volumes(links, volumes, MatchSettings(split_divided=False))
 
-    assert volume_of(matched, 0) == 8000 / 16
-    assert volume_of(matched, 1) == 8000 / 16
+    assert volume_of(matched, 0) == 8000 / SOURCE_VOLUME_TO_HOUR
+    assert volume_of(matched, 1) == 8000 / SOURCE_VOLUME_TO_HOUR
     assert not match.divided.any()
 
 
@@ -306,7 +307,7 @@ def test_two_way_roads_are_never_read_as_a_divided_pair():
     matched, match = add_volumes(links, volumes)
 
     assert not match.divided.any()
-    assert matched[VOLUME_COLUMN].max() == 8000 / 16
+    assert matched[VOLUME_COLUMN].max() == 8000 / SOURCE_VOLUME_TO_HOUR
 
 
 def test_a_roundabout_is_not_mistaken_for_a_divided_road():
@@ -380,7 +381,7 @@ def test_a_source_in_another_crs_is_matched_in_metres_all_the_same():
 
     matched, _ = add_volumes(links, volumes)
 
-    assert volume_of(matched, 0) == 7000 / 16
+    assert volume_of(matched, 0) == 7000 / SOURCE_VOLUME_TO_HOUR
 
 
 # --------------------------------------------------------------------------
@@ -419,7 +420,7 @@ def test_unmatched_car_links_get_highway_default_volumes():
     matched, _ = add_volumes(links, volumes)
 
     assert matched[VOLUME_COLUMN].iloc[:10].tolist() == [
-        12000.0 / 16,
+        12000.0 / SOURCE_VOLUME_TO_HOUR,
         500.0,
         100.0,
         100.0,
@@ -482,6 +483,91 @@ def test_the_traffic_command_writes_the_volumes_back_into_the_link_layer(tmp_pat
 
     back = gpd.read_file(links_path, layer=LINKS_LAYER)
     by_id = back.set_index("link_id")[VOLUME_COLUMN]
-    assert by_id.loc[0] == 12000 / 16
+    assert by_id.loc[0] == 12000 / SOURCE_VOLUME_TO_HOUR
     assert np.isnan(by_id.loc[1])
     assert missed_path.exists()
+
+
+# --------------------------------------------------------------------------
+# Paths beside a road are charged for its traffic, like the road
+# --------------------------------------------------------------------------
+
+
+def adjacent_of(links, link_id):
+    return float(links.set_index("link_id").loc[link_id, "adjacent_car_volume"])
+
+
+def test_a_cycleway_beside_a_road_takes_the_road_volume():
+    links = link_layer(
+        [
+            {"highway": "secondary", "coords": [(0, 0), (300, 0)]},
+            {"highway": "cycleway", "coords": [(0, 8), (300, 8)]},
+        ]
+    )
+    volumes = volume_layer([{"volume": 7000, "coords": [(0, 0), (300, 0)]}])
+
+    matched, _ = add_volumes(links, volumes)
+
+    assert adjacent_of(matched, 1) == pytest.approx(volume_of(matched, 0))
+    assert np.isnan(volume_of(matched, 1))
+    assert np.isnan(adjacent_of(matched, 0))
+
+
+def test_a_path_far_from_the_road_or_across_it_takes_nothing():
+    links = link_layer(
+        [
+            {"highway": "secondary", "coords": [(0, 0), (300, 0)]},
+            {"highway": "cycleway", "coords": [(0, 40), (300, 40)]},  # separated
+            {"highway": "cycleway", "coords": [(150, -100), (150, 100)]},  # crossing
+        ]
+    )
+    volumes = volume_layer([{"volume": 7000, "coords": [(0, 0), (300, 0)]}])
+
+    matched, _ = add_volumes(links, volumes)
+
+    assert np.isnan(adjacent_of(matched, 1))
+    assert np.isnan(adjacent_of(matched, 2))
+
+
+def test_a_path_only_briefly_beside_a_road_takes_nothing():
+    """Coverage: 50 m of a 400 m path along the road is not riding beside it."""
+    links = link_layer(
+        [
+            {"highway": "secondary", "coords": [(0, 0), (50, 0)]},
+            {"highway": "cycleway", "coords": [(0, 8), (50, 8), (50, 358)]},
+        ]
+    )
+    volumes = volume_layer([{"volume": 7000, "coords": [(0, 0), (50, 0)]}])
+
+    matched, _ = add_volumes(links, volumes)
+
+    assert np.isnan(adjacent_of(matched, 1))
+
+
+def test_the_road_override_carries_over_to_the_path_beside_it():
+    links = link_layer(
+        [
+            {"highway": "secondary", "coords": [(0, 0), (300, 0)]},
+            {"highway": "cycleway", "coords": [(0, 8), (300, 8)]},
+        ]
+    )
+    links["car_volume_override"] = [900.0, np.nan]
+    volumes = volume_layer([{"volume": 7000, "coords": [(0, 0), (300, 0)]}])
+
+    matched, _ = add_volumes(links, volumes)
+
+    assert adjacent_of(matched, 1) == pytest.approx(900.0)
+
+
+def test_adjacent_distance_zero_turns_it_off():
+    links = link_layer(
+        [
+            {"highway": "secondary", "coords": [(0, 0), (300, 0)]},
+            {"highway": "cycleway", "coords": [(0, 8), (300, 8)]},
+        ]
+    )
+    volumes = volume_layer([{"volume": 7000, "coords": [(0, 0), (300, 0)]}])
+
+    matched, _ = add_volumes(links, volumes, MatchSettings(adjacent_distance_m=0))
+
+    assert matched["adjacent_car_volume"].isna().all()

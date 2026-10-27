@@ -22,6 +22,22 @@ Which tiles get fetched is decided from the *links*, not from their bounding box
 A rural network is mostly empty space, and asking per link means we pay for the
 tiles the roads actually cross instead of the rectangle that contains them.
 
+Only the strip along the links is kept
+--------------------------------------
+At 2 m a whole tile is 4000 px a side, and the tiles the links touch cover most
+of the country: hundreds of gigabytes. But a profile only ever reads the pixels
+under the links, and a strip a few tens of metres wide along every link is a
+few per cent of that area. So a tile fetched for a link layer is stored as that
+strip alone (:data:`CORRIDOR_CELL_M` cells along the links, grown by
+:data:`CORRIDOR_GROW_CELLS`), everything else written as no-data, in whole
+decimetres in 16 bits -- which compresses to a few gigabytes for all of
+Finland. The strip a tile holds is recorded in the tile itself
+(:data:`CORRIDOR_TAG`), so a later run can tell which of its links the tile
+already covers. Links added or moved outside it make the tile fetch again, and
+store the old strip and the new together; links moved a few metres stay inside
+and cost nothing. A tile fetched whole (``valma dem --bbox``, or one cached
+before the strip existed) holds everything and is never fetched again.
+
 Coordinates
 -----------
 The service's native CRS is EPSG:3067, which is already
@@ -47,6 +63,8 @@ trusts; verification can be turned off outright as a last resort.
 
 from __future__ import annotations
 
+import base64
+import http.client
 import logging
 import os
 import sqlite3
@@ -55,6 +73,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
@@ -67,6 +86,11 @@ import pandas as pd
 import shapely
 
 from valma_bike_and_walk.config import PROJECTED_CRS
+from valma_bike_and_walk.links import (
+    ASCENT_OVERRIDE_COLUMN,
+    DESCENT_OVERRIDE_COLUMN,
+    link_climb,
+)
 from valma_bike_and_walk.progress import Progress
 
 logger = logging.getLogger(__name__)
@@ -173,8 +197,27 @@ STRUCTURE_ADJACENT_GRADE = 0.15
 #: Value MML writes where it has no measurement.
 NODATA = -9999.0
 
+#: Cell size of the strip kept along the links, in metres. Every cell a link
+#: passes through is kept, grown by :data:`CORRIDOR_GROW_CELLS` all round: the
+#: strip is 10-20 m either side of the line, so a link nudged in QGIS still
+#: reads from it.
+CORRIDOR_CELL_M = 10.0
+CORRIDOR_GROW_CELLS = 1
+
+#: GeoTIFF metadata item a strip-only tile records its strip in: the cell size,
+#: the cells a side, and the cells kept as zlib-compressed packed bits.
+CORRIDOR_TAG = "VALMA_CORRIDOR"
+
+#: Strip-only tiles store heights in whole decimetres, in 16 bits: Finland's
+#: highest point is 1324 m, and the 5 cm this rounds by is a tenth of the
+#: :data:`DEAD_BAND_M` a profile already ignores.
+STORED_SCALE = 0.1
+STORED_NODATA = -32768
+
 _HTTP_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
-_MAX_ATTEMPTS = 4
+#: Backs off 2, 4, 8, 16, 32 s: a minute is enough to ride out a Wi-Fi or
+#: DNS blip that would otherwise end an hours-long download.
+_MAX_ATTEMPTS = 6
 _BACKOFF_SECONDS = 2.0
 _TIMEOUT_SECONDS = 120.0
 
@@ -419,6 +462,15 @@ def _certificate_error(error: Exception) -> ssl.SSLCertVerificationError | None:
     return None
 
 
+class ElevationUnreachable(RuntimeError):
+    """The elevation service kept failing in ways that retrying might fix."""
+
+
+#: Give up on a corridor download after this many tiles have exhausted their
+#: retries: by then the network is down, not blinking.
+_MAX_FAILED_TILES = 20
+
+
 def _fetch(
     url: str,
     timeout: float = _TIMEOUT_SECONDS,
@@ -444,7 +496,9 @@ def _fetch(
                     f"{_strip_key(url)}"
                 ) from error
             last = error
-        except (urllib.error.URLError, TimeoutError, OSError) as error:
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as error:
+            # HTTPException covers a connection dropped mid-body (IncompleteRead)
+            # or before the status line (RemoteDisconnected) -- both transient.
             # A rejected certificate is not going to be accepted on the fourth
             # go, and retrying only buries the one line that says what to do.
             certificate = _certificate_error(error)
@@ -477,7 +531,7 @@ def _fetch(
             )
             time.sleep(delay)
 
-    raise RuntimeError(
+    raise ElevationUnreachable(
         f"Elevation service unreachable after {_MAX_ATTEMPTS} attempts: {last}"
     )
 
@@ -491,6 +545,111 @@ def _check_is_tiff(payload: bytes, tile: Tile) -> None:
         f"The elevation service returned no GeoTIFF for tile {tile.filename}. "
         f"It said:\n{excerpt}"
     )
+
+
+# --------------------------------------------------------------------------
+# The strip along the links
+# --------------------------------------------------------------------------
+
+
+def _corridor_cells(tile_m: int) -> int:
+    return int(round(tile_m / CORRIDOR_CELL_M))
+
+
+def corridors_for_links(
+    links: gpd.GeoDataFrame,
+    resolution_m: float = DEFAULT_RESOLUTION_M,
+    tile_m: int = DEFAULT_TILE_M,
+) -> dict[Tile, np.ndarray]:
+    """
+    The cells each tile needs to hold for these links.
+
+    A boolean grid of :data:`CORRIDOR_CELL_M` cells per tile, north row first:
+    every cell a link passes through. A tile stores these grown by
+    :data:`CORRIDOR_GROW_CELLS` (:func:`_grow`), and is fetched again only when a
+    link passes through a cell outside what it stores -- so a link nudged a few
+    metres costs nothing.
+    """
+    _require_rasterio()
+    from rasterio.features import rasterize
+    from rasterio.transform import from_origin
+
+    geometry = _projected(links).geometry.to_numpy()
+    bounds = shapely.bounds(geometry) / tile_m
+    c0 = np.floor(bounds[:, 0]).astype(np.int64)
+    r0 = np.floor(bounds[:, 1]).astype(np.int64)
+    c1 = np.floor(bounds[:, 2]).astype(np.int64)
+    r1 = np.floor(bounds[:, 3]).astype(np.int64)
+
+    # Which links each tile has to hold: most sit in one tile; walk the rest.
+    by_tile: dict[tuple[int, int], list[np.ndarray]] = {}
+    single = np.flatnonzero((c0 == c1) & (r0 == r1))
+    if single.size:
+        row_base = int(r0[single].min())
+        keys = (c0[single] << 32) + (r0[single] - row_base)
+        order = np.argsort(keys, kind="stable")
+        unique, starts = np.unique(keys[order], return_index=True)
+        ends = np.r_[starts[1:], order.size]
+        for key, start, end in zip(unique, starts, ends):
+            cell = (int(key >> 32), int((key & 0xFFFFFFFF) + row_base))
+            by_tile.setdefault(cell, []).append(single[order[start:end]])
+    for i in np.flatnonzero((c0 != c1) | (r0 != r1)):
+        for col in range(c0[i], c1[i] + 1):
+            for row in range(r0[i], r1[i] + 1):
+                by_tile.setdefault((int(col), int(row)), []).append(np.array([i]))
+
+    cells = _corridor_cells(tile_m)
+    needed: dict[Tile, np.ndarray] = {}
+    for (col, row), parts in by_tile.items():
+        tile = Tile(col, row, tile_m, resolution_m)
+        min_e, _, _, max_n = tile.bounds
+        members = np.concatenate(parts)
+        mask = rasterize(
+            ((g, 1) for g in geometry[members]),
+            out_shape=(cells, cells),
+            transform=from_origin(min_e, max_n, CORRIDOR_CELL_M, CORRIDOR_CELL_M),
+            fill=0,
+            all_touched=True,
+            dtype="uint8",
+        ).astype(bool)
+        if not mask.any():  # a link whose box touches the tile but not its line
+            continue
+        needed[tile] = mask
+    logger.info("%d link(s) pass through %d DEM tile(s)", len(links), len(needed))
+    return needed
+
+
+def _grow(mask: np.ndarray) -> np.ndarray:
+    """The cells kept around the ones the links pass through."""
+    if not CORRIDOR_GROW_CELLS:
+        return mask
+    from scipy.ndimage import binary_dilation
+
+    return binary_dilation(
+        mask, structure=np.ones((3, 3), dtype=bool), iterations=CORRIDOR_GROW_CELLS
+    )
+
+
+def _encode_corridor(mask: np.ndarray) -> str:
+    packed = zlib.compress(np.packbits(mask).tobytes(), 9)
+    return f"{CORRIDOR_CELL_M:g}:{mask.shape[0]}:{base64.b64encode(packed).decode('ascii')}"
+
+
+def _decode_corridor(value: str) -> np.ndarray:
+    cell_m, cells, data = value.split(":", 2)
+    if float(cell_m) != CORRIDOR_CELL_M:
+        raise ValueError(
+            f"The tile's strip is recorded in {cell_m} m cells, not {CORRIDOR_CELL_M:g} m."
+        )
+    n = int(cells)
+    bits = np.unpackbits(np.frombuffer(zlib.decompress(base64.b64decode(data)), dtype=np.uint8))
+    return bits[: n * n].reshape(n, n).astype(bool)
+
+
+def _cell_index(coord: np.ndarray, origin: float, sign: float, cells: int) -> np.ndarray:
+    """Strip cell of each coordinate, clamped to the tile (its overlap included)."""
+    index = np.floor(sign * (np.asarray(coord) - origin) / CORRIDOR_CELL_M).astype(np.int64)
+    return np.clip(index, 0, cells - 1)
 
 
 # --------------------------------------------------------------------------
@@ -535,6 +694,152 @@ class DemCache:
 
     def missing(self, tiles: Iterable[Tile]) -> list[Tile]:
         return [tile for tile in tiles if not self.path(tile).exists()]
+
+    def stored_corridor(self, tile: Tile) -> np.ndarray:
+        """
+        The strip a cached tile holds: a boolean cell grid, all True for a tile
+        held whole, all False for one not cached at all.
+        """
+        cells = _corridor_cells(self.tile_m)
+        path = self.path(tile)
+        if not path.exists():
+            return np.zeros((cells, cells), dtype=bool)
+        rasterio = _require_rasterio()
+        with rasterio.open(path) as dataset:
+            value = dataset.tags().get(CORRIDOR_TAG)
+        if value is None:
+            return np.ones((cells, cells), dtype=bool)
+        return _decode_corridor(value)
+
+    def ensure_corridor(self, links: gpd.GeoDataFrame, workers: int = 4) -> int:
+        """
+        Have the strip along every link cached, fetching only what is absent.
+
+        A tile not cached yet is fetched and stored as the strip alone. A cached
+        tile whose strip does not cover every link through it -- a link added or
+        moved since -- is fetched again and stored with the old strip and the new
+        together. Returns how many tiles were fetched.
+        """
+        needed = corridors_for_links(links, self.resolution_m, self.tile_m)
+        outstanding: list[tuple[Tile, np.ndarray]] = []
+        widened = 0
+        for tile, mask in needed.items():
+            have = self.stored_corridor(tile)
+            if (mask & ~have).any():
+                outstanding.append((tile, _grow(mask) | have))
+                widened += int(have.any())
+        if not outstanding:
+            logger.info(
+                "Every link's strip is already cached, in %d DEM tile(s) in %s",
+                len(needed),
+                self.directory,
+            )
+            return 0
+
+        # Fail on a missing key now rather than once per tile inside the pool.
+        resolve_api_key(self._api_key)
+        logger.info(
+            "Fetching %d of %d DEM tile(s) at %g m into %s (%d of them again, for "
+            "links outside the strip they hold)",
+            len(outstanding),
+            len(needed),
+            self.resolution_m,
+            self.directory,
+            widened,
+        )
+        # One tile that fails even after retries should not throw away the
+        # hours spent on the others: carry on, and fail at the end. Every tile
+        # fetched is already on disk, so running again picks up the rest.
+        failed: list[tuple[Tile, Exception]] = []
+
+        def fetch(job: tuple[Tile, np.ndarray]) -> None:
+            try:
+                self.fetch_corridor(*job)
+            except ElevationUnreachable as error:
+                logger.error("DEM tile %s failed: %s", job[0], error)
+                failed.append((job[0], error))
+
+        with Progress(len(outstanding), "  downloading tiles") as progress:
+            with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+                for _ in pool.map(fetch, outstanding):
+                    progress.advance()
+                    if len(failed) >= _MAX_FAILED_TILES:
+                        pool.shutdown(cancel_futures=True)
+                        break
+        if failed:
+            raise RuntimeError(
+                f"{len(failed)} of {len(outstanding)} DEM tile(s) could not be "
+                f"fetched (first: {failed[0][1]}). The rest are cached; run again "
+                "to fetch only the missing ones."
+            ) from failed[0][1]
+        return len(outstanding) - len(failed)
+
+    def fetch_corridor(self, tile: Tile, corridor: np.ndarray) -> Path:
+        """
+        Download one tile and store only ``corridor`` of it, compactly.
+
+        Written to a ``.part`` and renamed, so a tile and the strip recorded in
+        it are always replaced together, and an interrupted run leaves the tile
+        that was there before.
+        """
+        rasterio = _require_rasterio()
+        from rasterio.io import MemoryFile
+
+        url = coverage_url(tile, self.service, resolve_api_key(self._api_key))
+        payload = _fetch(url, context=tls_context(self.insecure))
+        _check_is_tiff(payload, tile)
+
+        with MemoryFile(payload) as memory, memory.open() as source:
+            heights = source.read(1).astype(np.float64)
+            transform = source.transform
+            crs = source.crs
+            nodata = source.nodata
+        missing = ~np.isfinite(heights) | (heights == NODATA)
+        if nodata is not None:
+            missing |= heights == nodata
+
+        # Each pixel's strip cell, by its centre.
+        cells = corridor.shape[0]
+        min_e, _, _, max_n = tile.bounds
+        rows, cols = heights.shape
+        east = transform.c + (np.arange(cols) + 0.5) * transform.a
+        north = transform.f + (np.arange(rows) + 0.5) * transform.e
+        keep = corridor[
+            np.ix_(_cell_index(north, max_n, -1.0, cells), _cell_index(east, min_e, 1.0, cells))
+        ]
+
+        stored = np.full(heights.shape, STORED_NODATA, dtype=np.int16)
+        good = keep & ~missing
+        stored[good] = np.round(heights[good] / STORED_SCALE).astype(np.int16)
+
+        destination = self.path(tile)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        partial = destination.with_suffix(".tif.part")
+        with rasterio.open(
+            partial,
+            "w",
+            driver="GTiff",
+            height=rows,
+            width=cols,
+            count=1,
+            dtype="int16",
+            nodata=STORED_NODATA,
+            crs=crs,
+            transform=transform,
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
+            compress="zstd",
+            predictor=2,
+        ) as target:
+            target.write(stored, 1)
+            target.scales = (STORED_SCALE,)
+            target.update_tags(**{CORRIDOR_TAG: _encode_corridor(corridor)})
+        os.replace(partial, destination)
+        logger.debug(
+            "Fetched %s, kept %.0f %% of it", destination.name, 100 * corridor.mean()
+        )
+        return destination
 
     # -- fetching ---------------------------------------------------------
 
@@ -648,6 +953,8 @@ class DemCache:
             with rasterio.open(path) as dataset:
                 band = dataset.read(1)
                 nodata = dataset.nodata
+                scale = dataset.scales[0] if dataset.scales else 1.0
+                corridor = dataset.tags().get(CORRIDOR_TAG)
                 pixel_col, pixel_row = ~dataset.transform * (east[selected], north[selected])
             pixel_col = np.floor(pixel_col).astype(np.int64)
             pixel_row = np.floor(pixel_row).astype(np.int64)
@@ -662,7 +969,18 @@ class DemCache:
             values[values == NODATA] = np.nan
             if nodata is not None:
                 values[values == nodata] = np.nan
-            heights[selected] = values
+            heights[selected] = values * scale
+            if corridor is not None:
+                # A point outside the strip the tile holds reads no-data, as the
+                # sea would: counted, so the one is not mistaken for the other.
+                kept = _decode_corridor(corridor)
+                cells = kept.shape[0]
+                min_e, _, _, max_n = tile.bounds
+                within = kept[
+                    _cell_index(north[selected], max_n, -1.0, cells),
+                    _cell_index(east[selected], min_e, 1.0, cells),
+                ]
+                outside[i] = int((~within).sum())
             return None
 
         workers = max(1, (os.cpu_count() or 4) - 2) if workers is None else max(1, workers)
@@ -673,6 +991,7 @@ class DemCache:
             workers,
         )
         missing: list[str] = []
+        outside = np.zeros(len(unique), dtype=np.int64)
         with Progress(len(unique), "  reading tiles") as progress:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 for absent in pool.map(read, range(len(unique))):
@@ -685,6 +1004,12 @@ class DemCache:
                 len(missing),
                 len(unique),
                 ", ".join(missing[:3]),
+            )
+        if outside.any():
+            logger.warning(
+                "%d point(s) lie outside the strip their DEM tile holds, and read "
+                "NaN; `valma dem` fetches the strip for the links it is given",
+                int(outside.sum()),
             )
         return heights
 
@@ -954,6 +1279,7 @@ def link_profiles(
     spacing_m: float = PROFILE_SPACING_M,
     dead_band_m: float = DEAD_BAND_M,
     max_grade: float = MAX_PROFILE_GRADE,
+    context: gpd.GeoDataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Read each link's height profile and reduce it to four columns.
@@ -975,7 +1301,11 @@ def link_profiles(
     *terrain* model: it reports the valley floor under a bridge and the hilltop
     over a tunnel, so sampling one produces a violent climb that is not on the
     route. Flat is wrong for a bridge that genuinely rises, but it is wrong by
-    far less, and ``grade_override`` is there for the ones that matter.
+    far less, and ``ascent_override_m`` / ``descent_override_m`` are there for
+    the ones that matter.
+
+    ``context`` is the whole layer when ``links`` is only part of it: a bridge
+    left out of ``links`` still marks the links touching it as next to one.
 
     No step is believed steeper than ``max_grade`` (see
     :data:`MAX_PROFILE_GRADE`): a lone spike is interpolated out, and any other
@@ -1052,7 +1382,7 @@ def link_profiles(
         profile.loc[flat, ["ascent_m", "descent_m"]] = 0.0
         profile.loc[flat, "z_v"] = profile.loc[flat, "z_u"]
 
-    _remove_structure_adjacent_spikes(links, profile, flat)
+    _remove_structure_adjacent_spikes(links, profile, flat, context)
 
     return profile
 
@@ -1068,14 +1398,23 @@ def _structure_mask(links: gpd.GeoDataFrame) -> np.ndarray:
 
 
 def _remove_structure_adjacent_spikes(
-    links: gpd.GeoDataFrame, profile: pd.DataFrame, structure: np.ndarray
+    links: gpd.GeoDataFrame,
+    profile: pd.DataFrame,
+    structure: np.ndarray,
+    context: gpd.GeoDataFrame | None = None,
 ) -> None:
     """Discard steep DEM changes on links touching a bridge or tunnel."""
-    if not structure.any() or not {"u", "v"}.issubset(links.columns):
+    source = links if context is None else context
+    source_structure = structure if context is None else _structure_mask(context)
+    if not source_structure.any() or not {"u", "v"}.issubset(links.columns):
         return
 
-    endpoints = links[["u", "v"]].apply(pd.to_numeric, errors="coerce").to_numpy()
-    structure_nodes = np.unique(endpoints[structure][np.isfinite(endpoints[structure])])
+    def ends(frame: gpd.GeoDataFrame) -> np.ndarray:
+        return frame[["u", "v"]].apply(pd.to_numeric, errors="coerce").to_numpy()
+
+    endpoints = ends(links)
+    bridged = ends(source)[source_structure]
+    structure_nodes = np.unique(bridged[np.isfinite(bridged)])
     adjacent = np.isin(endpoints, structure_nodes).any(axis=1) & ~structure
     if not adjacent.any():
         return
@@ -1108,40 +1447,105 @@ def add_elevation(
     cache: DemCache,
     spacing_m: float = PROFILE_SPACING_M,
     workers: int = 4,
+    remeasure: bool = False,
 ) -> gpd.GeoDataFrame:
     """
     Attach the elevation columns to a link layer, downloading what it needs.
 
-    This is the one call the pipeline makes: it works out which tiles the links
-    touch, fills any gaps in the cache, reads the profiles and returns the layer
-    with ``z_u``, ``z_v``, ``ascent_m``, ``descent_m`` and an empty
-    ``grade_override`` added -- the same "an empty column is an invitation"
-    convention ``speed_override_kmh`` follows.
+    This is the one call the pipeline makes: it works out the strip along the
+    links each tile must hold, fetches the tiles missing or holding too little of
+    it, reads the profiles and returns the layer
+    with ``z_u``, ``z_v``, ``ascent_m``, ``descent_m`` and empty
+    ``ascent_override_m`` / ``descent_override_m`` added -- the same "an empty
+    column is an invitation" convention ``speed_override_kmh`` follows.
+
+    Only links with ``ascent_m`` or ``descent_m`` empty are measured -- new
+    ones, or ones cleared by hand to have them measured again -- so a layer
+    shared without its tile cache costs the next person only the tiles under
+    what they add. ``remeasure`` measures every link instead. A link with both
+    overrides filled in is left out either way: no tile is fetched for it and
+    its DEM columns keep whatever they held. With only one override set, the
+    DEM still measures the link, and routing takes the override where there
+    is one.
     """
-    # Projected once here: each step below would otherwise reproject the whole
-    # layer itself, which on a country is a quarter of a minute each time.
-    projected = _projected(links)
-    cache.ensure(tiles_for_links(projected, cache.resolution_m, cache.tile_m), workers)
-
     links = links.copy()
-    profile = link_profiles(projected, cache.sample, spacing_m=spacing_m)
+    for column in (ASCENT_OVERRIDE_COLUMN, DESCENT_OVERRIDE_COLUMN):
+        if column not in links.columns:
+            links[column] = np.nan
+    # Superseded by the two above, which say which direction they mean.
+    links = links.drop(columns="grade_override", errors="ignore")
     for column in ("z_u", "z_v", "ascent_m", "descent_m"):
-        links[column] = profile[column].to_numpy()
-    if "grade_override" not in links.columns:
-        links["grade_override"] = np.nan
+        if column not in links.columns:
+            links[column] = np.nan
 
-    covered = np.isfinite(profile["z_u"].to_numpy())
-    logger.info(
-        "Elevation attached to %d of %d link(s); mean ascent %.2f m/km",
-        int(covered.sum()),
-        len(links),
-        _ascent_per_km(links),
-    )
+    overridden = _fully_overridden(links)
+    measured = np.zeros(len(links), dtype=bool) if remeasure else _has_climb(links)
+    measured &= ~overridden
+    measure = ~overridden & ~measured
+    if overridden.any():
+        logger.info(
+            "Leaving %d link(s) with both %s and %s set to their overrides",
+            int(overridden.sum()),
+            ASCENT_OVERRIDE_COLUMN,
+            DESCENT_OVERRIDE_COLUMN,
+        )
+    if measured.any():
+        logger.info(
+            "Keeping the elevation %d link(s) already have (--remeasure-all to "
+            "read them again)",
+            int(measured.sum()),
+        )
+    skipped = int((~measure).sum())
+
+    if measure.any():
+        # Projected once here: each step below would otherwise reproject the
+        # whole layer itself, which on a country is a quarter of a minute each.
+        projected = _projected(links)
+        subset = projected[measure]
+        cache.ensure_corridor(subset, workers)
+        profile = link_profiles(
+            subset,
+            cache.sample,
+            spacing_m=spacing_m,
+            context=projected if skipped else None,
+        )
+        for column in ("z_u", "z_v", "ascent_m", "descent_m"):
+            links[column] = pd.to_numeric(links[column], errors="coerce").astype(float)
+            links.loc[measure, column] = profile[column].to_numpy()
+        covered = int(np.isfinite(profile["z_u"].to_numpy()).sum())
+        logger.info(
+            "Elevation attached to %d of %d link(s) measured; mean ascent %.2f m/km",
+            covered,
+            int(measure.sum()),
+            _ascent_per_km(links),
+        )
+    else:
+        logger.info("No link needed measuring; nothing fetched")
     return links
 
 
+def _has_climb(links: gpd.GeoDataFrame) -> np.ndarray:
+    """Links already carrying both ``ascent_m`` and ``descent_m``."""
+    return np.logical_and.reduce(
+        [
+            np.isfinite(pd.to_numeric(links[column], errors="coerce").to_numpy(dtype=float))
+            for column in ("ascent_m", "descent_m")
+        ]
+    )
+
+
+def _fully_overridden(links: gpd.GeoDataFrame) -> np.ndarray:
+    """Links whose climb is set by hand both ways, so the DEM has no say."""
+    return np.logical_and.reduce(
+        [
+            np.isfinite(pd.to_numeric(links[column], errors="coerce").to_numpy(dtype=float))
+            for column in (ASCENT_OVERRIDE_COLUMN, DESCENT_OVERRIDE_COLUMN)
+        ]
+    )
+
+
 def _ascent_per_km(links: gpd.GeoDataFrame) -> float:
-    total_m = float(np.nansum(links["ascent_m"].to_numpy()))
+    total_m = float(np.nansum(link_climb(links)[0]))
     total_km = float(np.nansum(links["length_m"].to_numpy())) / 1000.0
     return total_m / total_km if total_km > 0 else 0.0
 
@@ -1157,6 +1561,7 @@ __all__ = [
     "MML_DEM",
     "Tile",
     "add_elevation",
+    "corridors_for_links",
     "coverage_url",
     "link_profiles",
     "resolve_api_key",
