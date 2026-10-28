@@ -303,6 +303,81 @@ def read_volumes(
     return volumes
 
 
+#: Valma's assignment results: the layer of its directed links, and the daily
+#: vehicle classes that together make the motor traffic on each.
+ASSIGNMENT_LINK_LAYER = "LINK"
+ASSIGNMENT_VOLUME_COLUMNS = (
+    "bev_vrk",
+    "icev_vrk",
+    "phev_vrk",
+    "semi_trailer_vrk",
+    "trailer_truck_vrk",
+    "van_vrk",
+    "truck_vrk",
+)
+
+#: Valma's link type for connectors -- zone centroids, walk and transit access
+#: -- rather than roads. Their straight lines would hand a zone's traffic to
+#: whichever street they happen to run along.
+ASSIGNMENT_CONNECTOR_TYPE = 99
+
+
+def volumes_from_assignment(
+    path: Path | str, layer: str = ASSIGNMENT_LINK_LAYER
+) -> gpd.GeoDataFrame:
+    """
+    A volume layer from Valma's assignment results: one line per road, both ways.
+
+    Valma keeps a link per direction (``i_node`` to ``j_node``, and back). Each
+    one's volume is the sum of :data:`ASSIGNMENT_VOLUME_COLUMNS`; the two
+    directions of a road are then added together, since the match spreads a
+    source line's volume over the roads beneath it whichever way they run. One
+    direction's line is kept; the other is the same road drawn back. Connectors
+    (:data:`ASSIGNMENT_CONNECTOR_TYPE`) are left out.
+    """
+    path = Path(path)
+    needed = [*ASSIGNMENT_VOLUME_COLUMNS, "i_node", "j_node", "type"]
+    links = read_vector(path, layer=layer)
+    missing = [c for c in needed if c not in links.columns]
+    if missing:
+        raise ValueError(f"{path} layer {layer!r} has no column(s) {missing}.")
+
+    connector = pd.to_numeric(links["type"], errors="coerce") == ASSIGNMENT_CONNECTOR_TYPE
+    links = links.loc[~connector & links.geometry.notna()].reset_index(drop=True)
+    volume = (
+        links[list(ASSIGNMENT_VOLUME_COLUMNS)]
+        .apply(pd.to_numeric, errors="coerce")
+        .fillna(0.0)
+        .sum(axis=1)
+        .to_numpy()
+    )
+    i = links["i_node"].astype(str)
+    j = links["j_node"].astype(str)
+    forward = (i <= j).to_numpy()
+    road = np.where(forward, i + "-" + j, j + "-" + i)
+
+    frame = gpd.GeoDataFrame(
+        {"road": road, "forward": forward, "volume": volume},
+        geometry=links.geometry.to_numpy(),
+        crs=links.crs,
+    )
+    total = frame.groupby("road")["volume"].sum()
+    kept = frame.sort_values("forward", ascending=False, kind="stable").drop_duplicates("road")
+    result = gpd.GeoDataFrame(
+        {"volume": kept["road"].map(total).to_numpy()},
+        geometry=kept.geometry.to_numpy(),
+        crs=links.crs,
+    )
+    logger.info(
+        "Built %d road(s) from %d directed link(s) in %s (%d connector(s) left out)",
+        len(result),
+        len(links),
+        path,
+        int(connector.sum()),
+    )
+    return result
+
+
 def carries_cars(links: gpd.GeoDataFrame) -> np.ndarray:
     """Boolean mask of the links a car may drive on."""
     return links["highway"].isin(CAR_HIGHWAYS).to_numpy(dtype=bool)
@@ -889,6 +964,9 @@ def summarise(
 
 __all__ = [
     "ADJACENT_HIGHWAYS",
+    "ASSIGNMENT_CONNECTOR_TYPE",
+    "ASSIGNMENT_LINK_LAYER",
+    "ASSIGNMENT_VOLUME_COLUMNS",
     "CAR_HIGHWAYS",
     "DEFAULT_ADJACENT_DISTANCE_M",
     "DEFAULT_MAX_ANGLE_DEG",
@@ -908,4 +986,5 @@ __all__ = [
     "read_volumes",
     "summarise",
     "unmatched_sources",
+    "volumes_from_assignment",
 ]

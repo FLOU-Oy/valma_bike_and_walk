@@ -127,7 +127,7 @@ WALK_TRAFFIC_LIGHT_PENALTY_SECONDS = 10
 #: green for the way you are going, 16 s. One number for every approach and
 #: every crossing: if the road waited longer than a crossing, stepping onto the
 #: crossing and turning onto the road there would be the cheap way in.
-SIGNAL_WAIT_S = 14.0
+SIGNAL_WAIT_S = 15.0
 
 #: Wait at a mid-block pedestrian light, seconds: it turns red for the road only
 #: when someone has pushed the button, and the one crossing waits for its turn.

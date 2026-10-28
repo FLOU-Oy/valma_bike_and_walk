@@ -571,3 +571,104 @@ def test_adjacent_distance_zero_turns_it_off():
     matched, _ = add_volumes(links, volumes, MatchSettings(adjacent_distance_m=0))
 
     assert matched["adjacent_car_volume"].isna().all()
+
+
+def assignment_results(path, rows):
+    """A Valma-style LINK layer from ``(i, j, type, volume, coords)`` dicts.
+
+    ``volume`` goes into ``icev_vrk``, with 1 more in each other vehicle class.
+    """
+    from valma_bike_and_walk.traffic import ASSIGNMENT_VOLUME_COLUMNS
+
+    records = []
+    for row in rows:
+        record = {c: 1.0 for c in ASSIGNMENT_VOLUME_COLUMNS}
+        record["icev_vrk"] = float(row["volume"])
+        record.update(i_node=str(row["i"]), j_node=str(row["j"]), type=row.get("type", 112))
+        records.append(record)
+    gpd.GeoDataFrame(
+        records,
+        geometry=[
+            shapely.LineString([(EAST + x, NORTH + y) for x, y in row["coords"]])
+            for row in rows
+        ],
+        crs=PROJECTED_CRS,
+    ).to_file(path, driver="GPKG", layer="LINK")
+    return path
+
+
+def test_assignment_volumes_sum_the_vehicle_classes_over_both_directions(tmp_path):
+    from valma_bike_and_walk.traffic import volumes_from_assignment
+
+    path = assignment_results(
+        tmp_path / "results.gpkg",
+        [
+            {"i": 101, "j": 202, "volume": 100, "coords": [(0, 0), (200, 0)]},
+            {"i": 202, "j": 101, "volume": 50, "coords": [(200, 0), (0, 0)]},
+            {"i": 303, "j": 404, "volume": 70, "coords": [(0, 50), (200, 50)]},
+            # A zone connector: not a road, whatever it carries.
+            {"i": 9, "j": 101, "type": 99, "volume": 900, "coords": [(0, -80), (0, 0)]},
+        ],
+    )
+    volumes = volumes_from_assignment(path).sort_values("volume").reset_index(drop=True)
+
+    # Six other classes at 1 each, in each direction.
+    assert volumes["volume"].tolist() == [70 + 6, 100 + 6 + 50 + 6]
+    assert len(volumes) == 2
+
+
+def _traffic_argv(links_path, volumes_path, results_path, *extra):
+    return [
+        "traffic",
+        "--links", str(links_path),
+        "--volumes", str(volumes_path),
+        "--assignment-results", str(results_path),
+        *extra,
+    ]
+
+
+def test_the_traffic_command_builds_missing_volumes_from_assignment_results(tmp_path):
+    links = link_layer([{"highway": "primary", "coords": [(0, 0), (200, 0)]}])
+    links_path = write_links(links.to_crs("EPSG:4326"), tmp_path / "bike_links.gpkg")
+    results = assignment_results(
+        tmp_path / "results.gpkg",
+        [
+            {"i": 1, "j": 2, "volume": 994, "coords": [(0, 2), (200, 2)]},
+            {"i": 2, "j": 1, "volume": 994, "coords": [(200, 2), (0, 2)]},
+        ],
+    )
+    volumes_path = tmp_path / "link_volumes.gpkg"
+
+    assert main(_traffic_argv(links_path, volumes_path, results)) == 0
+
+    assert volumes_path.exists()
+    back = gpd.read_file(links_path, layer=LINKS_LAYER)
+    assert back[VOLUME_COLUMN].iloc[0] == pytest.approx(2 * 1000 / SOURCE_VOLUME_TO_HOUR)
+
+
+def test_an_existing_volume_layer_is_kept_unless_rebuilt(tmp_path):
+    links = link_layer([{"highway": "primary", "coords": [(0, 0), (200, 0)]}])
+    links_path = write_links(links.to_crs("EPSG:4326"), tmp_path / "bike_links.gpkg")
+    results = assignment_results(
+        tmp_path / "results.gpkg",
+        [{"i": 1, "j": 2, "volume": 694, "coords": [(0, 2), (200, 2)]}],
+    )
+    volumes_path = tmp_path / "link_volumes.gpkg"
+    volume_layer([{"volume": 1400, "coords": [(0, 2), (200, 2)]}]).to_file(
+        volumes_path, driver="GPKG", layer="old"
+    )
+
+    assert main(_traffic_argv(links_path, volumes_path, results)) == 0
+    kept = gpd.read_file(links_path, layer=LINKS_LAYER)[VOLUME_COLUMN].iloc[0]
+    assert kept == pytest.approx(1400 / SOURCE_VOLUME_TO_HOUR)
+
+    assert main(_traffic_argv(links_path, volumes_path, results, "--rebuild-volumes")) == 0
+    rebuilt = gpd.read_file(links_path, layer=LINKS_LAYER)[VOLUME_COLUMN].iloc[0]
+    assert rebuilt == pytest.approx(700 / SOURCE_VOLUME_TO_HOUR)
+
+
+def test_missing_volumes_without_assignment_results_is_an_error(tmp_path):
+    links = link_layer([{"highway": "primary", "coords": [(0, 0), (200, 0)]}])
+    links_path = write_links(links.to_crs("EPSG:4326"), tmp_path / "bike_links.gpkg")
+    with pytest.raises(SystemExit, match="assignment-results"):
+        main(["traffic", "--links", str(links_path), "--volumes", str(tmp_path / "none.gpkg")])

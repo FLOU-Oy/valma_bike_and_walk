@@ -177,8 +177,17 @@ def test_the_key_is_stripped_from_anything_we_report():
 
 def test_a_missing_key_is_a_clear_error(monkeypatch):
     monkeypatch.delenv(elevation.API_KEY_ENV, raising=False)
+    monkeypatch.setattr(elevation, "_saved_user_variable", lambda name: None)
     with pytest.raises(ValueError, match="needs an API key"):
         elevation.resolve_api_key(None)
+
+
+def test_a_key_saved_after_the_terminal_opened_is_still_found(monkeypatch):
+    monkeypatch.delenv(elevation.API_KEY_ENV, raising=False)
+    monkeypatch.setattr(elevation, "_saved_user_variable", lambda name: "saved")
+    assert elevation.resolve_api_key(None) == "saved"
+    monkeypatch.setenv(elevation.API_KEY_ENV, "live")
+    assert elevation.resolve_api_key(None) == "live"
 
 
 # --------------------------------------------------------------------------
@@ -301,6 +310,7 @@ def test_a_missing_key_fails_before_any_tile_is_attempted(
     tmp_path, server, monkeypatch
 ):
     monkeypatch.delenv(elevation.API_KEY_ENV, raising=False)
+    monkeypatch.setattr(elevation, "_saved_user_variable", lambda name: None)
     with pytest.raises(ValueError, match="needs an API key"):
         cache_at(tmp_path).ensure([Tile(0, 0, 8000, 2.0), Tile(1, 0, 8000, 2.0)])
     assert server.urls == []

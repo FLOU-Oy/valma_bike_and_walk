@@ -471,21 +471,25 @@ settings files can be committed.
 
 ```bash
 valma pipeline -c scenarios/bike.toml --dry-run   # what would run, and why
-valma pipeline -c scenarios/bike.toml             # extract, dem, traffic, connect, assign
+valma pipeline -c scenarios/bike.toml             # extract, dem, traffic, connect, matrix, overlay, assign
 ```
 
-`valma pipeline` runs the steps from OSM to volumes with the same settings
-files, each exactly as its own command would, and skips any step whose
-settings, input files and upstream results are as they were when it last
-succeeded. A new OSM extract reruns everything; new traffic volumes rerun
-`traffic`, `connect` and `assign`; new demand reruns `assign` alone. What each
-step saw is kept in `<output_dir>/pipeline_<mode>.json`.
+`valma pipeline` runs the steps from OSM to the travel-time matrix and the
+volumes with the same settings files, each exactly as its own command would,
+and skips any step whose settings, input files and upstream results are as they
+were when it last succeeded. A new OSM extract reruns everything; new traffic
+volumes rerun `traffic`, `connect`, `matrix`, `overlay` and `assign`; new zones
+rerun `matrix`, `overlay` and `assign`; a new baseline matrix reruns `overlay`
+alone, new demand `assign` alone. What each step saw is kept in
+`<output_dir>/pipeline_<mode>.json`.
 
 The link layer is written in place by `extract`, `dem` and `traffic`, so each
 one's version of it is recorded rather than trusting its timestamp. A layer
-edited by hand afterwards — an override typed in QGIS — reruns `connect` and
-`assign`, never `extract`, which would overwrite the edit. `traffic` is left
-out when no `volumes` are set; `--skip STEP` leaves out any other.
+edited by hand afterwards — an override typed in QGIS — reruns `connect`,
+`matrix`, `overlay` and `assign`, never `extract`, which would overwrite the
+edit. `traffic` is left out when no `volumes` are set, `overlay` when no
+`baseline` matrix is, `assign` when no `demand` is; `--skip STEP` leaves out any
+other.
 
 For results already made by running the commands by hand, `--mark-done`
 records them as up to date without running anything, so the first pipeline
@@ -893,6 +897,11 @@ valma dem --links output/bike_links.gpkg --dem-resolution 10
 
 An API key is free from
 [maanmittauslaitos.fi](https://www.maanmittauslaitos.fi/rajapinnat/api-avaimen-ohje).
+On Windows, save it for your user once in PowerShell —
+`[Environment]::SetEnvironmentVariable("MML_API_KEY", "<key>", "User")`. It is
+read from there even in a terminal opened before it was saved, so the editor
+does not need restarting. Keep it out of the settings files: the key is never
+written into `pipeline_<mode>.json` or the recorded `valma_<command>_<mode>.toml`.
 The data is CC BY 4.0 — attribute the National Land Survey of Finland in anything
 you publish from it.
 
@@ -974,6 +983,23 @@ network, digitised separately, agreeing with OSM to within a few metres.
 valma traffic --links output/bike_links.gpkg --volumes data/link_volumes.gpkg
 valma traffic --links output/bike_links.gpkg --volumes model.gpkg \
               --volume-column aadt --unmatched-out output/no_match.gpkg
+```
+
+**Building the volume layer from Valma's assignment results.** When the
+`--volumes` file does not exist, `valma traffic` builds it from
+`--assignment-results` (the base scenario names
+`data/assignment_results_koko_suomi.gpkg`) and saves it there. Each directed
+link of the `LINK` layer carries `bev_vrk + icev_vrk + phev_vrk +
+semi_trailer_vrk + trailer_truck_vrk + van_vrk + truck_vrk`; a road's two
+directions are added together and written as one line. Type 99 links — zone
+connectors, walk and transit access — are left out. `--rebuild-volumes` (or
+`rebuild_volumes = true` in a settings file) rebuilds the file even when it
+exists. `valma pipeline` does not count a volume layer the traffic step built
+itself as a change, so `rebuild_volumes = true` rebuilds only when traffic runs
+for some other reason.
+
+```bash
+valma traffic -c scenarios/bike.toml --links output/bike/bike_links.gpkg --rebuild-volumes
 ```
 
 Run it after `extract` and before anything routes: it is a link-layer stage, for

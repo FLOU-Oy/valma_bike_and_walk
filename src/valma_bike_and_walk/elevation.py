@@ -392,8 +392,28 @@ def coverage_url(tile: Tile, service: DemService, api_key: str) -> str:
     return f"{service.endpoint}?{query}"
 
 
+def _saved_user_variable(name: str) -> str | None:
+    """
+    A Windows user environment variable as saved, even if this process lacks it.
+
+    Windows hands a program its environment when it starts, so a variable saved
+    afterwards (setx, the Settings dialog) is missing from every terminal opened
+    inside an editor that was already running -- until the editor restarts.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            value, _ = winreg.QueryValueEx(key, name)
+    except OSError:
+        return None
+    return str(value) or None
+
+
 def resolve_api_key(api_key: str | None = None) -> str:
-    key = api_key or os.environ.get(API_KEY_ENV)
+    key = api_key or os.environ.get(API_KEY_ENV) or _saved_user_variable(API_KEY_ENV)
     if not key:
         raise ValueError(
             "The elevation service needs an API key. Pass --api-key or set "
