@@ -245,6 +245,7 @@ to name another). Zones only in the model are ignored.
 | `length_m`, `speed_kmh`, `travel_time_s` | derived — recomputed on every build |
 | `speed_reverse_kmh`, `travel_time_reverse_s` | the same against the digitised direction; for bikes a cycle lane or track on one side (`cycleway:right` along, `cycleway:left` against) only speeds up its own direction |
 | `signal_wait_s`, `signal_wait_reverse_s` | derived, informational: the seconds of each direction's travel time spent waiting at traffic lights. `--gpkg` volumes carry it per edge as `signal_wait_s` |
+| `crossing_entry` links | zero-length connectors written by `extract`. Where a path meets one of a signalled junction's roads at an unsignalled crossing, the paths get their own (negative-id) node, joined to the road node by one of these: path to path across the road stays free, path onto the road pays the junction's wait here, road onto path is free. Without it, stepping off the cycleway onto the road at such a crossing rode through the junction without paying |
 | `bicycle`, `bicycle_forward`, `bicycle_backward` | the OSM tags; for bikes, a road with `use_sidepath` -- or a `cycleway*=separate` on that side -- is ridden `SIDEPATH_FACTOR` (1.5) times slower in the direction it applies to, so the path alongside wins. A penalty, not a ban; paths and walking are unaffected |
 | `speed_override_kmh` | **empty, for you**: a number here wins over the tags |
 | `car_volume` | cars a day sharing this link, after `valma traffic` — see below |
@@ -1041,7 +1042,7 @@ ones start around 5), `--max-angle` (45°), `--min-coverage` (0.5),
 right only if your source layer already holds one directed link per carriageway.
 
 For cycling, every finite `car_volume` changes the speed on links carrying motor
-traffic by adding `0.008 * car_volume / 5.6` to the link's per-km road-class + facility disutility, so its whole speed divisor is `(road class + facility + traffic) / (4.14 + 2.61)`: Tarkkala et al. (2024) estimate the volume term once per route, so it is spread over their average 5.6 km route. A link that is not a carriageway starts from the reference 6.75. Missing volumes
+traffic by adding `TRAFFIC_COEFFICIENT * car_volume / 5.6` to the link's per-km road-class + facility disutility, so its whole speed divisor is `(road class + facility + traffic) / (4.96 + 2.61)`: Tarkkala et al. (2024) estimate the volume term once per route, so it is spread over their average 5.6 km route. A link that is not a carriageway -- a cycleway, a path, and the quiet `service` and `unclassified` roads -- counts as a separated path on a local link and starts from the reference 7.57, which is also where Tarkkala coded such paths. A road whose road class + facility scores below the reference (a main street with a track) rides at its nominal speed, not faster. Missing volumes
 are not penalised.
 
 ## The walking model

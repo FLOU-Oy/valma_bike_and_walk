@@ -100,7 +100,7 @@ def _factors(frame: pd.DataFrame, forward: np.ndarray, mode: str) -> dict[str, n
         for p in parts
     ])
     disutility = speeds_module.link_disutility(frame["highway"], facility)
-    divisor = disutility / speeds_module.REFERENCE_DISUTIL
+    divisor = np.maximum(disutility / speeds_module.REFERENCE_DISUTIL, 1.0)
     vol = links_module.car_volumes(frame)
     vol = pd.Series([np.nan] * n) if vol is None else vol
     traffic = speeds_module.traffic_factor(disutility, vol)
@@ -176,7 +176,7 @@ def _road_beta_param(attr: str, highways: list[str]) -> Parameter:
         setattr(speeds_module, attr, value)
         for hw in highways:
             speeds_module.ROAD_CLASS_BETA[hw] = value  # type: ignore[index]
-        speeds_module.REFERENCE_DISUTIL = speeds_module.BETA_MAIN + speeds_module.BETA_SEPARATED
+        speeds_module.REFERENCE_DISUTIL = speeds_module.BETA_LOCAL + speeds_module.BETA_SEPARATED
     return Parameter(attr, lambda: float(getattr(speeds_module, attr)), setter, 0.5, 15.0)
 
 

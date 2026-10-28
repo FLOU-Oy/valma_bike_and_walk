@@ -83,17 +83,6 @@ ONEWAY_REVERSED_VALUES = frozenset({"-1", "T"})
 #: Columns a link layer must carry for the build to be able to read it.
 REQUIRED_COLUMNS = ("link_id", "u", "v", "highway", "geometry")
 
-#: Columns the build derives itself; present in a written layer for styling.
-DERIVED_COLUMNS = (
-    "length_m",
-    "speed_kmh",
-    "speed_reverse_kmh",
-    "travel_time_s",
-    "travel_time_reverse_s",
-    "signal_wait_s",
-    "signal_wait_reverse_s",
-)
-
 #: Seconds of the forward travel time spent waiting at traffic lights.
 SIGNAL_WAIT_COLUMN = "signal_wait_s"
 SIGNAL_WAIT_REVERSE_COLUMN = "signal_wait_reverse_s"
@@ -160,9 +149,9 @@ _NOT_UNSIGNALLED_CROSSING = frozenset({"", "traffic_signals", "no"})
 GRADE_MODERATE_THRESHOLD = 0.025
 GRADE_STEEP_THRESHOLD = 0.05
 GRADE_MAX_VALID = 0.20
-GRADE_LOW_FACTOR = 4.587
-GRADE_MODERATE_FACTOR = 4.587
-GRADE_STEEP_FACTOR = 3.744
+GRADE_LOW_FACTOR = 4.587*1.2
+GRADE_MODERATE_FACTOR = 4.587*1.2
+GRADE_STEEP_FACTOR = 3.744*1.2
 
 _BICYCLE_CROSSING_HIGHWAYS = frozenset(
     {
@@ -581,11 +570,6 @@ def geometry_lengths(links: gpd.GeoDataFrame) -> np.ndarray:
     if links.crs is not None and str(links.crs).upper() == PROJECTED_CRS:
         return links.geometry.length.to_numpy(dtype=float)
     return links.geometry.to_crs(PROJECTED_CRS).length.to_numpy(dtype=float)
-
-
-def link_speeds(links: gpd.GeoDataFrame, mode: str) -> np.ndarray:
-    """Speed in km/h per link along its digitised direction."""
-    return link_speeds_by_direction(links, mode)[0]
 
 
 def link_speeds_by_direction(

@@ -16,9 +16,6 @@ PROJECTED_CRS = "EPSG:3067"
 #: Travel modes this project supports, in our own vocabulary.
 MODES = ("walk", "bike")
 
-#: Mainland Finland plus Åland, as [min_lon, min_lat, max_lon, max_lat].
-FINLAND_BOUNDS = (19.0, 59.7, 31.7, 70.1)
-
 #: Where osmium keeps the node coordinates it needs to give ways a geometry.
 #:
 #: "flex_mem" holds them in memory and grows as needed -- right for anything up

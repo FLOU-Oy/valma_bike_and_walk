@@ -275,3 +275,108 @@ def test_extract_writes_the_codes(tmp_path):
     assert links.loc[(9, 4), "signal_cross_end"] == JUNCTION
     assert links.loc[(9, 4), "signal_entry"] == NONE
     assert links.loc[(4, 10), "signal_cross_end"] == NONE
+
+
+# A side street crossed by a cycleway at an unsignalled crossing inside a
+# signalled junction -- Sallinkatu/Mannerheimintie. Main road 1-2-3-4-5 with
+# stop-line lights at 2 and 4; side road 6-7-3 with the crossing node 7 at
+# (0, 20), 25 m from the light at 2; cycleway 8-7-9 crosses the side road at 7.
+SIDE = {
+    1: (-200, 0), 2: (-15, 0), 3: (0, 0), 4: (15, 0), 5: (200, 0),
+    6: (0, 200), 7: (0, 20), 8: (-60, 20), 9: (60, 20),
+}
+SIDE_LINKS = [
+    (1, 2, "secondary"), (2, 3, "secondary"), (3, 4, "secondary"), (4, 5, "secondary"),
+    (6, 7, "residential"), (7, 3, "residential"),
+    (8, 7, "cycleway"), (7, 9, "cycleway"),
+]
+
+
+def split_side():
+    """The SIDE junction after the split, as codes, plus the path-side twin of 7."""
+    from valma_bike_and_walk.signals import CROSSING_ENTRY_HIGHWAY, split_crossing_entries
+
+    u = np.array([a for a, _, _ in SIDE_LINKS])
+    v = np.array([b for _, b, _ in SIDE_LINKS])
+    highway = np.array([h for _, _, h in SIDE_LINKS], dtype=object)
+    ids = np.array(sorted(SIDE))
+    split = split_crossing_entries(
+        u, v, highway, np.isin(highway, list(links_module.PATH_HIGHWAYS)), ids,
+        np.array([SIDE[i][0] for i in ids], float), np.array([SIDE[i][1] for i in ids], float),
+        np.array([2, 4]), np.array([2, 4]), np.array([7]),
+    )
+    assert split.count == 1 and split.connector_to.tolist() == [7]
+    twin = int(split.connector_from[0])
+    nodes = {**SIDE, twin: SIDE[7]}
+    links = [(int(a), int(b), h) for a, b, h in zip(split.u, split.v, highway)]
+    links.append((twin, 7, CROSSING_ENTRY_HIGHWAY))
+    return codes_for(nodes, links, [2, 4], [2, 4], [7]), twin
+
+
+def test_the_paths_at_an_unsignalled_crossing_in_a_junction_get_their_own_node():
+    _, twin = split_side()
+    assert twin < 0
+
+
+def test_crossing_the_side_street_on_the_path_stays_free():
+    c, twin = split_side()
+    assert route(c, 8, twin, 9) == [] and route(c, 9, twin, 8) == []
+
+
+def test_stepping_off_the_path_onto_the_junction_roads_pays_once():
+    c, twin = split_side()
+    assert route(c, 8, twin, 7, 3, 4, 5) == [JUNCTION]
+    assert route(c, 9, twin, 7, 3, 2, 1) == [JUNCTION]
+
+
+def test_leaving_the_road_onto_the_path_pays_only_the_road_entry():
+    c, twin = split_side()
+    assert route(c, 6, 7, twin, 9) == [JUNCTION]  # the side road entering
+    assert route(c, 1, 2, 3, 7, twin, 8) == [JUNCTION]
+
+
+def test_a_crossing_outside_any_junction_is_not_split():
+    from valma_bike_and_walk.signals import split_crossing_entries
+
+    u, v = np.array([1, 2, 10]), np.array([2, 3, 2])
+    highway = np.array(["residential", "residential", "cycleway"], dtype=object)
+    split = split_crossing_entries(
+        u, v, highway, np.array([False, False, True]), np.array([1, 2, 3, 10]),
+        np.array([0.0, 100.0, 200.0, 100.0]), np.array([0.0, 0.0, 0.0, 50.0]),
+        np.array([3]), np.array([3]), np.array([2]),
+    )
+    assert split.count == 0 and split.u.tolist() == [1, 2, 10]
+
+
+def test_extract_splits_the_crossing_and_writes_the_connector(tmp_path):
+    from valma_bike_and_walk.config import Settings
+    from valma_bike_and_walk.osm import read_links
+    from valma_bike_and_walk.signals import CROSSING_ENTRY_HIGHWAY
+
+    def lonlat(xy):
+        return (24.0 + xy[0] / 55_800.0, 60.0 + xy[1] / 111_300.0)
+
+    nodes = {i: lonlat(SIDE[i]) for i in SIDE}
+    ways = [
+        (1, [1, 2, 3, 4, 5], {"highway": "secondary"}),
+        (2, [6, 7, 3], {"highway": "residential"}),
+        (3, [8, 7, 9], {"highway": "cycleway"}),
+    ]
+    tags = {2: {"highway": "traffic_signals"}, 4: {"highway": "traffic_signals"},
+            7: {"highway": "crossing", "crossing": "unmarked"}}
+    pbf = write_pbf(tmp_path / "side.osm.pbf", nodes, ways, node_tags=tags)
+    settings = Settings(pbf_path=pbf, cache_dir=tmp_path / "cache", output_dir=tmp_path)
+    links = read_links(settings, "bike")
+
+    connector = links[links["highway"] == CROSSING_ENTRY_HIGHWAY]
+    assert len(connector) == 1
+    twin = int(connector["u"].iloc[0])
+    assert twin < 0 and int(connector["v"].iloc[0]) == 7
+    assert connector["signal_entry"].iloc[0] == JUNCTION       # path -> road pays
+    assert connector["signal_entry_reverse"].iloc[0] == NONE   # road -> path is free
+    cycle = links[links["highway"] == "cycleway"]
+    assert set(cycle["u"]).union(cycle["v"]) == {8, 9, twin}
+    assert links["link_id"].is_unique
+    # The whole layer still normalises and routes.
+    normalised = normalise(links, "bike")
+    assert np.isfinite(normalised["travel_time_s"]).all()
