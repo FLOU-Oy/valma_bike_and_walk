@@ -48,7 +48,7 @@ def _times(frame: pd.DataFrame, forward: np.ndarray, mode: str, **drop) -> np.nd
     """Travel time of each traversal, optionally with a penalty switched off."""
     frame = frame.copy()
     if drop.get("grade"):
-        for column in ("ascent_m", "descent_m"):
+        for column in ("ascent_m", "descent_m", "ascent_override_m", "descent_override_m"):
             if column in frame.columns:
                 frame[column] = 0.0
     if drop.get("signals"):
@@ -86,14 +86,6 @@ def _factors(frame: pd.DataFrame, forward: np.ndarray, mode: str) -> dict[str, n
     if mode != "bike":
         return {"surface": 1 / surface_f}
     seg_f = speeds_module.segregation_factor(frame["highway"], frame.get("segregated"))
-    vol = pd.to_numeric(frame.get("car_volume", pd.Series([np.nan] * n)), errors="coerce").to_numpy()
-    traffic = np.where(
-        np.isfinite(vol),
-        speeds_module.AVG_BASE_DISUTIL
-        / (speeds_module.AVG_BASE_DISUTIL
-           + speeds_module.TRAFFIC_COEFFICIENT * np.nan_to_num(vol) / speeds_module.AVG_ROUTE_LENGTH_KM),
-        1.0,
-    )
     fwd_cw, rev_cw = links_module._cycleway_by_direction(frame)
     text = np.where(
         forward,
@@ -107,12 +99,11 @@ def _factors(frame: pd.DataFrame, forward: np.ndarray, mode: str) -> dict[str, n
         else speeds_module.MIXED_TRAFFIC_FACTOR
         for p in parts
     ])
-    road = frame["highway"].map(speeds_module.ROAD_CLASS_BETA).astype(float).to_numpy()
-    divisor = np.where(
-        np.isfinite(road),
-        (np.nan_to_num(road) + speeds_module.BETA_SEPARATED * facility) / speeds_module.REFERENCE_DISUTIL,
-        1.0,
-    )
+    disutility = speeds_module.link_disutility(frame["highway"], facility)
+    divisor = np.maximum(disutility / speeds_module.REFERENCE_DISUTIL, 1.0)
+    vol = links_module.car_volumes(frame)
+    vol = pd.Series([np.nan] * n) if vol is None else vol
+    traffic = speeds_module.traffic_factor(disutility, vol)
     return {"carriageway": divisor, "surface": 1 / surface_f, "segregation": 1 / seg_f,
             "traffic": 1 / traffic}
 
@@ -185,7 +176,7 @@ def _road_beta_param(attr: str, highways: list[str]) -> Parameter:
         setattr(speeds_module, attr, value)
         for hw in highways:
             speeds_module.ROAD_CLASS_BETA[hw] = value  # type: ignore[index]
-        speeds_module.REFERENCE_DISUTIL = speeds_module.BETA_MAIN + speeds_module.BETA_SEPARATED
+        speeds_module.REFERENCE_DISUTIL = speeds_module.BETA_LOCAL + speeds_module.BETA_SEPARATED
     return Parameter(attr, lambda: float(getattr(speeds_module, attr)), setter, 0.5, 15.0)
 
 
@@ -210,14 +201,10 @@ def parameters(mode: str, frames: list[pd.DataFrame]) -> list[Parameter]:
     highways = sorted(set().union(*[set(f["highway"].astype(str)) for f in frames]))
     surfaces = sorted(set().union(*[set(f["surface"].dropna().astype(str)) for f in frames if "surface" in f]))
     if any("signal_entry" in f.columns for f in frames):
-        # Signalled junctions: the cycle and the green shares set every wait.
+        # Signalled junctions: one wait per junction entered.
         lights = [
-            _module_param(links_module, "SIGNAL_CYCLE_S", 20.0, 240.0),
-            _module_param(links_module, "SIGNAL_GREEN_SHARE_MAIN", 0.05, 0.95),
-            _module_param(links_module, "SIGNAL_GREEN_SHARE_MINOR", 0.05, 0.95),
-            _module_param(links_module, "SIGNAL_GREEN_SHARE_EQUAL", 0.05, 0.95),
-            _module_param(links_module, "MIDBLOCK_ROAD_WAIT_S", 0.0, 60.0),
-            _module_param(links_module, "MIDBLOCK_CROSSING_WAIT_S", 0.0, 120.0),
+            _module_param(links_module, "SIGNAL_WAIT_S", 0.0, 120.0),
+            _module_param(links_module, "MIDBLOCK_SIGNAL_WAIT_S", 0.0, 60.0),
         ]
     else:
         light = "TRAFFIC_LIGHT_PENALTY_SECONDS" if mode == "bike" else "WALK_TRAFFIC_LIGHT_PENALTY_SECONDS"
@@ -237,6 +224,7 @@ def parameters(mode: str, frames: list[pd.DataFrame]) -> list[Parameter]:
             _module_param(speeds_module, "CYCLE_LANE_FACTOR", 0.5, 5.0),
             _module_param(speeds_module, "CYCLE_TRACK_FACTOR", 0.5, 5.0),
             _module_param(speeds_module, "TRAFFIC_COEFFICIENT", 0.0, 0.1),
+            _module_param(links_module, "SIDEPATH_FACTOR", 1.0, 10.0),
             _road_beta_param("BETA_LOCAL", local),
             _road_beta_param("BETA_ARTERIAL", arterial),
         ]

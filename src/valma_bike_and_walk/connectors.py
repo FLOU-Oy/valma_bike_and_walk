@@ -43,7 +43,6 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import shapely
-from pyproj import Transformer
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree

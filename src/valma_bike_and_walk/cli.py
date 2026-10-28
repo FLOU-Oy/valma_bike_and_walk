@@ -136,6 +136,7 @@ from valma_bike_and_walk.osm import resolve_clip
 from valma_bike_and_walk.speeds import profile_for
 from valma_bike_and_walk.overlay import overlay, read_model_minutes, read_omx_dense
 from valma_bike_and_walk.traffic import (
+    DEFAULT_ADJACENT_DISTANCE_M,
     DEFAULT_MAX_ANGLE_DEG,
     DEFAULT_MAX_DISTANCE_M,
     DEFAULT_MIN_COVERAGE,
@@ -147,6 +148,7 @@ from valma_bike_and_walk.traffic import (
     read_volumes,
     summarise as summarise_volumes,
     unmatched_sources,
+    volumes_from_assignment,
 )
 from valma_bike_and_walk.zones import (
     DEFAULT_POINTS_PER_ZONE,
@@ -565,13 +567,15 @@ def cmd_dem(args: argparse.Namespace) -> int:
     if args.links is not None:
         logger.info("Reading link layer from %s", args.links)
         links = links_module.read_links(args.links)
-        links = add_elevation(links, cache, workers=args.dem_workers)
+        links = add_elevation(
+            links, cache, workers=args.dem_workers, remeasure=args.remeasure_all
+        )
         links = links_module.normalise(links, _links_mode(args))
         out = args.out or args.links
         logger.info("Writing link layer to %s", out)
         links_module.write_links(links, out)
         print(f"Elevation written to {out} ({len(links):,} links)")
-        rise = links["ascent_m"].to_numpy()
+        rise, _ = links_module.link_climb(links)
         print(f"  total ascent: {np.nansum(rise):,.0f} m")
         print(f"  steepest link: {np.nanmax(rise):,.1f} m of climb")
     else:
@@ -594,15 +598,20 @@ def cmd_dem(args: argparse.Namespace) -> int:
 def cmd_traffic(args: argparse.Namespace) -> int:
     logger.info("Reading link layer from %s", args.links)
     links = links_module.read_links(args.links)
-    volumes = read_volumes(
-        args.volumes, layer=args.volume_layer, column=args.volume_column
-    )
+    if args.rebuild_volumes or not args.volumes.exists():
+        _build_volumes(args)
+        volumes = read_volumes(args.volumes)
+    else:
+        volumes = read_volumes(
+            args.volumes, layer=args.volume_layer, column=args.volume_column
+        )
     settings = MatchSettings(
         max_distance_m=args.max_distance,
         max_angle_deg=args.max_angle,
         min_coverage=args.min_coverage,
         spacing_m=args.sample_spacing,
         split_divided=not args.no_split_divided,
+        adjacent_distance_m=args.adjacent_distance,
     )
 
     links, match = add_volumes(links, volumes, settings)
@@ -625,6 +634,29 @@ def cmd_traffic(args: argparse.Namespace) -> int:
     if matched.any():
         print(f"  busiest matched link: {links.loc[matched, VOLUME_COLUMN].max():,.0f}")
     return 0
+
+
+def _build_volumes(args: argparse.Namespace) -> None:
+    """Write --volumes from Valma's assignment results, both directions summed."""
+    source = args.assignment_results
+    if source is None:
+        why = (
+            "--rebuild-volumes was given"
+            if args.volumes.exists()
+            else f"{args.volumes} does not exist"
+        )
+        raise SystemExit(
+            f"valma traffic: {why}, so the volumes have to be built, but no "
+            "--assignment-results names Valma's assignment results to build them from."
+        )
+    if not source.exists():
+        raise SystemExit(f"valma traffic: no assignment results at {source}.")
+    built = volumes_from_assignment(source)
+    args.volumes.parent.mkdir(parents=True, exist_ok=True)
+    # Removed first: a second layer left in the file would make it ambiguous.
+    args.volumes.unlink(missing_ok=True)
+    write_vector(built, args.volumes, driver="GPKG", layer="link_volumes")
+    print(f"Built {args.volumes} from {source} ({len(built):,} roads, both directions summed)")
 
 
 def _analysis_points(
@@ -1450,6 +1482,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Where to write the elevated link layer (default: in place).",
     )
+    dem.add_argument(
+        "--remeasure-all",
+        action="store_true",
+        help=(
+            "Read every link's height from the DEM again, not only those with "
+            "ascent_m/descent_m empty -- after a link was moved, or the DEM "
+            "settings changed. Links with both overrides set are still skipped."
+        ),
+    )
     dem.set_defaults(func=cmd_dem)
 
     traffic = sub.add_parser(
@@ -1473,8 +1514,24 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help=(
             "Vector layer of the other network's links, each carrying a car "
-            "volume. Any CRS; any format GDAL reads."
+            "volume. Any CRS; any format GDAL reads. If it does not exist, it "
+            "is built from --assignment-results."
         ),
+    )
+    traffic.add_argument(
+        "--assignment-results",
+        type=Path,
+        help=(
+            "Valma's assignment results GeoPackage (its LINK layer). Used when "
+            "--volumes does not exist, or with --rebuild-volumes: the daily "
+            "bev, icev, phev, semi_trailer, trailer_truck, van and truck volumes "
+            "are summed over both directions and written to --volumes."
+        ),
+    )
+    traffic.add_argument(
+        "--rebuild-volumes",
+        action="store_true",
+        help="Rebuild --volumes from --assignment-results even if it exists.",
     )
     traffic.add_argument(
         "--volume-layer", help="Layer inside --volumes (default: the only one)."
@@ -1544,6 +1601,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Give both carriageways of a divided road the source's full volume "
             "instead of half each. Right only if the source layer already holds "
             "one directed link per carriageway."
+        ),
+    )
+    traffic.add_argument(
+        "--adjacent-distance",
+        type=float,
+        default=DEFAULT_ADJACENT_DISTANCE_M,
+        help=(
+            "A path within this many metres of a road, and running alongside "
+            "it, takes that road's volume as adjacent_car_volume and is charged "
+            "for it like the road (default: %(default)s; 0 turns it off)."
         ),
     )
     traffic.set_defaults(func=cmd_traffic)
@@ -1791,7 +1858,8 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline = sub.add_parser(
         "pipeline",
         help=(
-            "Run extract, dem, traffic, connect and assign from settings files, "
+            "Run extract, dem, traffic, connect, matrix, overlay and assign from settings "
+            "files, "
             "each only when its inputs or settings changed since it last ran."
         ),
         description=(
@@ -1799,8 +1867,9 @@ def build_parser() -> argparse.ArgumentParser:
             "What each step saw is kept in <output-dir>/pipeline_<mode>.json; a "
             "step is skipped when its settings, its input files and the pipeline "
             "files it reads are as they were. traffic is skipped when no volumes "
-            "are configured. A link layer edited by hand re-runs connect and "
-            "assign, never extract, which would overwrite the edit."
+            "are configured, overlay when no baseline matrix is, assign when no "
+            "demand is. A link layer edited by hand re-runs connect, matrix, "
+            "overlay and assign, never extract, which would overwrite the edit."
         ),
     )
     pipeline.add_argument(
@@ -1818,7 +1887,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pipeline.add_argument(
         "--skip",
-        choices=("extract", "dem", "traffic", "connect", "assign"),
+        choices=("extract", "dem", "traffic", "connect", "matrix", "overlay", "assign"),
         action="append",
         help="Leave a step out (repeatable), e.g. --skip dem when no DEM is wanted.",
     )
@@ -1870,7 +1939,7 @@ def _record(args: argparse.Namespace, parser, command: str, files: list[Path]) -
 
 
 def cmd_pipeline(args: argparse.Namespace) -> int:
-    """extract, dem, traffic, connect and assign, each only when its inputs changed."""
+    """extract, dem, traffic, connect, matrix, overlay and assign, each only when its inputs changed."""
     from valma_bike_and_walk import __version__
     from valma_bike_and_walk.pipeline import build_plan, run_pipeline
 
@@ -1887,6 +1956,10 @@ def cmd_pipeline(args: argparse.Namespace) -> int:
         except SystemExit:
             if argv[0] == "traffic":
                 return None  # no volumes configured: nothing to match
+            if argv[0] == "overlay":
+                return None  # no baseline matrix configured: nothing to lay over
+            if argv[0] == "assign":
+                return None  # no demand configured: nothing to assign
             raise SystemExit(
                 f"valma pipeline: the {argv[0]} step cannot run with these settings:\n"
                 + errors.getvalue().strip()

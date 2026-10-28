@@ -177,8 +177,17 @@ def test_the_key_is_stripped_from_anything_we_report():
 
 def test_a_missing_key_is_a_clear_error(monkeypatch):
     monkeypatch.delenv(elevation.API_KEY_ENV, raising=False)
+    monkeypatch.setattr(elevation, "_saved_user_variable", lambda name: None)
     with pytest.raises(ValueError, match="needs an API key"):
         elevation.resolve_api_key(None)
+
+
+def test_a_key_saved_after_the_terminal_opened_is_still_found(monkeypatch):
+    monkeypatch.delenv(elevation.API_KEY_ENV, raising=False)
+    monkeypatch.setattr(elevation, "_saved_user_variable", lambda name: "saved")
+    assert elevation.resolve_api_key(None) == "saved"
+    monkeypatch.setenv(elevation.API_KEY_ENV, "live")
+    assert elevation.resolve_api_key(None) == "live"
 
 
 # --------------------------------------------------------------------------
@@ -301,6 +310,7 @@ def test_a_missing_key_fails_before_any_tile_is_attempted(
     tmp_path, server, monkeypatch
 ):
     monkeypatch.delenv(elevation.API_KEY_ENV, raising=False)
+    monkeypatch.setattr(elevation, "_saved_user_variable", lambda name: None)
     with pytest.raises(ValueError, match="needs an API key"):
         cache_at(tmp_path).ensure([Tile(0, 0, 8000, 2.0), Tile(1, 0, 8000, 2.0)])
     assert server.urls == []
@@ -541,23 +551,189 @@ def test_a_sampler_returning_the_wrong_shape_is_rejected():
 # --------------------------------------------------------------------------
 
 
-def test_add_elevation_fetches_only_what_the_links_touch(tmp_path, server, monkeypatch):
-    links = links_frame(
-        [{"coords": [(1_000.0, 1_000.0), (2_000.0, 1_000.0)]}], crs=PROJECTED_CRS
-    )
-    links["length_m"] = 1_000.0
+def tile_payload(tile: Tile, surface) -> bytes:
+    """The GeoTIFF the service would send for ``tile``, of a known surface."""
+    pytest.importorskip("rasterio")
+    from rasterio.io import MemoryFile
+    from rasterio.transform import from_origin
 
-    cache = cache_at(tmp_path)
-    monkeypatch.setattr(
-        DemCache, "sample", lambda self, e, n: slope_sampler(0.05)(e, n)
-    )
+    min_e, min_n, max_e, max_n = tile.request_bounds
+    res = tile.resolution_m
+    width = int(round((max_e - min_e) / res))
+    height = int(round((max_n - min_n) / res))
+    east = min_e + (np.arange(width) + 0.5) * res
+    north = max_n - (np.arange(height) + 0.5) * res
+    grid = surface(*np.meshgrid(east, north)).astype("float32")
+    with MemoryFile() as memory:
+        with memory.open(
+            driver="GTiff", height=height, width=width, count=1, dtype="float32",
+            nodata=elevation.NODATA, transform=from_origin(min_e, max_n, res, res),
+        ) as dataset:
+            dataset.write(grid, 1)
+        return memory.read()
+
+
+def ramp(e, n):
+    return 100.0 + 0.05 * (e - 380_000.0)
+
+
+#: Two links in one 8 km tile, 3 km apart.
+NEAR = [(378_000.0, 6_668_000.0), (379_000.0, 6_668_000.0)]
+FAR = [(378_000.0, 6_671_000.0), (379_000.0, 6_671_000.0)]
+
+
+def projected_links(*lines):
+    links = links_frame([{"coords": c} for c in lines], crs=PROJECTED_CRS)
+    links["length_m"] = 1_000.0
+    return links
+
+
+def test_add_elevation_fetches_only_what_the_links_touch(tmp_path, server):
+    cache = cache_at(tmp_path, resolution_m=8.0)
+    tile = cache.tile_at(*NEAR[0])
+    server.body = tile_payload(tile, ramp)
+    elevated = elevation.add_elevation(projected_links(NEAR), cache)
+
+    assert len(server.urls) == 1
+    for column in ("z_u", "z_v", "ascent_m", "descent_m", "ascent_override_m", "descent_override_m"):
+        assert column in elevated.columns
+    assert "grade_override" not in elevated.columns
+    assert elevated["ascent_m"].iloc[0] == pytest.approx(50.0, abs=0.5)
+    assert elevated["ascent_override_m"].isna().all()
+    assert elevated["descent_override_m"].isna().all()
+
+
+def test_add_elevation_leaves_links_with_both_overrides_alone(tmp_path, server):
+    """No tile is fetched for them, and their DEM columns are kept as they were."""
+    cache = cache_at(tmp_path, resolution_m=8.0)
+    links = projected_links(NEAR, FAR)
+    links["ascent_m"] = [np.nan, 7.0]
+    links["descent_m"] = [np.nan, 3.0]
+    links["ascent_override_m"] = [np.nan, 12.0]
+    links["descent_override_m"] = [np.nan, 0.0]
+    links["grade_override"] = np.nan
+    server.body = tile_payload(cache.tile_at(*NEAR[0]), ramp)
+
+    elevated = elevation.add_elevation(links, cache)
+
+    # Both links sit in one tile, so only the strip along NEAR was fetched.
+    assert len(server.urls) == 1
+    far = elevation.corridors_for_links(projected_links(FAR), 8.0)[cache.tile_at(*FAR[0])]
+    assert not (cache.stored_corridor(cache.tile_at(*FAR[0])) & far).any()
+    assert elevated["ascent_m"].iloc[0] == pytest.approx(50.0, abs=0.5)
+    assert elevated["ascent_m"].iloc[1] == 7.0
+    assert elevated["descent_m"].iloc[1] == 3.0
+    assert elevated["ascent_override_m"].iloc[1] == 12.0
+    assert "grade_override" not in elevated.columns
+
+
+def test_add_elevation_keeps_links_already_measured(tmp_path, server):
+    """A layer shared without its cache: only the link with no climb is fetched."""
+    cache = cache_at(tmp_path, resolution_m=8.0)
+    links = projected_links(NEAR, FAR)
+    links["ascent_m"] = [np.nan, 7.0]
+    links["descent_m"] = [np.nan, 3.0]
+    server.body = tile_payload(cache.tile_at(*NEAR[0]), ramp)
+
     elevated = elevation.add_elevation(links, cache)
 
     assert len(server.urls) == 1
-    for column in ("z_u", "z_v", "ascent_m", "descent_m", "grade_override"):
-        assert column in elevated.columns
-    assert elevated["ascent_m"].iloc[0] == pytest.approx(50.0)
-    assert elevated["grade_override"].isna().all()
+    far = elevation.corridors_for_links(projected_links(FAR), 8.0)[cache.tile_at(*FAR[0])]
+    assert not (cache.stored_corridor(cache.tile_at(*FAR[0])) & far).any()
+    assert elevated["ascent_m"].iloc[0] == pytest.approx(50.0, abs=0.5)
+    assert elevated["ascent_m"].iloc[1] == 7.0
+    assert elevated["descent_m"].iloc[1] == 3.0
+
+
+def test_add_elevation_fetches_nothing_when_every_link_is_measured(tmp_path, server):
+    cache = cache_at(tmp_path, resolution_m=8.0)
+    links = projected_links(NEAR)
+    links["ascent_m"] = [7.0]
+    links["descent_m"] = [3.0]
+
+    elevated = elevation.add_elevation(links, cache)
+
+    assert server.urls == []
+    assert elevated["ascent_m"].iloc[0] == 7.0
+
+
+def test_remeasure_reads_every_link_again(tmp_path, server):
+    cache = cache_at(tmp_path, resolution_m=8.0)
+    links = projected_links(NEAR)
+    links["ascent_m"] = [7.0]
+    links["descent_m"] = [3.0]
+    server.body = tile_payload(cache.tile_at(*NEAR[0]), ramp)
+
+    elevated = elevation.add_elevation(links, cache, remeasure=True)
+
+    assert len(server.urls) == 1
+    assert elevated["ascent_m"].iloc[0] == pytest.approx(50.0, abs=0.5)
+
+
+def test_add_elevation_still_measures_a_link_with_one_override(tmp_path, server):
+    cache = cache_at(tmp_path, resolution_m=8.0)
+    links = projected_links(NEAR)
+    links["ascent_override_m"] = [5.0]
+    server.body = tile_payload(cache.tile_at(*NEAR[0]), ramp)
+
+    elevated = elevation.add_elevation(links, cache)
+
+    assert len(server.urls) == 1
+    assert elevated["ascent_m"].iloc[0] == pytest.approx(50.0, abs=0.5)
+    assert elevated["descent_override_m"].isna().all()
+
+
+def test_a_tile_is_stored_as_the_strip_along_the_links(tmp_path, server):
+    """Compact: heights in decimetres, and only near the links."""
+    rasterio = pytest.importorskip("rasterio")
+    cache = cache_at(tmp_path, resolution_m=8.0)
+    tile = cache.tile_at(*NEAR[0])
+    server.body = tile_payload(tile, ramp)
+    cache.ensure_corridor(projected_links(NEAR))
+
+    with rasterio.open(cache.path(tile)) as dataset:
+        assert dataset.dtypes[0] == "int16"
+        assert elevation.CORRIDOR_TAG in dataset.tags()
+    on_link = cache.sample(np.array([378_500.0]), np.array([6_668_000.0]))
+    assert on_link[0] == pytest.approx(ramp(378_500.0, 0.0), abs=0.06)
+    # Far from any link: not kept.
+    assert np.isnan(cache.sample(np.array([378_500.0]), np.array([6_671_000.0]))[0])
+    assert cache.stored_corridor(tile).mean() < 0.05
+
+
+def test_the_same_links_again_fetch_nothing(tmp_path, server):
+    cache = cache_at(tmp_path, resolution_m=8.0)
+    server.body = tile_payload(cache.tile_at(*NEAR[0]), ramp)
+    cache.ensure_corridor(projected_links(NEAR))
+    # Nudged a few metres, as an edit in QGIS would: still inside the strip.
+    nudged = [(e + 3.0, n + 4.0) for e, n in NEAR]
+    assert cache.ensure_corridor(projected_links(NEAR, nudged)) == 0
+    assert len(server.urls) == 1
+
+
+def test_a_link_added_outside_the_strip_fetches_the_tile_again(tmp_path, server, caplog):
+    cache = cache_at(tmp_path, resolution_m=8.0)
+    tile = cache.tile_at(*NEAR[0])
+    server.body = tile_payload(tile, ramp)
+    cache.ensure_corridor(projected_links(NEAR))
+
+    # Before `valma dem` runs again, the new link reads nothing, and says why.
+    with caplog.at_level(logging.WARNING):
+        assert np.isnan(cache.sample(np.array([378_500.0]), np.array([6_671_000.0]))[0])
+    assert "outside the strip" in caplog.text
+
+    elevated = elevation.add_elevation(projected_links(NEAR, FAR), cache)
+    assert len(server.urls) == 2
+    # Both strips held now: the new link and the old one.
+    assert elevated["ascent_m"].tolist() == pytest.approx([50.0, 50.0], abs=0.5)
+    assert cache.ensure_corridor(projected_links(NEAR, FAR)) == 0
+
+
+def test_a_tile_cached_whole_is_never_fetched_again(tmp_path, server):
+    cache = cache_at(tmp_path, resolution_m=8.0)
+    write_tile(cache, cache.tile_at(*NEAR[0]), ramp)
+    assert cache.ensure_corridor(projected_links(NEAR, FAR)) == 0
+    assert server.urls == []
 
 
 def write_tile(cache: DemCache, tile: Tile, surface, nodata_at=None) -> None:

@@ -57,6 +57,17 @@ def test_speed_is_derived_from_the_edge_cost():
     np.testing.assert_allclose(gdf["speed_kmh"], expected)
 
 
+def test_each_edge_carries_the_wait_at_lights_in_its_own_direction():
+    rows = [{**CHAIN[0], "highway": "secondary", "signal_entry": 2, "signal_entry_reverse": 0}]
+    network, links = built(rows, mode="bike")
+    gdf = edges_to_geodataframe(network, links)
+
+    wait = dict(zip(gdf["direction"], gdf["signal_wait_s"]))
+    assert wait[1] == pytest.approx(links["signal_wait_s"].iloc[0])
+    assert wait[1] > 0
+    assert wait[-1] == 0.0
+
+
 def test_the_wrong_link_layer_is_refused_rather_than_mis_joined():
     """Silently drawing volumes on someone else's geometry would be worse."""
     network, _ = built(CHAIN)

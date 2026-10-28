@@ -244,6 +244,9 @@ to name another). Zones only in the model are ignored.
 | `under_construction` | the way is under roadworks in OSM (`highway=construction`) and was read as what it is being built into, e.g. `construction=cycleway` as a cycleway. On by default; `valma extract --no-include-construction` drops roadworks instead. Ways with no `construction=` type are always dropped. The tag also covers new ways not yet open. |
 | `length_m`, `speed_kmh`, `travel_time_s` | derived — recomputed on every build |
 | `speed_reverse_kmh`, `travel_time_reverse_s` | the same against the digitised direction; for bikes a cycle lane or track on one side (`cycleway:right` along, `cycleway:left` against) only speeds up its own direction |
+| `signal_wait_s`, `signal_wait_reverse_s` | derived, informational: the seconds of each direction's travel time spent waiting at traffic lights. `--gpkg` volumes carry it per edge as `signal_wait_s` |
+| `crossing_entry` links | zero-length connectors written by `extract`. Where a path meets one of a signalled junction's roads at an unsignalled crossing, the paths get their own (negative-id) node, joined to the road node by one of these: path to path across the road stays free, path onto the road pays the junction's wait here, road onto path is free. Without it, stepping off the cycleway onto the road at such a crossing rode through the junction without paying |
+| `bicycle`, `bicycle_forward`, `bicycle_backward` | the OSM tags; for bikes, a road with `use_sidepath` -- or a `cycleway*=separate` on that side -- is ridden `SIDEPATH_FACTOR` (1.5) times slower in the direction it applies to, so the path alongside wins. A penalty, not a ban; paths and walking are unaffected |
 | `speed_override_kmh` | **empty, for you**: a number here wins over the tags |
 | `car_volume` | cars a day sharing this link, after `valma traffic` — see below |
 
@@ -468,21 +471,25 @@ settings files can be committed.
 
 ```bash
 valma pipeline -c scenarios/bike.toml --dry-run   # what would run, and why
-valma pipeline -c scenarios/bike.toml             # extract, dem, traffic, connect, assign
+valma pipeline -c scenarios/bike.toml             # extract, dem, traffic, connect, matrix, overlay, assign
 ```
 
-`valma pipeline` runs the steps from OSM to volumes with the same settings
-files, each exactly as its own command would, and skips any step whose
-settings, input files and upstream results are as they were when it last
-succeeded. A new OSM extract reruns everything; new traffic volumes rerun
-`traffic`, `connect` and `assign`; new demand reruns `assign` alone. What each
-step saw is kept in `<output_dir>/pipeline_<mode>.json`.
+`valma pipeline` runs the steps from OSM to the travel-time matrix and the
+volumes with the same settings files, each exactly as its own command would,
+and skips any step whose settings, input files and upstream results are as they
+were when it last succeeded. A new OSM extract reruns everything; new traffic
+volumes rerun `traffic`, `connect`, `matrix`, `overlay` and `assign`; new zones
+rerun `matrix`, `overlay` and `assign`; a new baseline matrix reruns `overlay`
+alone, new demand `assign` alone. What each step saw is kept in
+`<output_dir>/pipeline_<mode>.json`.
 
 The link layer is written in place by `extract`, `dem` and `traffic`, so each
 one's version of it is recorded rather than trusting its timestamp. A layer
-edited by hand afterwards — an override typed in QGIS — reruns `connect` and
-`assign`, never `extract`, which would overwrite the edit. `traffic` is left
-out when no `volumes` are set; `--skip STEP` leaves out any other.
+edited by hand afterwards — an override typed in QGIS — reruns `connect`,
+`matrix`, `overlay` and `assign`, never `extract`, which would overwrite the
+edit. `traffic` is left out when no `volumes` are set, `overlay` when no
+`baseline` matrix is, `assign` when no `demand` is; `--skip STEP` leaves out any
+other.
 
 For results already made by running the commands by hand, `--mark-done`
 records them as up to date without running anything, so the first pipeline
@@ -868,6 +875,18 @@ what the next one finds already there. Which tiles get fetched is decided from
 the **links**, not their bounding box, so a sparse rural network pays for the
 ground its roads actually cross.
 
+**Only the strip along the links is kept.** A tile fetched for a link layer is
+stored as a strip 10–20 m either side of every link, in whole decimetres in 16
+bits, with everything else left as no-data — about a twentieth of the tile on
+disk. That is what makes the native 2 m model affordable: the whole Finnish
+network at `--dem-resolution 2` is about 3 GB, where whole tiles would be over
+200 GB. (The download is still the whole tile; it is trimmed before it is
+stored.) Each tile records the strip it holds, so when links are added or
+moved outside it, the next `valma dem` — which the pipeline reruns whenever
+the link layer changes — fetches that tile again and keeps the old strip and
+the new together. A link nudged a few metres stays inside and costs nothing.
+Tiles cached whole, by `--bbox` or before strips existed, are used as they are.
+
 ```bash
 export MML_API_KEY=...                       # or pass --api-key
 
@@ -878,6 +897,11 @@ valma dem --links output/bike_links.gpkg --dem-resolution 10
 
 An API key is free from
 [maanmittauslaitos.fi](https://www.maanmittauslaitos.fi/rajapinnat/api-avaimen-ohje).
+On Windows, save it for your user once in PowerShell —
+`[Environment]::SetEnvironmentVariable("MML_API_KEY", "<key>", "User")`. It is
+read from there even in a terminal opened before it was saved, so the editor
+does not need restarting. Keep it out of the settings files: the key is never
+written into `pipeline_<mode>.json` or the recorded `valma_<command>_<mode>.toml`.
 The data is CC BY 4.0 — attribute the National Land Survey of Finland in anything
 you publish from it.
 
@@ -889,7 +913,22 @@ convention:
 | `z_u`, `z_v` | height at the link's first and last vertex, metres |
 | `ascent_m` | metres climbed following the digitised direction |
 | `descent_m` | metres dropped following it |
-| `grade_override` | empty, for you to fill in where the DEM is wrong |
+| `ascent_override_m` | empty, for you to fill in where the DEM is wrong: metres climbed along the digitised direction |
+| `descent_override_m` | the same for metres dropped |
+
+Where an override is filled in, routing uses it instead of the DEM's value on
+that link; each one works on its own. A link with **both** filled in is skipped
+by `valma dem` entirely -- no tile is fetched for it and its `ascent_m` /
+`descent_m` are left as they were -- so a rerun never undoes a hand fix. New
+links, with both overrides empty, are measured from the DEM as usual. Older
+layers' `grade_override` column is dropped on the next `valma dem`.
+
+`valma dem` only measures links whose `ascent_m` or `descent_m` is empty, so
+the link layer can be shared on its own, without `.cache/dem/`: whoever adds
+links downloads only the tiles under those. A link moved or reshaped keeps its
+old values -- empty its `ascent_m` in QGIS to have it measured again, or run
+`valma dem --remeasure-all` to measure every link (still skipping those with
+both overrides set), e.g. after changing `--dem-resolution`.
 
 Ascent and descent are kept apart rather than netted off: a link that climbs ten
 metres and drops them again costs nothing like a flat one, and the two swap
@@ -946,6 +985,23 @@ valma traffic --links output/bike_links.gpkg --volumes model.gpkg \
               --volume-column aadt --unmatched-out output/no_match.gpkg
 ```
 
+**Building the volume layer from Valma's assignment results.** When the
+`--volumes` file does not exist, `valma traffic` builds it from
+`--assignment-results` (the base scenario names
+`data/assignment_results_koko_suomi.gpkg`) and saves it there. Each directed
+link of the `LINK` layer carries `bev_vrk + icev_vrk + phev_vrk +
+semi_trailer_vrk + trailer_truck_vrk + van_vrk + truck_vrk`; a road's two
+directions are added together and written as one line. Type 99 links — zone
+connectors, walk and transit access — are left out. `--rebuild-volumes` (or
+`rebuild_volumes = true` in a settings file) rebuilds the file even when it
+exists. `valma pipeline` does not count a volume layer the traffic step built
+itself as a change, so `rebuild_volumes = true` rebuilds only when traffic runs
+for some other reason.
+
+```bash
+valma traffic -c scenarios/bike.toml --links output/bike/bike_links.gpkg --rebuild-volumes
+```
+
 Run it after `extract` and before anything routes: it is a link-layer stage, for
 the same reason elevation is. The columns then survive a QGIS edit, are re-read
 on every build, and can be corrected by hand where the match went wrong.
@@ -957,6 +1013,7 @@ on every build, and can be corrected by hand where the match went wrong.
 | `car_volume` | representative hourly vehicles sharing this link; fallback values are used where no source link matched |
 | `car_volume_offset_m` | how far the model's line sat from ours — the number to style by when checking a match |
 | `car_volume_override` | **empty, for you**: a number here is the last word |
+| `adjacent_car_volume` | on a cycleway, footway or path running beside a road (within 20 m, `--adjacent-distance`, and within 30 degrees of parallel along at least half its length), that road's `car_volume`. A path beside a road is charged for its traffic exactly as the road is: Tarkkala et al. (2024) showed traffic volume with every adjacent cycle path in their survey and none with a separated one |
 
 Three things make it more than a nearest-neighbour join, and each is a real
 failure this data produces without it.
@@ -1011,7 +1068,7 @@ ones start around 5), `--max-angle` (45°), `--min-coverage` (0.5),
 right only if your source layer already holds one directed link per carriageway.
 
 For cycling, every finite `car_volume` changes the speed on links carrying motor
-traffic using the multiplier `7.5 / (7.5 + 0.008 * car_volume / 5.6)`: Tarkkala et al. (2024) estimate the volume term once per route, so it is spread over their average 5.6 km route. Missing volumes
+traffic by adding `TRAFFIC_COEFFICIENT * car_volume / 5.6` to the link's per-km road-class + facility disutility, so its whole speed divisor is `(road class + facility + traffic) / (4.96 + 2.61)`: Tarkkala et al. (2024) estimate the volume term once per route, so it is spread over their average 5.6 km route. A link that is not a carriageway -- a cycleway, a path, and the quiet `service` and `unclassified` roads -- counts as a separated path on a local link and starts from the reference 7.57, which is also where Tarkkala coded such paths. A road whose road class + facility scores below the reference (a main street with a track) rides at its nominal speed, not faster. Missing volumes
 are not penalised.
 
 ## The walking model
@@ -1045,26 +1102,31 @@ Where it differs from cycling, and why:
   affects cycling. A red light costs a walker the same wait as a cyclist; the
   walking speeds are pace in motion and leave it out. Crossings without lights
   cost only cyclists (`UNSIGNALLED_CROSSING_PENALTY_SECONDS`).
-- **Lights are charged per junction, by how much green you get.** OSM maps a
-  signalled junction as many nodes — a light at each stop line, a signalled
-  crossing on each arm — so `valma extract` groups signal nodes within 30 m
-  into junctions (`signals.py`). On the road, the wait is charged once, on the
-  link that *enters* the junction (`signal_entry` / `signal_entry_reverse`);
-  on a path, at each signalled crossing actually crossed
-  (`signal_cross_start` / `_end`), since crossing two arms is two waits. The
-  wait is the average for a random arrival, red² / (2 × cycle): about 9 s on
-  the junction's main road or crossing a side road with it
-  (`SIGNAL_GREEN_SHARE_MAIN`), about 25 s from a side road or crossing the main
-  road (`SIGNAL_GREEN_SHARE_MINOR`), over a `SIGNAL_CYCLE_S` of 90 s. At a
-  junction of equals — its top road class arriving from three or more
-  directions, a divided road's two carriageways counting as one — every
-  approach and crossing shares the green (`SIGNAL_GREEN_SHARE_EQUAL`, about
-  16 s). A
-  mid-block pedestrian light — signalled crossings with no road light and no
-  side road — costs road traffic `MIDBLOCK_ROAD_WAIT_S` and someone crossing
-  `MIDBLOCK_CROSSING_WAIT_S`. The constants are read at routing time, so they
-  can be tuned (and are, by the viewer's route calibration) without
-  re-extracting.
+- **A road pays a light once per junction; a path pays it per crossing.** OSM
+  maps a signalled junction as many nodes — a light at each stop line, a
+  signalled crossing on each arm, one on each carriageway of a divided road —
+  so `valma extract` groups signal nodes within 30 m of each other into
+  junctions (`signals.py`); a link end within 30 m of a junction's signal
+  nodes is inside it. Then, each in the direction of travel that does it:
+  - a road pays on the link that *enters* the junction
+    (`signal_entry` / `signal_entry_reverse`), however many signal nodes it
+    passes inside;
+  - a cycleway or footway pays on the link stepping onto a signalled crossing
+    (`signal_cross_end` / `signal_cross_start`). A crossing over a divided road
+    is one crossing, and stepping off is free. Going round the corner without
+    crossing anything is free: a right turn on the cycleway costs nothing;
+  - a path, or a service road, that gets onto the junction's roads inside it
+    pays as the road does (`signal_entry`), so riding the cycleway into the
+    junction and joining the road there does not pass the light for free. A
+    path reaching the road at a crossing node is crossing it, not joining it.
+
+  Every one of these is the same wait, `SIGNAL_WAIT_S` (16 s, the average for
+  a random arrival with 40 % green over a 90 s cycle), so no way in is cheaper
+  than another. A mid-block pedestrian light — signalled crossings with no road
+  light and no side road — costs `MIDBLOCK_SIGNAL_WAIT_S` (8 s), once to the
+  road passing it and once to someone crossing; a sidewalk running past it is
+  free. The constants are read at routing time, so they can be tuned (and are,
+  by the viewer's route calibration) without re-extracting.
 - **Each unsignalled crossing is charged once per passage.** Every crossing
   node — a `crossing=marked`, `uncontrolled`, `zebra`, `unmarked` or bare
   `highway=crossing` node, but not `crossing=no` — is made a link end by

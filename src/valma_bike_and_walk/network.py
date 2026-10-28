@@ -96,6 +96,7 @@ EXTRACT_MODULES = (
     "valma_bike_and_walk.config",
     "valma_bike_and_walk.links",
     "valma_bike_and_walk.osm",
+    "valma_bike_and_walk.signals",
     "valma_bike_and_walk.speeds",
 )
 

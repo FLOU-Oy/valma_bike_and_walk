@@ -36,7 +36,11 @@ from valma_bike_and_walk.config import (
     validate_mode,
 )
 from valma_bike_and_walk.links import CROSSING_SHARE_COLUMN, PATH_HIGHWAYS
-from valma_bike_and_walk.signals import signal_codes
+from valma_bike_and_walk.signals import (
+    CROSSING_ENTRY_HIGHWAY,
+    signal_codes,
+    split_crossing_entries,
+)
 from valma_bike_and_walk.vector_io import read_vector, write_vector
 
 logger = logging.getLogger(__name__)
@@ -56,6 +60,9 @@ WAY_TAGS: tuple[str, ...] = (
     "crossing",
     "oneway",
     "oneway:bicycle",
+    "bicycle",
+    "bicycle:forward",
+    "bicycle:backward",
     "junction",
     "name",
     "bridge",
@@ -557,8 +564,8 @@ def read_links(
         length_m,
         counts.shape[0],
     )
-    # Which signalled junction each link enters, and how much green it gets
-    # (see signals.py): worked out on the whole network, once, here.
+    # Which links pay at signalled junctions (see signals.py): worked out on the
+    # whole network, once, here.
     first_vertex = np.concatenate([[0], np.cumsum(lengths)[:-1]])
     last_vertex = first_vertex + lengths - 1
     end_ids, end_at = np.unique(
@@ -566,24 +573,56 @@ def read_links(
     )
     end_x = np.concatenate([px[first_vertex], px[last_vertex]])[end_at]
     end_y = np.concatenate([py[first_vertex], py[last_vertex]])[end_at]
-    columns.update(
-        signal_codes(
-            refs[starts],
-            refs[ends],
-            columns["highway"],
-            np.isin(columns["highway"], list(PATH_HIGHWAYS)),
-            end_ids,
-            end_x,
-            end_y,
-            signal_ids,
-            np.fromiter(buffer.light_nodes, dtype=np.int64, count=len(buffer.light_nodes)),
-        )
+    light_ids = np.fromiter(
+        buffer.light_nodes, dtype=np.int64, count=len(buffer.light_nodes)
+    )
+    path = np.isin(columns["highway"], list(PATH_HIGHWAYS))
+    # Unsignalled crossings inside a junction: paths get a node of their own,
+    # joined to the road by a connector that pays the junction (signals.py).
+    split = split_crossing_entries(
+        refs[starts], refs[ends], columns["highway"], path,
+        end_ids, end_x, end_y, signal_ids, light_ids, crossing_ids,
+    )
+    columns["u"], columns["v"] = split.u, split.v
+    k = split.count
+    codes = signal_codes(
+        np.concatenate([split.u, split.connector_from]),
+        np.concatenate([split.v, split.connector_to]),
+        np.concatenate([columns["highway"], np.full(k, CROSSING_ENTRY_HIGHWAY, dtype=object)]),
+        np.concatenate([path, np.zeros(k, dtype=bool)]),
+        np.concatenate([end_ids, split.connector_from]),
+        np.concatenate([end_x, split.connector_x]),
+        np.concatenate([end_y, split.connector_y]),
+        signal_ids,
+        light_ids,
+        crossing_ids,
     )
     columns[CONSTRUCTION_COLUMN] = np.repeat(
         np.frombuffer(buffer.under_construction, dtype=np.int8).astype(bool),
         links_per_way,
     )
     columns["length_m"] = length_m
+
+    if k:
+        logger.info(
+            "Split %d unsignalled crossing node(s) inside signalled junctions",
+            k,
+        )
+        end_lon = np.concatenate([vertex_lon[first_vertex], vertex_lon[last_vertex]])[end_at]
+        end_lat = np.concatenate([vertex_lat[first_vertex], vertex_lat[last_vertex]])[end_at]
+        at = np.searchsorted(end_ids, split.connector_to)
+        point = np.column_stack([end_lon[at], end_lat[at]])
+        geometry = np.concatenate([
+            np.asarray(geometry),
+            shapely.linestrings(
+                np.repeat(point, 2, axis=0),
+                indices=np.repeat(np.arange(k), 2),
+            ),
+        ])
+        n = len(length_m)
+        for key, values in list(columns.items()):
+            columns[key] = np.concatenate([values, _connector_values(key, values, k, n, split)])
+    columns.update(codes)
 
     links = gpd.GeoDataFrame(columns, geometry=geometry, crs=WGS84)
 
@@ -597,6 +636,26 @@ def read_links(
         np.unique(np.concatenate([columns["u"], columns["v"]])).shape[0],
     )
     return links
+
+
+def _connector_values(key: str, values: np.ndarray, k: int, n: int, split) -> np.ndarray:
+    """A column's values for the ``k`` crossing-entry connectors appended after ``n`` links."""
+    if key == "link_id":
+        return np.arange(n, n + k, dtype=np.int64)
+    if key == "osm_way_id":
+        return np.full(k, -1, dtype=np.int64)
+    if key == "u":
+        return split.connector_from
+    if key == "v":
+        return split.connector_to
+    if key == "highway":
+        return np.full(k, CROSSING_ENTRY_HIGHWAY, dtype=object)
+    values = np.asarray(values)
+    if values.dtype == bool:
+        return np.zeros(k, dtype=bool)
+    if values.dtype.kind in "iuf":
+        return np.zeros(k, dtype=values.dtype)
+    return np.full(k, None, dtype=object)
 
 
 def _column_name(tag: str) -> str:

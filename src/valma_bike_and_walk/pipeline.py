@@ -1,4 +1,4 @@
-"""``valma pipeline``: extract, dem, traffic, connect and assign, each only when needed.
+"""``valma pipeline``: extract, dem, traffic, connect, matrix, overlay and assign, each only when needed.
 
 Each step is run exactly as its own command would be, with the same settings
 files, and is skipped when nothing it depends on has changed since it last
@@ -8,8 +8,10 @@ succeeded. What it depends on is recorded, after each success, in
 - its own resolved settings (paths absolute; thread counts and the like left
   out, since they do not change the result) and the package version;
 - the size and modification time of every input file from outside the
-  pipeline: the OSM extract, the traffic volumes, the zones, the demand;
-- the version of every pipeline file it read -- the link layer, the connectors.
+  pipeline: the OSM extract, the traffic volumes, the zones, the baseline
+  matrix, the demand;
+- the version of every pipeline file it read -- the link layer, the connectors,
+  the travel-time matrix.
 
 The link layer is the subtle one, because three steps write it *in place*:
 extract writes it, dem rewrites it, traffic rewrites it again. Its timestamp
@@ -20,7 +22,7 @@ changed then runs nothing, however many steps rewrote the file.
 
 A link layer edited by hand after the pipeline wrote it -- a speed override
 typed in QGIS -- is a new input for the steps that read it *after* its last
-writer (connect and assign), so they run again. The steps before are not rerun:
+writer (connect, matrix and assign), so they run again. The steps before are not rerun:
 extract would overwrite the edit.
 
 A step also runs when one of its outputs is missing, and every step after one
@@ -42,11 +44,14 @@ from valma_bike_and_walk.cache import file_stamp
 logger = logging.getLogger(__name__)
 
 #: In the order they run.
-STEPS = ("extract", "dem", "traffic", "connect", "assign")
+STEPS = ("extract", "dem", "traffic", "connect", "matrix", "overlay", "assign")
 
 #: Settings that change how fast a step runs or how it reports, not its result.
 _NOT_SIGNED = frozenset(
     {
+        # A credential: changes nothing in the result, and must not be
+        # written into pipeline_<mode>.json.
+        "api_key",
         "workers",
         "dem_workers",
         "chunk_size",
@@ -122,17 +127,18 @@ def build_plan(
     ``resolve(argv)`` returns a command's arguments as the settings files and
     ``argv`` make them, or None when the command cannot run as configured.
     """
-    assign = resolve(["assign"])
-    if assign is None:
-        raise ValueError("valma assign cannot run with these settings; see the error above.")
-    links = Path(assign.links).resolve()
-    mode = assign.mode
+    matrix = resolve(["matrix"])
+    if matrix is None:
+        raise ValueError("valma matrix cannot run with these settings; see the error above.")
+    links = Path(matrix.links).resolve()
+    mode = matrix.mode
     connectors = (
-        Path(assign.connectors).resolve()
-        if assign.connectors is not None
+        Path(matrix.connectors).resolve()
+        if matrix.connectors is not None
         else links.with_name(f"{links.stem.removesuffix('_links')}_connectors.gpkg")
     )
-    files = {"links": links, "connectors": connectors}
+    travel_times = (Path(matrix.output_dir) / f"travel_times_{mode}.npz").resolve()
+    files = {"links": links, "connectors": connectors, "travel_times": travel_times}
     skipped: dict[str, str] = {name: "--skip" for name in STEPS if name in skip}
     steps: list[Step] = []
 
@@ -165,7 +171,7 @@ def build_plan(
         steps[-1].external = [Path(traffic.volumes)]
 
     # A network already in one piece needs no connectors, and connect then
-    # writes no file: assign is given them only if they exist when it runs.
+    # writes no file: matrix and assign are given them only if they exist when they run.
     add(
         "connect",
         ["connect", "--links", str(links), "--out", str(connectors)],
@@ -173,27 +179,56 @@ def build_plan(
         writes=["connectors"],
         fresh=["connectors"],
     )
-    final = add(
+    routed = add(
+        "matrix",
+        ["matrix", "--links", str(links)],
+        reads=["links", "connectors"],
+        writes=["travel_times"],
+        optional={"connectors": "--connectors"},
+    )
+    if routed is not None:
+        steps[-1].external = [
+            Path(p)
+            for p in (
+                getattr(routed, "centroids", None),
+                getattr(routed, "zones", None),
+                getattr(routed, "weights", None),
+            )
+            if p is not None
+        ]
+
+    # Only with a baseline matrix configured: without one there is nothing to
+    # lay the routed times over.
+    laid = add(
+        "overlay",
+        ["overlay", "--model", str(travel_times)],
+        reads=["travel_times"],
+    )
+    if laid is not None:
+        steps[-1].external = [Path(laid.baseline)]
+        steps[-1].outputs = [Path(laid.out)]
+
+    # Only with demand configured: without it there is nothing to assign.
+    assigned = add(
         "assign",
         ["assign", "--links", str(links)],
         reads=["links", "connectors"],
         optional={"connectors": "--connectors"},
     )
-    if final is not None:
-        external = [
+    if assigned is not None:
+        steps[-1].external = [
             Path(p)
             for p in (
-                getattr(final, "centroids", None),
-                getattr(final, "zones", None),
-                getattr(final, "demand", None),
-                getattr(final, "weights", None),
+                getattr(assigned, "centroids", None),
+                getattr(assigned, "zones", None),
+                getattr(assigned, "demand", None),
+                getattr(assigned, "weights", None),
             )
             if p is not None
         ]
-        steps[-1].external = external
-        steps[-1].outputs = [Path(final.output_dir) / f"link_volumes_{final.mode}.npz"]
+        steps[-1].outputs = [Path(assigned.output_dir) / f"link_volumes_{mode}.npz"]
 
-    state_path = Path(assign.output_dir) / f"pipeline_{mode}.json"
+    state_path = Path(matrix.output_dir) / f"pipeline_{mode}.json"
     return Plan(steps, files, state_path, skipped)
 
 
@@ -350,6 +385,7 @@ def run_pipeline(
         for file, flag in step.optional.items():
             if plan.files[file].exists():
                 argv += [flag, str(plan.files[file])]
+        inputs_before = [_stamp(p) for p in step.external]
         code = run(argv)
         if code != 0:
             report(f"  {step.name}: failed (exit code {code}); stopping")
@@ -358,7 +394,12 @@ def run_pipeline(
             files_state.setdefault(file, {})[step.name] = _stamp(plan.files[file])
             rewritten[file] = step.name
         # Signed with what it read before it ran, so an edit saved meanwhile
-        # still shows up next time.
+        # still shows up next time -- unless the step wrote one of its own
+        # inputs (traffic building or rebuilding its volumes from assignment
+        # results): then as written, or the next run would see the change and
+        # run the step again, and with rebuild_volumes set, again every time.
+        if [_stamp(p) for p in step.external] != inputs_before:
+            signature = _signature(step, read_versions, version)
         state["steps"][step.name] = {"signature": signature, "settings": settings_of(step.args)}
         _save_state(plan.state_path, state)
 

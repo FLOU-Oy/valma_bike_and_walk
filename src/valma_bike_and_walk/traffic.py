@@ -42,6 +42,12 @@ Columns added
                           layer by when checking a match by eye.
 ``car_volume_override``   empty for you to fill in, the same invitation
                           ``speed_override_kmh`` extends.
+``adjacent_car_volume``   on a path running beside a road (a cycleway along a
+                          main street), that road's volume. Routing charges it
+                          exactly as it charges the road itself: Tarkkala et al.
+                          (2024) showed a traffic volume with every *adjacent*
+                          cycle path in their survey, and none with a separated
+                          one. See :func:`adjacent_volumes`.
 
 Where it goes in the pipeline
 -----------------------------
@@ -68,7 +74,13 @@ import pandas as pd
 import shapely
 
 from valma_bike_and_walk.config import PROJECTED_CRS
-from valma_bike_and_walk.links import ONEWAY_VALUES, geometry_lengths
+from valma_bike_and_walk.links import (
+    ADJACENT_CAR_VOLUME_COLUMN,
+    ONEWAY_VALUES,
+    PATH_HIGHWAYS,
+    car_volumes,
+    geometry_lengths,
+)
 from valma_bike_and_walk.progress import Progress
 from valma_bike_and_walk.vector_io import read_vector
 
@@ -131,6 +143,20 @@ DISTANCE_DECAY_M = 10.0
 #: slip road at a junction from halving a whole link's volume.
 DIVIDED_MIN_SHARE = 0.25
 
+#: How far a path may run from a road and still be beside it, in metres: a
+#: cycleway behind a verge sits 5-15 m from the road's centreline; one 30 m
+#: off through a park is a separated path, which carries no traffic exposure.
+DEFAULT_ADJACENT_DISTANCE_M = 20.0
+
+#: How far off parallel a path may run and still be beside the road. Tighter
+#: than the source match: a path crossing the road, or leaving it at a corner,
+#: is not riding along it.
+ADJACENT_MAX_ANGLE_DEG = 30.0
+
+#: Paths that can run beside a road. Steps and lifts are left out: they go up,
+#: not along.
+ADJACENT_HIGHWAYS = PATH_HIGHWAYS - {"steps", "elevator"}
+
 #: Samples per chunk. The candidate query and its geometry work are proportional
 #: to this, so it sets peak memory; a country's 13 million samples then cost a
 #: predictable amount rather than all of RAM.
@@ -143,8 +169,11 @@ OVERRIDE_COLUMN = "car_volume_override"
 #: Column read from the source layer unless another is named.
 DEFAULT_VOLUME_COLUMN = "volume"
 
-# Source volumes are daily totals; store their representative hourly equivalent.
-SOURCE_VOLUME_TO_HOUR = 16.0
+#: Source volumes are daily totals; store their representative hourly
+#: equivalent. 14 rather than an even 16 daytime hours: cycling is daytime and
+#: peak-heavy, so the hours people ride in carry more than an average one --
+#: about 7 % of the day's traffic each.
+SOURCE_VOLUME_TO_HOUR = 14.0
 
 # Fallback volumes for car-carrying links that did not match a source link.
 DEFAULT_CAR_VOLUMES = {
@@ -171,6 +200,8 @@ class MatchSettings:
     spacing_m: float = DEFAULT_SPACING_M
     #: Split a divided road's volume between its two carriageways.
     split_divided: bool = True
+    #: How far a path may be from a road to take its volume; 0 turns it off.
+    adjacent_distance_m: float = DEFAULT_ADJACENT_DISTANCE_M
 
     def __post_init__(self) -> None:
         if self.max_distance_m <= 0:
@@ -181,6 +212,8 @@ class MatchSettings:
             raise ValueError("min_coverage must be a fraction between 0 and 1.")
         if self.spacing_m <= 0:
             raise ValueError("spacing_m must be positive.")
+        if self.adjacent_distance_m < 0:
+            raise ValueError("adjacent_distance_m must not be negative.")
 
 
 @dataclass(frozen=True)
@@ -268,6 +301,81 @@ def read_volumes(
         float(volumes["volume"].mean()),
     )
     return volumes
+
+
+#: Valma's assignment results: the layer of its directed links, and the daily
+#: vehicle classes that together make the motor traffic on each.
+ASSIGNMENT_LINK_LAYER = "LINK"
+ASSIGNMENT_VOLUME_COLUMNS = (
+    "bev_vrk",
+    "icev_vrk",
+    "phev_vrk",
+    "semi_trailer_vrk",
+    "trailer_truck_vrk",
+    "van_vrk",
+    "truck_vrk",
+)
+
+#: Valma's link type for connectors -- zone centroids, walk and transit access
+#: -- rather than roads. Their straight lines would hand a zone's traffic to
+#: whichever street they happen to run along.
+ASSIGNMENT_CONNECTOR_TYPE = 99
+
+
+def volumes_from_assignment(
+    path: Path | str, layer: str = ASSIGNMENT_LINK_LAYER
+) -> gpd.GeoDataFrame:
+    """
+    A volume layer from Valma's assignment results: one line per road, both ways.
+
+    Valma keeps a link per direction (``i_node`` to ``j_node``, and back). Each
+    one's volume is the sum of :data:`ASSIGNMENT_VOLUME_COLUMNS`; the two
+    directions of a road are then added together, since the match spreads a
+    source line's volume over the roads beneath it whichever way they run. One
+    direction's line is kept; the other is the same road drawn back. Connectors
+    (:data:`ASSIGNMENT_CONNECTOR_TYPE`) are left out.
+    """
+    path = Path(path)
+    needed = [*ASSIGNMENT_VOLUME_COLUMNS, "i_node", "j_node", "type"]
+    links = read_vector(path, layer=layer)
+    missing = [c for c in needed if c not in links.columns]
+    if missing:
+        raise ValueError(f"{path} layer {layer!r} has no column(s) {missing}.")
+
+    connector = pd.to_numeric(links["type"], errors="coerce") == ASSIGNMENT_CONNECTOR_TYPE
+    links = links.loc[~connector & links.geometry.notna()].reset_index(drop=True)
+    volume = (
+        links[list(ASSIGNMENT_VOLUME_COLUMNS)]
+        .apply(pd.to_numeric, errors="coerce")
+        .fillna(0.0)
+        .sum(axis=1)
+        .to_numpy()
+    )
+    i = links["i_node"].astype(str)
+    j = links["j_node"].astype(str)
+    forward = (i <= j).to_numpy()
+    road = np.where(forward, i + "-" + j, j + "-" + i)
+
+    frame = gpd.GeoDataFrame(
+        {"road": road, "forward": forward, "volume": volume},
+        geometry=links.geometry.to_numpy(),
+        crs=links.crs,
+    )
+    total = frame.groupby("road")["volume"].sum()
+    kept = frame.sort_values("forward", ascending=False, kind="stable").drop_duplicates("road")
+    result = gpd.GeoDataFrame(
+        {"volume": kept["road"].map(total).to_numpy()},
+        geometry=kept.geometry.to_numpy(),
+        crs=links.crs,
+    )
+    logger.info(
+        "Built %d road(s) from %d directed link(s) in %s (%d connector(s) left out)",
+        len(result),
+        len(links),
+        path,
+        int(connector.sum()),
+    )
+    return result
 
 
 def carries_cars(links: gpd.GeoDataFrame) -> np.ndarray:
@@ -711,7 +819,81 @@ def add_volumes(
         links[OVERRIDE_COLUMN] = np.nan
 
     logger.info(summarise(links, volumes, match))
+    links[ADJACENT_CAR_VOLUME_COLUMN] = adjacent_volumes(links, settings or MatchSettings())
     return links, match
+
+
+def adjacent_volumes(links: gpd.GeoDataFrame, settings: MatchSettings) -> np.ndarray:
+    """
+    The car volume of the road each path runs beside, NaN where it runs beside none.
+
+    A cycleway mapped as its own way next to a main street is, in Tarkkala et
+    al.'s terms, an *adjacent* cycle path, and their survey asked about the
+    traffic on the road beside it. Each path is sampled along its length; a
+    sample is beside a road when one lies within ``adjacent_distance_m`` and
+    within :data:`ADJACENT_MAX_ANGLE_DEG` of parallel, the nearest such road
+    winning. A path with at least ``min_coverage`` of its samples beside a road
+    takes the mean volume of the roads they found -- the effective volume, so a
+    ``car_volume_override`` on the road carries over. Run after the roads have
+    their own volumes.
+    """
+    result = np.full(len(links), np.nan)
+    if settings.adjacent_distance_m <= 0:
+        return result
+    road_volume = car_volumes(links)
+    if road_volume is None:
+        return result
+    road_volume = road_volume.to_numpy(dtype=float)
+    road = carries_cars(links) & np.isfinite(road_volume)
+    path = links["highway"].isin(ADJACENT_HIGHWAYS).to_numpy(dtype=bool)
+    if not road.any() or not path.any():
+        return result
+
+    projected = links.to_crs(PROJECTED_CRS).geometry.to_numpy()
+    road_rows = np.flatnonzero(road)
+    road_geometry = projected[road_rows]
+    tree = shapely.STRtree(road_geometry)
+    path_rows = np.flatnonzero(path)
+    path_geometry = projected[path_rows]
+    path_length = shapely.length(path_geometry)
+    counts = _sample_counts(path_length, settings.spacing_m)
+    beside = MatchSettings(
+        max_distance_m=settings.adjacent_distance_m,
+        max_angle_deg=ADJACENT_MAX_ANGLE_DEG,
+    )
+    # One road per sample: the other-carriageway claim is for source lines
+    # running down a road's centre, not for a path at its side.
+    no_pairs = np.zeros(len(road_rows), dtype=bool)
+
+    found = np.zeros(len(path_rows), dtype=np.int64)
+    total = np.zeros(len(path_rows), dtype=float)
+    with Progress(int(counts.sum()), "Finding roads beside paths") as progress:
+        for start, stop in _chunks(counts, SAMPLES_PER_CHUNK):
+            block = slice(start, stop)
+            points, dx, dy, owner = _samples(
+                path_geometry[block], path_length[block], counts[block]
+            )
+            sample, target, _, _ = _claims(
+                points, dx, dy, tree, road_geometry, no_pairs, beside
+            )
+            progress.advance(points.shape[0])
+            if sample.shape[0] == 0:
+                continue
+            who = owner[sample] + start
+            found += np.bincount(who, minlength=len(path_rows))
+            total += np.bincount(
+                who, weights=road_volume[road_rows[target]], minlength=len(path_rows)
+            )
+
+    covered = (found > 0) & (found >= settings.min_coverage * counts)
+    result[path_rows[covered]] = total[covered] / found[covered]
+    logger.info(
+        "%d of %d path link(s) run beside a road and take its volume (within %g m)",
+        int(covered.sum()),
+        len(path_rows),
+        settings.adjacent_distance_m,
+    )
+    return result
 
 
 def unmatched_sources(
@@ -781,7 +963,12 @@ def summarise(
 
 
 __all__ = [
+    "ADJACENT_HIGHWAYS",
+    "ASSIGNMENT_CONNECTOR_TYPE",
+    "ASSIGNMENT_LINK_LAYER",
+    "ASSIGNMENT_VOLUME_COLUMNS",
     "CAR_HIGHWAYS",
+    "DEFAULT_ADJACENT_DISTANCE_M",
     "DEFAULT_MAX_ANGLE_DEG",
     "DEFAULT_MAX_DISTANCE_M",
     "DEFAULT_MIN_COVERAGE",
@@ -793,9 +980,11 @@ __all__ = [
     "VOLUME_COLUMN",
     "VolumeMatch",
     "add_volumes",
+    "adjacent_volumes",
     "carries_cars",
     "match_volumes",
     "read_volumes",
     "summarise",
     "unmatched_sources",
+    "volumes_from_assignment",
 ]

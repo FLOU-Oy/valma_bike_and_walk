@@ -1,0 +1,33 @@
+# Base scenario: the settings every other scenario starts from.
+#
+#   valma extract -c scenarios/base.toml           # OSM -> output/base/bike_links.gpkg
+#   valma assign  -c scenarios/base.toml           # -> output/base/
+#   valma assign  -c scenarios/base.toml --mode walk
+#   valma view    -c scenarios/base.toml --run output/
+#   valma assign  -c scenarios/base.toml --show-config   # what it would run with, and why
+#
+# A variant names this file and overrides only what differs:
+#
+#   scenarios/bike.toml
+extends = "base.toml"
+scenario = "bike"
+# mode = "bike"                       # "bike" or "walk"
+
+demand = "../data/demand_vrk.omx"  # placeholder: point at the real OD demand
+demand_matrix = "{mode}"
+
+[dem]
+# The NLS API key is read from the MML_API_KEY environment variable.
+
+[extract]
+pbf = "../finland-highways.osm.pbf"
+
+[matrix]
+max_minutes = 90.0
+
+[assign]
+gpkg = true                             # link volumes drawn on the link layer
+max_minutes = 90.0
+points_per_zone = 8
+zones = "data/2023_zonedata--dev-template.gpkg"
+id-column = "input_zone_id"

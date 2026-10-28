@@ -1,17 +1,26 @@
-"""Compare modeled bike volumes with observed bicycle counter averages."""
+"""Compare modeled bike volumes with observed bicycle counter averages.
+
+Reads the same settings files as ``valma``: ``-c scenarios/bike.toml`` takes
+the count lines and observed averages from the ``[view]`` settings, the volumes
+from ``<output_dir>/<scenario>/<mode>_volumes.gpkg`` (where ``valma assign
+--gpkg`` writes them) and writes its results into that same folder. Any flag
+given on the command line wins.
+"""
 
 from __future__ import annotations
 
 import argparse
+import errno
 import re
+import time
 from pathlib import Path
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from shapely.geometry import Point
 
+from valma_bike_and_walk import cli
 from valma_bike_and_walk.vector_io import read_vector, write_vector
 
 COUNTER_LAYER = "count_lines"
@@ -184,41 +193,80 @@ def plot_comparison(data: pd.DataFrame, path: Path, title: str | None = None) ->
         axis.legend(title="City", fontsize=7, title_fontsize=8, loc="best")
     axis.grid(True, alpha=0.25)
     figure.tight_layout()
-    figure.savefig(path, dpi=180)
+    _save(figure, path)
     plt.close(figure)
+
+
+def _save(figure: plt.Figure, path: Path, attempts: int = 5) -> None:
+    """Save, retrying while Windows briefly refuses to replace the file.
+
+    Antivirus or a thumbnail indexer holding a freshly written image makes
+    replacing it fail with EINVAL for a moment.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            figure.savefig(path, dpi=180)
+            return
+        except OSError as error:
+            if error.errno != errno.EINVAL or attempt == attempts:
+                raise
+            time.sleep(0.5 * attempt)
+
+
+def _settle_paths(args: argparse.Namespace) -> None:
+    """Fill every path not given on the command line from the settings files."""
+    # `view` owns count_lines and observed; --links is required there but
+    # unused here, so a placeholder stands in for it.
+    settings = cli._parse(["view", "--links", "-"], list(args.config)).args
+    out = Path(settings.output_dir)
+    defaults = {
+        "count_lines": Path(settings.count_lines),
+        "observed": Path(settings.observed),
+        "bike_volumes": out / f"{settings.mode or 'bike'}_volumes.gpkg",
+        "output_csv": out / "counter_volume_comparison.csv",
+        "output_plot": out / "counter_volume_scatter.png",
+        "city_plots_directory": out / "counter_volume_scatter_by_city",
+        "output_gpkg": out / "counter_volume_comparison.gpkg",
+    }
+    for key, value in defaults.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--count-lines", type=Path, default=Path("data/count_lines.gpkg"))
-    parser.add_argument("--bike-volumes", type=Path, default=Path("output/bike_volumes.gpkg"))
     parser.add_argument(
-        "--observed",
+        "-c",
+        "--config",
         type=Path,
-        default=Path("output/bicycle_counter_annual_averages.csv"),
+        action="append",
+        default=[],
+        help="Settings file(s), as for valma; several stack in the order given.",
     )
+    parser.add_argument("--count-lines", type=Path)
     parser.add_argument(
-        "--output-csv",
+        "--bike-volumes",
         type=Path,
-        default=Path("output/counter_volume_comparison.csv"),
+        help="Default: <output_dir>/<scenario>/<mode>_volumes.gpkg from the settings.",
     )
-    parser.add_argument(
-        "--output-plot",
-        type=Path,
-        default=Path("output/counter_volume_scatter.png"),
-    )
+    parser.add_argument("--observed", type=Path)
+    parser.add_argument("--output-csv", type=Path)
+    parser.add_argument("--output-plot", type=Path)
     parser.add_argument(
         "--city-plots-directory",
         type=Path,
-        default=Path("output/counter_volume_scatter_by_city"),
         help="Directory for one scatterplot per city.",
     )
-    parser.add_argument(
-    "--output-gpkg",
-    type=Path,
-    default=Path("output/counter_volume_comparison.gpkg"),
-    )
+    parser.add_argument("--output-gpkg", type=Path)
     args = parser.parse_args()
+    _settle_paths(args)
+    print(f"Volumes: {args.bike_volumes}")
+    print(f"Count lines: {args.count_lines}; observed: {args.observed}")
+    if not args.bike_volumes.exists():
+        raise SystemExit(
+            f"No volumes at {args.bike_volumes}: run valma assign --gpkg with "
+            "these settings first, or name the file with --bike-volumes."
+        )
     comparison = compare(args.count_lines, args.bike_volumes, args.observed)
     args.output_csv.parent.mkdir(parents=True, exist_ok=True)
     # CSV without GeoPandas/Shapely geometry

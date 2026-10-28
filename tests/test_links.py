@@ -116,6 +116,21 @@ def test_traffic_light_penalty_applies_in_both_bike_directions():
     ] == pytest.approx(expected)
 
 
+def test_the_wait_at_lights_is_written_per_direction():
+    """signal_wait_s is the part of each travel time spent at red lights."""
+    entering = {**CHAIN[0], "highway": "secondary", "signal_entry": 1, "signal_entry_reverse": 0}
+    signalled = normalise(links_frame([entering]), "bike")
+    plain = normalise(links_frame([{**CHAIN[0], "highway": "secondary"}]), "bike")
+    wait = links_module.SIGNAL_WAIT_S
+
+    assert signalled["signal_wait_s"].iloc[0] == pytest.approx(wait)
+    assert signalled["signal_wait_reverse_s"].iloc[0] == 0.0
+    assert signalled["travel_time_s"].iloc[0] == pytest.approx(
+        plain["travel_time_s"].iloc[0] + wait
+    )
+    assert plain["signal_wait_s"].iloc[0] == 0.0
+
+
 def test_walking_pays_the_traffic_light_penalty_both_ways():
     """The walk speeds are pace in motion; the wait at a red light is extra."""
     signalled = normalise(
@@ -350,6 +365,37 @@ def test_elevation_penalty_is_directional_for_an_asymmetric_profile():
     )
 
 
+def test_climb_overrides_win_over_the_dem_each_on_its_own():
+    graded = _graded_links([(0.06, 0.06), (0.06, 0.06)])
+    length = links_module.geometry_lengths(graded)
+    # Link 0: the DEM's climb is wrong, its descent right. Link 1: untouched.
+    graded["ascent_override_m"] = [0.02 * length[0], np.nan]
+    graded["descent_override_m"] = [np.nan, np.nan]
+    normalised = normalise(graded, "bike")
+    flat = _flat_seconds(normalised)
+    length = normalised["length_m"].to_numpy()
+
+    assert normalised["travel_time_s"].to_numpy() == pytest.approx(
+        flat + links_module.GRADE_STEEP_FACTOR * 0.06 * length * np.array([0, 1])
+        + links_module.GRADE_LOW_FACTOR * 0.02 * length * np.array([1, 0])
+    )
+    assert normalised["travel_time_reverse_s"].to_numpy() == pytest.approx(
+        flat + links_module.GRADE_STEEP_FACTOR * 0.06 * length
+    )
+
+
+def test_a_zero_override_makes_a_link_flat_for_routing():
+    graded = _graded_links([(0.06, 0.06)])
+    graded["ascent_override_m"] = [0.0]
+    graded["descent_override_m"] = [0.0]
+    normalised = normalise(graded, "bike")
+
+    assert normalised["travel_time_s"].to_numpy() == pytest.approx(_flat_seconds(normalised))
+    assert normalised["travel_time_reverse_s"].to_numpy() == pytest.approx(
+        _flat_seconds(normalised)
+    )
+
+
 def test_walking_pays_for_the_climb_only_in_the_uphill_direction():
     """Walking is two-way everywhere, but a hill is still only uphill one way."""
     normalised = normalise(_graded_links([(0.03, 0.01)]), "walk")
@@ -529,6 +575,13 @@ def test_every_edge_remembers_the_link_it_came_from():
     assert set(edges["direction"]) == {1, -1}
 
 
+def _track_speed():
+    """Bike speed on a secondary road with a track serving that direction."""
+    from valma_bike_and_walk.speeds import CYCLE_TRACK_FACTOR, carriageway_divisor
+
+    return 18.0 / carriageway_divisor("secondary", CYCLE_TRACK_FACTOR)
+
+
 def _directional_speeds(**tags):
     """Forward and reverse bike speed on a secondary road with these tags."""
     row = {**CHAIN[0], "highway": "secondary", **tags}
@@ -550,7 +603,7 @@ def test_a_right_side_lane_serves_only_the_digitised_direction():
 
 def test_a_left_side_track_serves_only_the_reverse_direction():
     forward, reverse = _directional_speeds(cycleway_left="track")
-    assert reverse == pytest.approx(18.0)
+    assert reverse == pytest.approx(_track_speed())
     assert forward < reverse
 
 
@@ -559,8 +612,8 @@ def test_plain_and_both_side_tags_serve_both_directions():
         _directional_speeds(cycleway="lane")[1]
     )
     forward, reverse = _directional_speeds(cycleway_both="track")
-    assert forward == pytest.approx(18.0)
-    assert reverse == pytest.approx(18.0)
+    assert forward == pytest.approx(_track_speed())
+    assert reverse == pytest.approx(_track_speed())
 
 
 def test_cycleway_no_does_not_hide_a_side_lane():
@@ -572,7 +625,7 @@ def test_cycleway_no_does_not_hide_a_side_lane():
 
 def test_on_a_oneway_street_a_left_lane_serves_the_only_direction():
     forward, _ = _directional_speeds(oneway="yes", cycleway_left="track")
-    assert forward == pytest.approx(18.0)
+    assert forward == pytest.approx(_track_speed())
 
 
 def test_a_contraflow_lane_serves_only_the_contraflow_rider():
@@ -601,6 +654,67 @@ def test_plain_cycleway_on_a_oneway_street_is_not_given_to_contraflow():
     )
     assert forward == pytest.approx(18.0 / carriageway_divisor("secondary", CYCLE_LANE_FACTOR))
     assert reverse == pytest.approx(18.0 / carriageway_divisor("secondary", MIXED_TRAFFIC_FACTOR))
+
+
+def test_car_volume_override_wins_over_the_matched_volume():
+    matched = _directional_speeds(car_volume=2000.0)
+    overridden = _directional_speeds(car_volume=2000.0, car_volume_override=0.0)
+    quiet = _directional_speeds(car_volume=0.0)
+    assert overridden == pytest.approx(quiet)
+    assert overridden[0] > matched[0]
+
+
+def test_a_path_pays_for_the_road_beside_it_like_the_road_does():
+    from valma_bike_and_walk import speeds
+
+    row = {**CHAIN[0], "highway": "cycleway"}
+    plain = normalise(links_frame([row]), "bike")["speed_kmh"].iloc[0]
+    beside = normalise(links_frame([{**row, "adjacent_car_volume": 500.0}]), "bike")
+    term = speeds.TRAFFIC_COEFFICIENT * 500.0 / speeds.AVG_ROUTE_LENGTH_KM
+    expected = plain * speeds.REFERENCE_DISUTIL / (speeds.REFERENCE_DISUTIL + term)
+    assert beside["speed_kmh"].iloc[0] == pytest.approx(expected)
+
+
+def test_an_empty_override_leaves_the_matched_volume():
+    assert _directional_speeds(car_volume=500.0, car_volume_override=np.nan) == pytest.approx(
+        _directional_speeds(car_volume=500.0)
+    )
+
+
+def test_use_sidepath_slows_the_road_both_ways():
+    plain = _directional_speeds()
+    forward, reverse = _directional_speeds(bicycle="use_sidepath")
+    assert forward == pytest.approx(plain[0] / links_module.SIDEPATH_FACTOR)
+    assert reverse == pytest.approx(plain[1] / links_module.SIDEPATH_FACTOR)
+
+
+def test_one_sided_sidepath_tags_slow_only_their_direction():
+    plain, _ = _directional_speeds()
+    slow = plain / links_module.SIDEPATH_FACTOR
+    assert _directional_speeds(bicycle_forward="use_sidepath") == pytest.approx((slow, plain))
+    assert _directional_speeds(bicycle_backward="use_sidepath") == pytest.approx((plain, slow))
+    # cycleway:left=separate: the path for travel against the way is mapped apart.
+    assert _directional_speeds(cycleway_left="separate") == pytest.approx((plain, slow))
+    assert _directional_speeds(cycleway_both="separate") == pytest.approx((slow, slow))
+
+
+def test_a_path_is_never_slowed_for_a_sidepath():
+    row = {**CHAIN[0], "highway": "cycleway", "bicycle": "use_sidepath"}
+    plain = normalise(links_frame([{**CHAIN[0], "highway": "cycleway"}]), "bike")
+    tagged = normalise(links_frame([row]), "bike")
+    assert tagged["speed_kmh"].iloc[0] == pytest.approx(plain["speed_kmh"].iloc[0])
+
+
+def test_speed_override_wins_over_the_sidepath_penalty():
+    forward, reverse = _directional_speeds(bicycle="use_sidepath", speed_override_kmh=20.0)
+    assert (forward, reverse) == pytest.approx((20.0, 20.0))
+
+
+def test_walking_ignores_use_sidepath():
+    row = {**CHAIN[0], "highway": "secondary"}
+    plain = normalise(links_frame([row]), "walk")
+    tagged = normalise(links_frame([{**row, "bicycle": "use_sidepath"}]), "walk")
+    assert tagged["speed_kmh"].iloc[0] == pytest.approx(plain["speed_kmh"].iloc[0])
 
 
 def test_directional_speed_reaches_the_reverse_travel_time():

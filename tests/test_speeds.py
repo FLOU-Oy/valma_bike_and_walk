@@ -5,7 +5,9 @@ import pytest
 from valma_bike_and_walk.speeds import (
     BIKE_PROFILE,
     CYCLE_LANE_FACTOR,
+    CYCLE_TRACK_FACTOR,
     MIXED_TRAFFIC_FACTOR,
+    TRAFFIC_COEFFICIENT,
     WALK_PROFILE,
     carriageway_divisor,
     profile_for,
@@ -66,17 +68,21 @@ def test_car_volume_uses_one_speed_multiplier_for_all_volumes():
     speeds = BIKE_PROFILE.speeds_kph(
         highway, surface, car_volume=volume
     )
-    # The per-route volume term, spread over the average 5.6 km route.
-    expected = base_speed * np.array(
-        [
-            7.5 / (7.5 + 0.008 * 0.0 / 5.6),
-            7.5 / (7.5 + 0.008 * 100.0 / 5.6),
-            7.5 / (7.5 + 0.008 * 1000.0 / 5.6),
-            7.5 / (7.5 + 0.008 * 1001.0 / 5.6),
-        ]
-    )
+    # The per-route volume term, spread over the average 5.6 km route, added to
+    # the reference disutility a path stands at (4.96 + 2.61).
+    ref = 4.96 + 2.61
+    expected = base_speed * (ref / (ref + TRAFFIC_COEFFICIENT * volume.to_numpy() / 5.6))
 
     assert speeds == pytest.approx(expected)
+
+
+def test_car_volume_joins_the_road_class_and_facility_sum():
+    """One divisor: (road class + facility + traffic) / (local link + separated path)."""
+    speed = BIKE_PROFILE.speeds_kph(
+        pd.Series(["secondary"]), pd.Series(["asphalt"]), car_volume=pd.Series([500.0])
+    )[0]
+    divisor = (4.14 + 2.61 * 1.927 + TRAFFIC_COEFFICIENT * 500.0 / 5.6) / (4.96 + 2.61)
+    assert speed == pytest.approx(18.0 / divisor)
 
 
 def test_missing_car_volume_does_not_penalize_bike_speed():
@@ -130,18 +136,32 @@ def test_cycle_lane_replaces_the_mixed_traffic_factor():
 
 
 def test_cycle_lane_does_not_speed_up_roads_without_a_carriageway_factor():
-    highway = pd.Series(["service", "unclassified", "trunk"])
-    lane = BIKE_PROFILE.speeds_kph(highway, cycleway=pd.Series(["lane"] * 3))
-    none = BIKE_PROFILE.speeds_kph(highway, cycleway=pd.Series([None] * 3))
+    highway = pd.Series(["trunk", "trunk_link"])
+    lane = BIKE_PROFILE.speeds_kph(highway, cycleway=pd.Series(["lane"] * 2))
+    none = BIKE_PROFILE.speeds_kph(highway, cycleway=pd.Series([None] * 2))
     assert lane == pytest.approx(none)
 
 
+def test_unclassified_and_service_ride_as_quiet_as_a_cycleway():
+    highway = pd.Series(["unclassified", "service", "residential"])
+    speeds = BIKE_PROFILE.speeds_kph(highway)
+    local = carriageway_divisor("residential", MIXED_TRAFFIC_FACTOR)
+    assert speeds == pytest.approx([18.0, 16.0, 18.0 / local])
+
+
+def test_a_service_road_still_pays_for_its_cars():
+    highway = pd.Series(["service", "service"])
+    speeds = BIKE_PROFILE.speeds_kph(highway, car_volume=pd.Series([np.nan, 200.0]))
+    assert speeds[0] == pytest.approx(16.0)
+    assert speeds[1] < speeds[0]
+
+
 def test_cycle_track_counts_as_a_separate_cycleway():
-    highway = pd.Series(["secondary", "secondary", "secondary"])
+    highway = pd.Series(["residential", "residential", "residential"])
     speeds = BIKE_PROFILE.speeds_kph(
         highway, cycleway=pd.Series(["track", "lane", None])
     )
-    assert speeds[0] == pytest.approx(18.0)
+    assert speeds[0] == pytest.approx(18.0 / carriageway_divisor("residential", CYCLE_TRACK_FACTOR))
     assert speeds[0] > speeds[1] > speeds[2]
 
 
@@ -149,12 +169,20 @@ def test_road_class_and_facility_costs_add_up():
     """Tarkkala's per-km terms are summed, not multiplied."""
     highway = pd.Series(["secondary", "residential", "secondary"])
     speeds = BIKE_PROFILE.speeds_kph(highway, cycleway=pd.Series([None, None, "track"]))
-    # Mixed traffic on a main street: (4.14 + 5.03) / (4.14 + 2.61).
-    assert speeds[0] == pytest.approx(18.0 * 6.75 / (4.14 + 2.61 * MIXED_TRAFFIC_FACTOR))
+    ref = 4.96 + 2.61  # a separated path on a local link: every cycleway
+    # Mixed traffic on a main street: (4.14 + 5.03) / (4.96 + 2.61).
+    assert speeds[0] == pytest.approx(18.0 * ref / (4.14 + 2.61 * MIXED_TRAFFIC_FACTOR))
     # On a local street the two costs still add rather than multiply.
-    assert speeds[1] == pytest.approx(18.0 * 6.75 / (4.96 + 2.61 * MIXED_TRAFFIC_FACTOR))
-    # A track along a main street is the reference itself.
+    assert speeds[1] == pytest.approx(18.0 * ref / (4.96 + 2.61 * MIXED_TRAFFIC_FACTOR))
+    # A track along a main street, (4.14 + 2.52), scores below the reference:
+    # preferred, but no quicker than the road's nominal speed.
     assert speeds[2] == pytest.approx(18.0)
+
+
+def test_a_quiet_street_costs_tarkkalas_share_more_than_a_cycleway():
+    """Both carry the local road class; only the facility differs."""
+    speeds = BIKE_PROFILE.speeds_kph(pd.Series(["cycleway", "residential"]))
+    assert speeds[0] / speeds[1] == pytest.approx((4.96 + 5.03) / (4.96 + 2.61), rel=1e-3)
 
 
 def test_a_segregated_path_is_quicker_and_untagged_counts_as_shared():
