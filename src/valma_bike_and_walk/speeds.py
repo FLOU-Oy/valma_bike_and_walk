@@ -69,25 +69,22 @@ ROAD_CLASS_BETA: Mapping[str, float] = {
 REFERENCE_DISUTIL = BETA_LOCAL + BETA_SEPARATED
 
 
-#: Paths that pedestrians share unless they are split into a cycling half and
-#: a walking half (``segregated=yes``). Shared and untagged paths ride at the
-#: highway's own speed; a segregated one is a little quicker, with no weaving
-#: round people on foot.
+#: Paths that pedestrians may share with cyclists. Only one tagged as shared
+#: (``segregated=no``) is slower, for the weaving round people on foot;
+#: segregated, untagged and foot-free (``foot=no``) paths ride at the
+#: highway's own speed.
 SHARED_PATH_HIGHWAYS = frozenset({"cycleway", "path"})
-SEGREGATED_PATH_FACTOR = 1.05
-SHARED_PATH_FACTOR = 1.0
+SHARED_PATH_FACTOR = 0.95
 
 
 def segregation_factor(highway: pd.Series, segregated: pd.Series | None) -> np.ndarray:
-    """Bike speed factor for shared vs segregated foot-and-cycle paths."""
+    """Bike speed factor for foot-and-cycle paths tagged as shared."""
     on_path = highway.isin(SHARED_PATH_HIGHWAYS).to_numpy(dtype=bool)
     if segregated is None:
-        split = np.zeros(len(highway), dtype=bool)
+        shared = np.zeros(len(highway), dtype=bool)
     else:
-        split = segregated.eq("yes").fillna(False).to_numpy(dtype=bool)
-    return np.where(
-        on_path, np.where(split, SEGREGATED_PATH_FACTOR, SHARED_PATH_FACTOR), 1.0
-    )
+        shared = segregated.eq("no").fillna(False).to_numpy(dtype=bool)
+    return np.where(on_path & shared, SHARED_PATH_FACTOR, 1.0)
 
 
 def link_disutility(highway: pd.Series, facility_factor: np.ndarray) -> np.ndarray:

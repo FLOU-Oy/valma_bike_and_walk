@@ -188,8 +188,101 @@ def test_access_time_charges_for_the_snap_distance(net, tmp_path):
     )
 
     # 3.6 km/h is 1 m/s, so access seconds equal the snap distance in metres.
-    assert charged.access_seconds[0] == pytest.approx(float(np.hypot(50.0, 50.0)), rel=1e-6)
+    snap = float(np.hypot(50.0, 50.0))
+    assert charged.access_seconds[0] == pytest.approx(snap, rel=1e-6)
     assert free.access_seconds[0] == 0.0
+
+    # The same leg in metres, for a distance matrix: the snap distance itself,
+    # and zero exactly where the time is, so the two charge for access alike.
+    assert charged.access_metres[0] == pytest.approx(snap, rel=1e-6)
+    assert charged.representative_access_metres[0] == pytest.approx(snap, rel=1e-6)
+    assert free.access_metres[0] == 0.0
+    assert free.representative_access_metres[0] == 0.0
+
+
+def test_access_metres_survive_merging_points_on_one_node(net, tmp_path):
+    """Two candidates on the same node merge; both legs average together."""
+    # A box covering a single network node, asked for more points than the
+    # network can give it distinct nodes for.
+    path = write_zones(tmp_path / "zones.gpkg", [shapely.box(-40, -40, 40, 40)])
+
+    zones = load_zones(
+        net, path, id_column="zone_id", points_per_zone=4, access_speed_kmh=3.6
+    )
+
+    # 1 m/s again, so metres and seconds have to come out of the merge equal.
+    np.testing.assert_allclose(
+        zones.access_metres, zones.access_seconds, rtol=1e-6, atol=1e-9
+    )
+
+
+def street_and_park(tmp_path):
+    """A street 0-300 m along y = 0, and a park east of it full of footways."""
+    from valma_bike_and_walk.network import network_from_links
+
+    from .conftest import links_frame
+
+    rows = [
+        {"u": 1, "v": 2, "coords": [(0, 0), (100, 0)]},
+        {"u": 2, "v": 3, "coords": [(100, 0), (200, 0)]},
+        {"u": 3, "v": 4, "coords": [(200, 0), (300, 0)], "highway": "service"},
+    ]
+    # Footways: a ladder from x = 300 to 600, two rails and a rung every 100 m.
+    park = [
+        (4, (300, 0)),
+        (5, (400, 0)),
+        (6, (500, 0)),
+        (7, (600, 0)),
+        (8, (300, 100)),
+        (9, (400, 100)),
+        (10, (500, 100)),
+        (11, (600, 100)),
+    ]
+    xy = dict(park)
+    for a, b in [
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (8, 9),
+        (9, 10),
+        (10, 11),
+        (4, 8),
+        (5, 9),
+        (6, 10),
+        (7, 11),
+    ]:
+        rows.append({"u": a, "v": b, "coords": [xy[a], xy[b]], "highway": "footway"})
+    for i, row in enumerate(rows):
+        row["link_id"] = i
+    return network_from_links(links_frame(rows, crs=PROJECTED_CRS), "walk")
+
+
+def test_paths_do_not_draw_access_points(tmp_path):
+    network = street_and_park(tmp_path)
+    everything = shapely.box(-50, -50, 650, 150)
+    path = write_zones(tmp_path / "zones.gpkg", [everything])
+    zones = load_zones(network, path, id_column="zone_id", points_per_zone=1)
+    # Streets and the service road only: their length-weighted mean is on the street.
+    assert zones.x[0] <= 300
+    assert zones.y[0] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_a_zone_with_no_street_takes_its_points_from_the_paths(tmp_path):
+    network = street_and_park(tmp_path)
+    park_only = shapely.box(350, -50, 650, 150)
+    path = write_zones(tmp_path / "zones.gpkg", [park_only])
+    zones = load_zones(network, path, id_column="zone_id", points_per_zone=4)
+    assert zones.n_points > 1
+    assert (zones.x >= 350).all()
+
+
+def test_the_demand_flag_survives_a_save(tmp_path):
+    from valma_bike_and_walk.network import RoutableNetwork
+
+    network = street_and_park(tmp_path)
+    assert network.demand_edge is not None and not network.demand_edge.all()
+    loaded = RoutableNetwork.load(network.save(tmp_path / "net.npz"))
+    np.testing.assert_array_equal(loaded.demand_edge, network.demand_edge)
 
 
 def test_node_weights_follow_street_length_not_node_count(net):
@@ -224,3 +317,111 @@ def test_zone_points_frame_round_trips_to_a_geopackage(net, tmp_path):
     out = tmp_path / "points.gpkg"
     frame.to_file(out, layer="zone_points", driver="GPKG")
     assert len(gpd.read_file(out)) == zones.n_points
+
+
+# --------------------------------------------------------------------------
+# Rows sharing an id are one zone
+# --------------------------------------------------------------------------
+
+
+def write_grid_zones(path, column="taz", mapping=None):
+    """
+    The 5x5 grid network cut into 4 cells of 2x2 nodes, plus a mapping column.
+
+    Cell k covers nodes in a 200 m box; ``mapping[k]`` is the analysis zone it
+    rolls up into, so the default maps the four cells onto two zones.
+    """
+    cells = [
+        shapely.box(-50, -50, 150, 150),  # nodes with x,y <= 100
+        shapely.box(150, -50, 450, 150),
+        shapely.box(-50, 150, 150, 450),
+        shapely.box(150, 150, 450, 450),
+    ]
+    frame = gpd.GeoDataFrame(
+        {
+            "cell_id": [0, 1, 2, 3],
+            column: mapping if mapping is not None else ["A", "A", "B", "B"],
+        },
+        geometry=cells,
+        crs=PROJECTED_CRS,
+    )
+    frame.to_file(path, layer="zones", driver="GPKG")
+    return path
+
+
+def test_rows_sharing_an_id_become_one_zone(net, tmp_path):
+    path = write_grid_zones(tmp_path / "zones.gpkg")
+
+    cells = load_zones(net, path, id_column="cell_id", points_per_zone=1)
+    grouped = load_zones(net, path, id_column="taz", points_per_zone=1)
+
+    assert cells.n_zones == 4
+    assert grouped.n_zones == 2
+    np.testing.assert_array_equal(grouped.ids, ["A", "B"])
+
+
+def test_a_grouped_zone_covers_every_node_of_its_parts(net, tmp_path):
+    """Access points are placed over the whole zone, not one part of it."""
+    path = write_grid_zones(tmp_path / "zones.gpkg")
+    grouped = load_zones(net, path, id_column="taz", points_per_zone=8)
+
+    # Zone A is the bottom half of the grid: y <= 100, x anywhere.
+    a = slice(grouped.indptr[0], grouped.indptr[1])
+    assert grouped.y[a].max() <= 100
+    assert grouped.x[a].max() >= 300  # reaches into the second cell
+    # And its weights still normalise within the zone, not within a part.
+    np.testing.assert_allclose(grouped.weight[a].sum(), 1.0)
+
+
+def test_a_grouped_zone_takes_the_area_of_all_its_parts(net, tmp_path):
+    path = write_grid_zones(tmp_path / "zones.gpkg")
+    cells = load_zones(net, path, id_column="cell_id", points_per_zone=1)
+    grouped = load_zones(net, path, id_column="taz", points_per_zone=1)
+
+    # Cells 0 and 1 make zone A; the equal-area-circle intrazonal estimate
+    # has to see the whole zone, or it would understate every grouped zone.
+    np.testing.assert_allclose(grouped.area_m2[0], cells.area_m2[0] + cells.area_m2[1])
+
+
+def test_grouping_keeps_the_order_the_ids_first_appear_in(net, tmp_path):
+    path = write_grid_zones(
+        tmp_path / "zones.gpkg", mapping=["late", "early", "early", "late"]
+    )
+    grouped = load_zones(net, path, id_column="taz", points_per_zone=1)
+
+    np.testing.assert_array_equal(grouped.ids, ["late", "early"])
+
+
+def test_unique_ids_are_left_exactly_as_they_were(net, tmp_path):
+    """The ungrouped path must not change: no dissolve, no reordering."""
+    path = write_grid_zones(tmp_path / "zones.gpkg", mapping=["d", "c", "b", "a"])
+    zones = load_zones(net, path, id_column="taz", points_per_zone=4)
+
+    np.testing.assert_array_equal(zones.ids, ["d", "c", "b", "a"])
+
+
+def test_rows_with_no_id_are_dropped_rather_than_made_into_a_zone(net, tmp_path):
+    path = write_grid_zones(tmp_path / "zones.gpkg", mapping=["A", None, "A", "B"])
+    zones = load_zones(net, path, id_column="taz", points_per_zone=4)
+
+    assert zones.n_zones == 2
+    np.testing.assert_array_equal(sorted(zones.ids), ["A", "B"])
+    # The dropped cell is the one covering x >= 150, y <= 100; zone A keeps
+    # only its other part.
+    a = slice(zones.indptr[0], zones.indptr[1])
+    assert zones.x[a].max() <= 100
+
+
+def test_a_grouped_zone_in_separated_pieces_still_routes(net, tmp_path):
+    """Two disjoint cells under one id: a MultiPolygon, not an error."""
+    path = write_grid_zones(tmp_path / "zones.gpkg", mapping=["X", "Y", "Y", "X"])
+    zones = load_zones(net, path, id_column="taz", points_per_zone=4)
+
+    assert zones.n_zones == 2
+    # The representative point has to sit on an access point, not in the gap
+    # between the two diagonal pieces (see the module docstring).
+    for z in range(2):
+        block = slice(zones.indptr[z], zones.indptr[z + 1])
+        points = np.column_stack([zones.x[block], zones.y[block]])
+        rep = np.array([zones.representative.x[z], zones.representative.y[z]])
+        assert (np.abs(points - rep).sum(axis=1) < 1e-6).any()

@@ -62,7 +62,9 @@ from valma_bike_and_walk.config import (
     Settings,
     validate_mode,
 )
+from valma_bike_and_walk.connectors import CONNECTOR_HIGHWAY
 from valma_bike_and_walk.osm import read_links, resolve_clip
+from valma_bike_and_walk.signals import CROSSING_ENTRY_HIGHWAY
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +72,18 @@ logger = logging.getLogger(__name__)
 #: node order, edge order, which arrays exist -- so that a file written by
 #: another version is refused (see :class:`NetworkFormatError`) and a cached one
 #: is rebuilt, rather than either being read as if it were this one.
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
+
+#: Links whose length says nothing about where people live or work, left out
+#: when a zone without a weights layer places its access points by network
+#: length (:func:`valma_bike_and_walk.zones.network_node_weights`): paths -- a
+#: park full of footways would outweigh a block of flats -- and the connectors
+#: that join islands and split crossings. Pedestrian streets stay: shops and
+#: offices line them.
+NO_DEMAND_HIGHWAYS = (links_module.PATH_HIGHWAYS - {"pedestrian"}) | {
+    CONNECTOR_HIGHWAY,
+    CROSSING_ENTRY_HIGHWAY,
+}
 
 #: Bits per axis of the Hilbert key nodes are sorted by. 2**16 cells across
 #: Finland is about 20 m a cell -- far finer than it needs to be to keep
@@ -122,6 +135,9 @@ class RoutableNetwork:
     #: What this graph was built from, as a JSON cache key (see
     #: :mod:`valma_bike_and_walk.cache`); empty if nobody recorded it.
     source_key: str = ""
+    #: Per directed edge, whether its length counts towards where a zone's
+    #: demand sits -- False on :data:`NO_DEMAND_HIGHWAYS`. None counts every edge.
+    demand_edge: np.ndarray | None = None  # bool
 
     def __post_init__(self) -> None:
         self._tree: cKDTree | None = None
@@ -188,10 +204,12 @@ class RoutableNetwork:
         handle, tmp = tempfile.mkstemp(
             prefix=path.name + ".", suffix=".tmp", dir=path.parent
         )
+        optional = {} if self.demand_edge is None else {"demand_edge": self.demand_edge}
         try:
             with os.fdopen(handle, "wb") as out:
                 (np.savez_compressed if compress else np.savez)(
                     out,
+                    **optional,
                     format_version=np.array(FORMAT_VERSION),
                     mode=np.array(self.mode),
                     crs=np.array(self.crs),
@@ -242,6 +260,7 @@ class RoutableNetwork:
                 length=data["length"],
                 link_id=data["link_id"],
                 direction=data["direction"],
+                demand_edge=data["demand_edge"] if "demand_edge" in data.files else None,
             )
 
 
@@ -348,6 +367,8 @@ class _EdgeArrays:
     length: np.ndarray
     link_id: np.ndarray
     direction: np.ndarray
+    #: link_id of every link on :data:`NO_DEMAND_HIGHWAYS`.
+    no_demand_links: np.ndarray | None = None
 
 
 def edge_arrays(links: gpd.GeoDataFrame, mode: str) -> _EdgeArrays:
@@ -388,6 +409,9 @@ def edge_arrays(links: gpd.GeoDataFrame, mode: str) -> _EdgeArrays:
         length=directed["length_m"].to_numpy(dtype=np.float32),
         link_id=directed["link_id"].to_numpy(dtype=np.int64),
         direction=directed["direction"].to_numpy(dtype=np.int8),
+        no_demand_links=links.loc[
+            links["highway"].isin(NO_DEMAND_HIGHWAYS), "link_id"
+        ].to_numpy(dtype=np.int64),
     )
 
 
@@ -444,6 +468,10 @@ def _assemble(mode: str, parts: list[_EdgeArrays]) -> RoutableNetwork:
     indptr, indices, travel_time, length, link_id, direction = _build_csr(
         u_idx, v_idx, travel_time, length, link_id, direction, len(node_ids)
     )
+    no_demand = [p.no_demand_links for p in parts if p.no_demand_links is not None]
+    demand_edge = (
+        ~np.isin(link_id, np.concatenate(no_demand)) if len(no_demand) == len(parts) else None
+    )
 
     # Walking is modelled bidirectionally, so weak and strong components agree;
     # cycling is genuinely directed.
@@ -462,6 +490,7 @@ def _assemble(mode: str, parts: list[_EdgeArrays]) -> RoutableNetwork:
             length=length,
             link_id=link_id,
             direction=direction,
+            demand_edge=demand_edge,
         ),
         keep,
     )
@@ -773,6 +802,7 @@ def _subset(network: RoutableNetwork, keep: np.ndarray) -> RoutableNetwork:
         link_id=network.link_id[edge_keep],
         direction=network.direction[edge_keep],
         crs=network.crs,
+        demand_edge=None if network.demand_edge is None else network.demand_edge[edge_keep],
     )
 
 
@@ -788,11 +818,15 @@ def _from_coo(
     link_id: np.ndarray,
     direction: np.ndarray,
     crs: str,
+    demand_edge: np.ndarray | None = None,
 ) -> RoutableNetwork:
+    # The flag rides through _build_csr's sort and dedup on the link it names.
+    no_demand = None if demand_edge is None else np.unique(link_id[~demand_edge])
     indptr, indices, travel_time, length, link_id, direction = _build_csr(
         u_idx, v_idx, travel_time, length, link_id, direction, node_ids.shape[0]
     )
     return RoutableNetwork(
+        demand_edge=None if no_demand is None else ~np.isin(link_id, no_demand),
         mode=mode,
         node_ids=node_ids,
         x=x,

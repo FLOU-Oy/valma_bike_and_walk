@@ -19,11 +19,15 @@ demand_matrix = "{mode}"
 [dem]
 # The NLS API key is read from the MML_API_KEY environment variable.
 
+
 [extract]
 pbf = "../finland-highways.osm.pbf"
 
 [matrix]
 max_minutes = 90.0
+points_per_zone = 8
+zones = "data/2023_zonedata--dev-template.gpkg"
+id-column = "input_zone_id"
 
 [assign]
 gpkg = true                             # link volumes drawn on the link layer
@@ -31,3 +35,6 @@ max_minutes = 90.0
 points_per_zone = 8
 zones = "data/2023_zonedata--dev-template.gpkg"
 id-column = "input_zone_id"
+
+[overlay]
+baseline = "../data/demand_vrk.omx"  # the baseline demand to overlay on top of

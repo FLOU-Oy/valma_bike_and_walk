@@ -773,3 +773,65 @@ def test_cli_refuses_a_network_built_for_another_mode(chain_pbf, tmp_path):
 def test_cli_without_any_source_says_what_it_wants():
     with pytest.raises(SystemExit, match="--network"):
         main(["build", "--mode", "walk"])
+
+
+def grid_zone_layer(path):
+    """Four slices of the chain, with a column rolling them up into two zones."""
+    import shapely
+
+    frame = gpd.GeoDataFrame(
+        {
+            "cell_id": [1, 2, 3, 4],
+            "submodel": [10, 10, 20, 20],
+        },
+        geometry=[
+            shapely.box(23.9990, 59.9990, 24.0010, 60.0010),
+            shapely.box(24.0010, 59.9990, 24.0030, 60.0010),
+            shapely.box(24.0030, 59.9990, 24.0050, 60.0010),
+            shapely.box(24.0050, 59.9990, 24.0070, 60.0010),
+        ],
+        crs="EPSG:4326",
+    )
+    frame.to_file(path, layer="zones", driver="GPKG")
+    return path
+
+
+def test_cli_matrix_rolls_grid_cells_up_into_analysis_zones(chain_pbf, tmp_path):
+    """
+    The model-system case: one layer, a fine grid, and a column per submodel
+    naming the analysis zone each cell belongs to.
+    """
+    out_dir, cache, links_path = extract_chain(chain_pbf, tmp_path)
+    zones = grid_zone_layer(tmp_path / "zones.gpkg")
+
+    def run(id_column):
+        assert (
+            main(
+                [
+                    "matrix",
+                    "--links", str(links_path),
+                    "--mode", "walk",
+                    "--zones", str(zones),
+                    "--id-column", id_column,
+                    "--points-per-zone", "4",
+                    "--output-dir", str(out_dir),
+                    "--cache-dir", str(cache),
+                    "--workers", "1",
+                ]
+            )  # fmt: skip
+            == 0
+        )
+        with np.load(out_dir / "travel_times_walk.npz") as data:
+            return data["ids"], data["seconds"]
+
+    cell_ids, cell_seconds = run("cell_id")
+    zone_ids, zone_seconds = run("submodel")
+
+    np.testing.assert_array_equal(cell_ids, [1, 2, 3, 4])
+    np.testing.assert_array_equal(zone_ids, [10, 20])
+    assert cell_seconds.shape == (4, 4) and zone_seconds.shape == (2, 2)
+
+    # A zone two cells wide is wider than either cell, so its intrazonal trip
+    # is longer -- the grouping really did place points across both parts.
+    assert zone_seconds[0, 0] > cell_seconds[0, 0]
+    assert zone_seconds[0, 1] > 0
