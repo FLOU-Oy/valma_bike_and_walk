@@ -512,7 +512,13 @@ def _hilbert_keys(ix: np.ndarray, iy: np.ndarray, bits: int) -> np.ndarray:
     while s > 0:
         rx = (x & s) > 0
         ry = (y & s) > 0
-        key += s * s * ((3 * rx) ^ ry)
+        # int64 throughout, explicitly. `3 * rx` on a bool array takes the
+        # platform's default integer, which is int32 on Windows under numpy 1
+        # -- and at bits=16 the first level is 32768 * 32768 * 3, which wraps
+        # there and silently scrambles the order. numpy 2 defaults to int64
+        # and hides the bug, so this costs nothing and must not be removed.
+        quadrant = (3 * rx.astype(np.int64)) ^ ry.astype(np.int64)
+        key += np.int64(s) * np.int64(s) * quadrant
         # Rotate the lower quadrants so the curve inside them lines up.
         flip = ~ry & rx
         x = np.where(flip, side - 1 - x, x)
