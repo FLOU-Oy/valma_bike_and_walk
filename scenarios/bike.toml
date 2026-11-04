@@ -11,7 +11,7 @@
 #   scenarios/bike.toml
 extends = "base.toml"
 scenario = "bike"
-# mode = "bike"                       # "bike" or "walk"
+mode = "bike"                       # "bike" or "walk"
 
 demand = "../data/demand_vrk.omx"  # placeholder: point at the real OD demand
 demand_matrix = "{mode}"
@@ -24,6 +24,9 @@ pbf = "../finland-highways.osm.pbf"
 
 [matrix]
 max_minutes = 90.0
+points_per_zone = 8
+zones = "data/2023_zonedata--dev-template.gpkg"
+id-column = "input_zone_id"
 
 [assign]
 gpkg = true                             # link volumes drawn on the link layer
@@ -31,3 +34,6 @@ max_minutes = 90.0
 points_per_zone = 8
 zones = "data/2023_zonedata--dev-template.gpkg"
 id-column = "input_zone_id"
+
+[overlay]
+baseline = "../data/demand_vrk.omx"  # the baseline demand to overlay on top of

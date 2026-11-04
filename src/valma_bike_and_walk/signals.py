@@ -36,7 +36,10 @@ junction on the way onto the road. Crossing stays free, joining does not.
 
 Every one of these is the same wait, so no way in is cheaper than another:
 stepping onto a crossing and turning onto the road there costs what the road
-approach does.
+approach does. The wait goes by the junction's largest road
+(:data:`JUNCTION_CLASSES`) -- a light on a primary road has a longer cycle
+than one on a tertiary -- and not by the road each crossing goes over, which
+would make the crossing of the side street a cheap way onto the main road.
 
 A mid-block pedestrian light -- signalled crossings with no road light and no
 side road -- is a junction of its own kind, :data:`MIDBLOCK`, with a smaller
@@ -53,6 +56,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
@@ -67,20 +71,28 @@ JUNCTION_RADIUS_M = 30.0
 CROSSING_ENTRY_HIGHWAY = "crossing_entry"
 
 #: Codes stored per link and direction: what kind of light the link pays for.
+#: JUNCTION, of no class, is what layers extracted before the classes carry;
 #: 2 and 4 were used by an earlier scheme and are read as JUNCTION.
 NONE, JUNCTION, MIDBLOCK = 0, 1, 3
+#: Signalled junctions by their largest road.
+JUNCTION_PRIMARY, JUNCTION_SECONDARY, JUNCTION_TERTIARY, JUNCTION_MINOR = 5, 6, 7, 8
 
-#: The roads a junction is made of: ``unclassified``/``residential`` and up,
-#: their ``_link`` slip roads included. Service roads and living streets are
-#: not -- a driveway or parking aisle inside the radius is not the junction, and
-#: a sidewalk passing its end should not pay.
-JUNCTION_ROADS = frozenset(
-    {
-        "trunk", "trunk_link", "primary", "primary_link",
-        "secondary", "secondary_link", "tertiary", "tertiary_link",
-        "unclassified", "residential",
-    }
-)
+#: The roads a junction is made of, and the code each makes it when it is the
+#: largest there: ``unclassified``/``residential`` and up, their ``_link`` slip
+#: roads included. Service roads and living streets are not -- a driveway or
+#: parking aisle inside the radius is not the junction, and a sidewalk passing
+#: its end should not pay.
+JUNCTION_CLASSES = {
+    "trunk": JUNCTION_PRIMARY, "trunk_link": JUNCTION_PRIMARY,
+    "primary": JUNCTION_PRIMARY, "primary_link": JUNCTION_PRIMARY,
+    "secondary": JUNCTION_SECONDARY, "secondary_link": JUNCTION_SECONDARY,
+    "tertiary": JUNCTION_TERTIARY, "tertiary_link": JUNCTION_TERTIARY,
+    "unclassified": JUNCTION_MINOR, "residential": JUNCTION_MINOR,
+}
+JUNCTION_ROADS = frozenset(JUNCTION_CLASSES)
+
+#: Junction codes from the smallest road class to the largest.
+_CLASS_ORDER = (JUNCTION_MINOR, JUNCTION_TERTIARY, JUNCTION_SECONDARY, JUNCTION_PRIMARY)
 
 
 @dataclass(frozen=True)
@@ -94,7 +106,7 @@ class _Layout:
     jv: np.ndarray
     path: np.ndarray
     junction_road: np.ndarray
-    code: np.ndarray  # per junction: JUNCTION or MIDBLOCK
+    code: np.ndarray  # per junction: its class's JUNCTION_* code, or MIDBLOCK
     is_signal: np.ndarray  # per node
     is_crossing: np.ndarray  # per node: signalled or not
     on_junction_road: np.ndarray  # per node: one of its junction's roads runs here
@@ -164,8 +176,18 @@ def _layout(
 
     # A mid-block light's inside is its signal nodes: passing beside it is free.
     inside = np.where(midblock[np.maximum(inside, 0)] & ~is_signal, -1, inside)
-    code = np.where(midblock, MIDBLOCK, JUNCTION).astype(np.int8)
     ju, jv = inside[ui], inside[vi]
+
+    # Each junction's class: the largest road with an end inside it, minor
+    # where none of its roads reaches it.
+    rank = pd.Series(np.asarray(highway, dtype=object)).map(
+        {h: _CLASS_ORDER.index(c) for h, c in JUNCTION_CLASSES.items()}
+    ).fillna(0).to_numpy(dtype=np.int64)
+    largest = np.zeros(n_junctions, dtype=np.int64)
+    for j in (ju, jv):
+        at = junction_road & (j >= 0)
+        np.maximum.at(largest, j[at], rank[at])
+    code = np.where(midblock, MIDBLOCK, np.array(_CLASS_ORDER)[largest]).astype(np.int8)
 
     # The junction's roads: nodes inside it where one of its roads runs.
     on_junction_road = np.zeros(len(node_ids), dtype=bool)

@@ -201,11 +201,16 @@ def parameters(mode: str, frames: list[pd.DataFrame]) -> list[Parameter]:
     highways = sorted(set().union(*[set(f["highway"].astype(str)) for f in frames]))
     surfaces = sorted(set().union(*[set(f["surface"].dropna().astype(str)) for f in frames if "surface" in f]))
     if any("signal_entry" in f.columns for f in frames):
-        # Signalled junctions: one wait per junction entered.
+        # Signalled junctions: one wait per junction entered, by its largest
+        # road; a layer from before the classes has one wait for them all.
         lights = [
-            _module_param(links_module, "SIGNAL_WAIT_S", 0.0, 120.0),
-            _module_param(links_module, "MIDBLOCK_SIGNAL_WAIT_S", 0.0, 60.0),
+            _module_param(links_module, name, 0.0, 120.0)
+            for name in (
+                "PRIMARY_SIGNAL_WAIT_S", "SECONDARY_SIGNAL_WAIT_S",
+                "TERTIARY_SIGNAL_WAIT_S", "MINOR_SIGNAL_WAIT_S", "SIGNAL_WAIT_S",
+            )
         ]
+        lights.append(_module_param(links_module, "MIDBLOCK_SIGNAL_WAIT_S", 0.0, 60.0))
     else:
         light = "TRAFFIC_LIGHT_PENALTY_SECONDS" if mode == "bike" else "WALK_TRAFFIC_LIGHT_PENALTY_SECONDS"
         lights = [_module_param(links_module, light, 0.0, 120.0)]

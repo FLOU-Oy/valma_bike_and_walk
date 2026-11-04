@@ -272,10 +272,14 @@ def _point_rows(
     indptr,
     indices,
     weight,
+    edge_tail,
     sources,
     targets,
     limit,
     out,
+    edge_length,
+    out_length,
+    tree_length,
     stamp,
     serial,
     dist,
@@ -285,11 +289,20 @@ def _point_rows(
     heap_key,
     heap_node,
 ):
-    """``out[i, j]`` = cost from ``sources[i]`` to ``targets[j]``, inf if beyond reach."""
+    """
+    ``out[i, j]`` = cost from ``sources[i]`` to ``targets[j]``, inf if beyond reach.
+
+    When ``out_length`` is not empty, ``out_length[i, j]`` gets the length of
+    the path that cost measures -- ``edge_length`` summed along the
+    shortest-path tree, so it describes the route the search chose rather than
+    the shortest route by length. Unreached pairs are inf there too.
+    ``tree_length`` is scratch.
+    """
+    lengths = out_length.shape[0] > 0
     for i in range(sources.shape[0]):
         serial += 1
         n_targets = _mark(stamp, serial, targets)
-        n_touched, _, heap_key, heap_node = _search(
+        n_touched, n_settled, heap_key, heap_node = _search(
             indptr,
             indices,
             weight,
@@ -305,8 +318,24 @@ def _point_rows(
             heap_key,
             heap_node,
         )
+        if lengths:
+            # Settling order: a node settles after its predecessor, so one
+            # forward pass lengths every path at once. Every target the search
+            # reached is settled -- it stops only once all of them are -- so
+            # every finite cell below has its length ready here.
+            tree_length[settled[0]] = 0.0
+            for s in range(1, n_settled):
+                node = settled[s]
+                edge = pred_edge[node]
+                tree_length[node] = tree_length[edge_tail[edge]] + edge_length[edge]
         for j in range(targets.shape[0]):
-            out[i, j] = dist[targets[j]]
+            target = targets[j]
+            out[i, j] = dist[target]
+            if lengths:
+                if dist[target] == np.inf:
+                    out_length[i, j] = np.inf
+                else:
+                    out_length[i, j] = tree_length[target]
         _reset(dist, touched, n_touched)
     return serial, heap_key, heap_node
 
@@ -316,18 +345,24 @@ def _zone_rows(
     indptr,
     indices,
     weight,
+    edge_tail,
     source_nodes,
     source_access,
+    source_access_m,
     source_weight,
     source_row,
     target_nodes,
     target_access,
+    target_access_m,
     target_weight,
     target_zone,
     limit,
     decay_mu,
     numerator,
     denominator,
+    edge_length,
+    numerator_m,
+    tree_length,
     stamp,
     serial,
     dist,
@@ -344,12 +379,19 @@ def _zone_rows(
     and ``w_a * w_b`` to ``denominator[row_a, zone_b]`` for every target point
     ``b`` it reached, where ``t_ab`` includes both access legs and ``value`` is
     ``t`` itself or ``exp(-decay_mu * t)`` when ``decay_mu`` is positive.
+
+    When ``numerator_m`` is not empty it takes ``w_a * w_b * d_ab`` over the
+    same pairs, where ``d_ab`` is the length of the path the cost chose plus
+    both access legs in metres. Never decayed: the decay is a logsum over time
+    utilities, and a distance has no place in it. The denominator is shared --
+    the same pairs with the same weights -- so there is only ever one.
     """
     use_decay = decay_mu > 0.0
+    lengths = numerator_m.shape[0] > 0
     for a in range(source_nodes.shape[0]):
         serial += 1
         n_targets = _mark(stamp, serial, target_nodes)
-        n_touched, _, heap_key, heap_node = _search(
+        n_touched, n_settled, heap_key, heap_node = _search(
             indptr,
             indices,
             weight,
@@ -365,11 +407,19 @@ def _zone_rows(
             heap_key,
             heap_node,
         )
+        if lengths:
+            tree_length[settled[0]] = 0.0
+            for s in range(1, n_settled):
+                node = settled[s]
+                edge = pred_edge[node]
+                tree_length[node] = tree_length[edge_tail[edge]] + edge_length[edge]
         row = source_row[a]
         weight_a = source_weight[a]
         access_a = source_access[a]
+        access_m_a = source_access_m[a] if lengths else 0.0
         for b in range(target_nodes.shape[0]):
-            d = dist[target_nodes[b]]
+            node = target_nodes[b]
+            d = dist[node]
             if d < np.inf:
                 t = d + access_a + target_access[b]
                 value = np.exp(-decay_mu * t) if use_decay else t
@@ -377,6 +427,9 @@ def _zone_rows(
                 zone = target_zone[b]
                 numerator[row, zone] += w * value
                 denominator[row, zone] += w
+                if lengths:
+                    metres = tree_length[node] + access_m_a + target_access_m[b]
+                    numerator_m[row, zone] += w * metres
         _reset(dist, touched, n_touched)
     return serial, heap_key, heap_node
 
@@ -386,19 +439,25 @@ def _zone_rows_settled(
     indptr,
     indices,
     weight,
+    edge_tail,
     source_nodes,
     source_access,
+    source_access_m,
     source_weight,
     source_row,
     points_at_node_ptr,
     points_at_node,
     target_access,
+    target_access_m,
     target_weight,
     target_zone,
     limit,
     decay_mu,
     numerator,
     denominator,
+    edge_length,
+    numerator_m,
+    tree_length,
     stamp,
     serial,
     dist,
@@ -415,8 +474,12 @@ def _zone_rows_settled(
     nodes are read through a node -> target points index. That costs at most the search
     again, where marking and scanning every target point costs O(target points) per source
     however little a short search reached.
+
+    ``numerator_m``, ``edge_length`` and ``tree_length`` carry path lengths
+    exactly as in :func:`_zone_rows`.
     """
     use_decay = decay_mu > 0.0
+    lengths = numerator_m.shape[0] > 0
     for a in range(source_nodes.shape[0]):
         serial += 1  # no node carries this stamp, so the search runs to the bound
         n_touched, n_settled, heap_key, heap_node = _search(
@@ -435,9 +498,16 @@ def _zone_rows_settled(
             heap_key,
             heap_node,
         )
+        if lengths:
+            tree_length[settled[0]] = 0.0
+            for s in range(1, n_settled):
+                node = settled[s]
+                edge = pred_edge[node]
+                tree_length[node] = tree_length[edge_tail[edge]] + edge_length[edge]
         row = source_row[a]
         weight_a = source_weight[a]
         access_a = source_access[a]
+        access_m_a = source_access_m[a] if lengths else 0.0
         for s in range(n_settled):
             node = settled[s]
             d = dist[node]
@@ -449,6 +519,9 @@ def _zone_rows_settled(
                 zone = target_zone[b]
                 numerator[row, zone] += w * value
                 denominator[row, zone] += w
+                if lengths:
+                    metres = tree_length[node] + access_m_a + target_access_m[b]
+                    numerator_m[row, zone] += w * metres
         _reset(dist, touched, n_touched)
     return serial, heap_key, heap_node
 
@@ -818,9 +891,11 @@ class _Workspace:
         self.tree_length = np.zeros(n_nodes if lengths else 0, dtype=np.float64)
 
 
-def workspace_bytes(n_nodes: int, n_edges: int, flow: bool = False) -> int:
+def workspace_bytes(
+    n_nodes: int, n_edges: int, flow: bool = False, lengths: bool = False
+) -> int:
     """Roughly what one thread's :class:`_Workspace` costs, for logging."""
-    per_node = 8 + 8 + 4 + 4 + 8 + (8 if flow else 0)
+    per_node = 8 + 8 + 4 + 4 + 8 + (8 if flow else 0) + (8 if lengths else 0)
     return n_nodes * per_node + (n_edges * 8 if flow else 0) + _INITIAL_HEAP * 12
 
 
@@ -920,8 +995,26 @@ def point_matrix(
     workers: int = 1,
     chunk_size: int | None = None,
     progress_every: int = 10,
+    edge_length: np.ndarray | None = None,
+    out_length: np.ndarray | None = None,
 ) -> None:
-    """Fill ``out[i, j]`` with the least cost from ``sources[i]`` to ``targets[j]``."""
+    """
+    Fill ``out[i, j]`` with the least cost from ``sources[i]`` to ``targets[j]``.
+
+    Given ``edge_length`` (per edge) and ``out_length`` (shaped like ``out``),
+    each cell's path length is written there from the same searches: the length
+    of the route the cost chose, inf where the cost is.
+    """
+    lengths = out_length is not None
+    if out_length is not None:
+        if edge_length is None or out_length.shape != out.shape:
+            raise ValueError("out_length needs edge_length and the shape of out.")
+        lengths_per_edge = np.ascontiguousarray(edge_length, dtype=np.float64)
+        lengths_out = out_length
+    else:
+        # Empty stand-ins: the kernel reads their length, not a flag.
+        lengths_per_edge = np.zeros(0, dtype=np.float64)
+        lengths_out = np.zeros((0, 0), dtype=out.dtype)
     sources = np.ascontiguousarray(sources, dtype=np.int32)
     targets = np.ascontiguousarray(targets, dtype=np.int32)
     size = task_size(sources.shape[0], workers, chunk_size)
@@ -933,10 +1026,14 @@ def point_matrix(
             graph.indptr,
             graph.indices,
             graph.weight,
+            graph.edge_tail,
             sources[start : start + size],
             targets,
             bound,
             out[start : start + size],
+            lengths_per_edge,
+            lengths_out[start : start + size],
+            ws.tree_length,
             ws.stamp,
             ws.serial,
             ws.dist,
@@ -947,7 +1044,13 @@ def point_matrix(
             ws.heap_node,
         )
 
-    _run(starts, solve, lambda: _Workspace(graph.n_nodes), workers, progress_every)
+    _run(
+        starts,
+        solve,
+        lambda: _Workspace(graph.n_nodes, lengths=lengths),
+        workers,
+        progress_every,
+    )
 
 
 @dataclass(frozen=True)
@@ -963,6 +1066,9 @@ class AccessPoints:
     node: np.ndarray  # (n_points,)
     access: np.ndarray  # (n_points,) seconds
     weight: np.ndarray  # (n_points,)
+    #: (n_points,) the same access leg in metres. Only needed by a run that
+    #: asks :func:`zone_sums` for path lengths.
+    access_metres: np.ndarray | None = None
 
     @property
     def n_zones(self) -> int:
@@ -979,12 +1085,18 @@ def zone_sums(
     decay_mu: float | None = None,
     workers: int = 1,
     progress_every: int = 10,
+    edge_length: np.ndarray | None = None,
+    numerator_metres: np.ndarray | None = None,
 ) -> None:
     """
     Add every access point's weighted terms into zone-level ``numerator``/``denominator``.
 
     Each task is one ``[lo, hi)`` run of whole zones and writes only those
     zones' rows, so tasks never write the same memory.
+
+    Given ``edge_length`` and a ``numerator_metres`` shaped like ``numerator``,
+    the same pairs' path lengths are summed into it, against the one shared
+    ``denominator``. That needs ``points.access_metres``.
     """
     indptr = np.asarray(points.indptr, dtype=np.int64)
     node = np.ascontiguousarray(points.node, dtype=np.int32)
@@ -993,6 +1105,23 @@ def zone_sums(
     zone = np.repeat(np.arange(points.n_zones, dtype=np.int32), np.diff(indptr))
     bound = _limit(limit)
     mu = 0.0 if decay_mu is None else float(decay_mu)
+
+    lengths = numerator_metres is not None
+    if numerator_metres is not None:
+        if edge_length is None or points.access_metres is None:
+            raise ValueError(
+                "numerator_metres needs edge_length and points.access_metres."
+            )
+        if numerator_metres.shape != numerator.shape:
+            raise ValueError("numerator_metres needs the shape of numerator.")
+        lengths_per_edge = np.ascontiguousarray(edge_length, dtype=np.float64)
+        access_m = np.ascontiguousarray(points.access_metres, dtype=np.float64)
+        metres_out = numerator_metres
+    else:
+        # Empty stand-ins: the kernel reads their length, not a flag.
+        lengths_per_edge = np.zeros(0, dtype=np.float64)
+        access_m = np.zeros(0, dtype=np.float64)
+        metres_out = np.zeros((0, 0), dtype=np.float64)
 
     # A bounded search is read through its settled nodes (see _zone_rows_settled), which
     # needs the points at each node; an unbounded one stops at its last target instead.
@@ -1012,19 +1141,25 @@ def zone_sums(
                 graph.indptr,
                 graph.indices,
                 graph.weight,
+                graph.edge_tail,
                 node[first:last],
                 access[first:last],
+                access_m[first:last],
                 weight[first:last],
                 zone[first:last] - lo,
                 points_at_node_ptr,
                 points_at_node,
                 access,
+                access_m,
                 weight,
                 zone,
                 bound,
                 mu,
                 numerator[lo:hi],
                 denominator[lo:hi],
+                lengths_per_edge,
+                metres_out[lo:hi],
+                ws.tree_length,
                 ws.stamp,
                 ws.serial,
                 ws.dist,
@@ -1039,18 +1174,24 @@ def zone_sums(
             graph.indptr,
             graph.indices,
             graph.weight,
+            graph.edge_tail,
             node[first:last],
             access[first:last],
+            access_m[first:last],
             weight[first:last],
             zone[first:last] - lo,
             node,
             access,
+            access_m,
             weight,
             zone,
             bound,
             mu,
             numerator[lo:hi],
             denominator[lo:hi],
+            lengths_per_edge,
+            metres_out[lo:hi],
+            ws.tree_length,
             ws.stamp,
             ws.serial,
             ws.dist,
@@ -1064,7 +1205,7 @@ def zone_sums(
     _run(
         list(zone_ranges),
         solve,
-        lambda: _Workspace(graph.n_nodes),
+        lambda: _Workspace(graph.n_nodes, lengths=lengths),
         workers,
         progress_every,
     )

@@ -122,11 +122,21 @@ WALK_TRAFFIC_LIGHT_PENALTY_SECONDS = 10
 # path pays stepping onto a signalled crossing. Walking and cycling wait alike:
 # a light does not care who is waiting at it.
 
-#: Wait at a signalled junction, seconds. The average for someone arriving at a
-#: random moment is red**2 / (2 * cycle): with a 90 s cycle and 40 % of it
-#: green for the way you are going, 16 s. One number for every approach and
-#: every crossing: if the road waited longer than a crossing, stepping onto the
-#: crossing and turning onto the road there would be the cheap way in.
+#: Wait at a signalled junction, seconds, by its largest road. The average for
+#: someone arriving at a random moment is red**2 / (2 * cycle): a 100 s cycle
+#: with 35 % of it green for the way you are going waits 21 s on a primary
+#: road, 80 s and 40 % 14 s on a secondary, 70 s and 45 % 11 s on a tertiary,
+#: 60 s and 50 % 7.5 s on a smaller one. One number for every approach and
+#: every crossing of a junction: if the road waited longer than a crossing,
+#: stepping onto the crossing and turning onto the road there would be the
+#: cheap way in.
+PRIMARY_SIGNAL_WAIT_S = 19.0
+SECONDARY_SIGNAL_WAIT_S = 14.0
+TERTIARY_SIGNAL_WAIT_S = 10.0
+MINOR_SIGNAL_WAIT_S = 7.0
+
+#: The same for a layer extracted before junctions had a class: one wait for
+#: them all.
 SIGNAL_WAIT_S = 15.0
 
 #: Wait at a mid-block pedestrian light, seconds: it turns red for the road only
@@ -461,14 +471,19 @@ def _crossing_tags(links: gpd.GeoDataFrame) -> pd.Series:
 
 def signal_waits() -> np.ndarray:
     """
-    Seconds of wait per signal code (signals.NONE, JUNCTION, MIDBLOCK).
+    Seconds of wait per signal code (signals.NONE, JUNCTION, MIDBLOCK and
+    JUNCTION_PRIMARY to JUNCTION_MINOR).
 
     Indexed by code: 2 and 4, from an earlier scheme, wait as JUNCTION. Read
     from the module constants on every call, so a calibration that varies them
     sees the change.
     """
     return np.array(
-        [0.0, SIGNAL_WAIT_S, SIGNAL_WAIT_S, MIDBLOCK_SIGNAL_WAIT_S, SIGNAL_WAIT_S]
+        [
+            0.0, SIGNAL_WAIT_S, SIGNAL_WAIT_S, MIDBLOCK_SIGNAL_WAIT_S, SIGNAL_WAIT_S,
+            PRIMARY_SIGNAL_WAIT_S, SECONDARY_SIGNAL_WAIT_S, TERTIARY_SIGNAL_WAIT_S,
+            MINOR_SIGNAL_WAIT_S,
+        ]
     )
 
 
@@ -477,7 +492,7 @@ def _codes(links: gpd.GeoDataFrame, column: str) -> np.ndarray:
     if column not in links.columns:
         return np.zeros(len(links), dtype=np.int64)
     codes = pd.to_numeric(links[column], errors="coerce").fillna(0).to_numpy(dtype=np.int64)
-    return np.clip(codes, 0, 4)
+    return np.clip(codes, 0, 8)
 
 
 def _signal_flag(links: gpd.GeoDataFrame, column: str) -> pd.Series:

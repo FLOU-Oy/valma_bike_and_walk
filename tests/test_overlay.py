@@ -36,7 +36,7 @@ def test_times_over_the_limit_keep_the_baseline():
     base = np.full((4, 4), 50.0, dtype=np.float32)
     model = np.array([[0.0, 30.0], [400.0, 0.0]], dtype=np.float32)
 
-    result, _ = overlay(BASE_IDS, base, np.array([100, 101]), model, max_minutes=120)
+    result, _ = overlay(BASE_IDS, base, np.array([100, 101]), model, cutoff=120)
 
     assert result[0, 1] == 30.0
     assert result[1, 0] == 50.0

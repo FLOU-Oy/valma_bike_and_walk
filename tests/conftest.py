@@ -20,23 +20,32 @@ from valma_bike_and_walk.network import RoutableNetwork, _build_csr
 from valma_bike_and_walk.zones import Zones
 
 
-def make_network(edges, n_nodes, mode="bike") -> RoutableNetwork:
+def make_network(edges, n_nodes, mode="bike", lengths=None) -> RoutableNetwork:
     """
     A network straight from an edge list, skipping both pipeline stages.
 
     ``edges`` is a list of ``(u, v, seconds)`` over node ids 0..n_nodes-1, laid
     out along the x axis 100 m apart. For tests about routing rather than about
     where the graph came from.
+
+    Link length defaults to the travel time, which keeps the two indistinguishable
+    -- pass ``lengths`` (metres, one per edge) for a test that needs a route that
+    is quickest without being shortest.
     """
     u = np.array([e[0] for e in edges], dtype=np.int64)
     v = np.array([e[1] for e in edges], dtype=np.int64)
     seconds = np.array([e[2] for e in edges], dtype=float)
+    metres = (
+        seconds.astype(np.float32)
+        if lengths is None
+        else np.asarray(lengths, dtype=np.float32)
+    )
 
     indptr, indices, travel_time, length, link_id, direction = _build_csr(
         u,
         v,
         seconds,
-        seconds.astype(np.float32),
+        metres,
         np.arange(len(edges), dtype=np.int64),
         np.ones(len(edges), dtype=np.int8),
         n_nodes,
@@ -113,6 +122,7 @@ def make_zones(
     ids: list | None = None,
     area_m2: list[float] | None = None,
     network: RoutableNetwork | None = None,
+    access_metres_per_zone: list[list[float]] | None = None,
 ) -> Zones:
     """
     Build a :class:`Zones` straight from node lists, skipping :func:`load_zones`.
@@ -120,12 +130,15 @@ def make_zones(
     For tests about the aggregation arithmetic rather than about where the
     access points came from. Weights default to uniform within each zone and
     access time to zero; the representative point of a zone is its first node.
+    ``access_metres_per_zone`` is the same leg in metres, for distance matrices.
     """
     n_zones = len(nodes_per_zone)
     if weights_per_zone is None:
         weights_per_zone = [[1.0 / len(n)] * len(n) for n in nodes_per_zone]
     if access_per_zone is None:
         access_per_zone = [[0.0] * len(n) for n in nodes_per_zone]
+    if access_metres_per_zone is None:
+        access_metres_per_zone = [[0.0] * len(n) for n in nodes_per_zone]
 
     counts = np.array([len(n) for n in nodes_per_zone], dtype=np.int64)
     indptr = np.zeros(n_zones + 1, dtype=np.int64)
@@ -134,6 +147,9 @@ def make_zones(
     node_index = np.array([n for zone in nodes_per_zone for n in zone], dtype=np.int64)
     weight = np.array([w for zone in weights_per_zone for w in zone], dtype=float)
     access = np.array([a for zone in access_per_zone for a in zone], dtype=float)
+    access_m = np.array(
+        [a for zone in access_metres_per_zone for a in zone], dtype=float
+    )
 
     if network is not None:
         x, y = network.x[node_index], network.y[node_index]
@@ -148,6 +164,7 @@ def make_zones(
         node_index=node_index,
         weight=weight,
         access_seconds=access,
+        access_metres=access_m,
         x=x,
         y=y,
         area_m2=np.array(area_m2 if area_m2 is not None else [0.0] * n_zones),
@@ -159,6 +176,7 @@ def make_zones(
             snap_distance=np.zeros(n_zones),
         ),
         representative_access_seconds=np.zeros(n_zones),
+        representative_access_metres=np.zeros(n_zones),
     )
 
 

@@ -37,9 +37,13 @@ back to a single point beyond a few zone radii.
   layer -- building centroids, a population grid converted to points, workplace
   registers -- with an optional column giving each point's weight. This is the
   accurate option when the data exists.
-- the **network itself**, the default. Street density is a serviceable proxy for
-  where people are and needs no extra data source at all: every network node in
-  the zone is a candidate, weighted by the length of link attached to it. Length
+- the **network itself**, the fallback when there is no weights layer. Street
+  density is a serviceable proxy for where people are and needs no extra data
+  source at all: every network node on a street in the zone is a candidate,
+  weighted by the length of street attached to it. Paths do not count -- a
+  park full of footways has nobody living in it -- so a weights layer, where
+  one exists, is always the better choice: building footprints by floor area
+  above all, since they place homes and workplaces alike. Length
   rather than node count matters here, because this project deliberately splits
   links at tag changes as well as at junctions (see the README), so a node count
   measures how finely OSM is tagged as much as how dense the streets are.
@@ -159,11 +163,16 @@ class Zones:
     node_index: np.ndarray  # (n_points,) network node index, always >= 0
     weight: np.ndarray  # (n_points,) sums to 1 within each zone
     access_seconds: np.ndarray  # (n_points,) time to cover the snap distance
+    #: (n_points,) that same access leg in metres -- the snap distance itself,
+    #: and zero wherever ``access_seconds`` is, so a distance matrix charges
+    #: for access exactly when a time matrix does.
+    access_metres: np.ndarray
     x: np.ndarray  # (n_points,) PROJECTED_CRS metres
     y: np.ndarray
     area_m2: np.ndarray  # (n_zones,) 0 for zones given as points
     representative: Centroids  # one point per zone, aligned with ids
     representative_access_seconds: np.ndarray  # (n_zones,)
+    representative_access_metres: np.ndarray  # (n_zones,)
 
     @property
     def n_zones(self) -> int:
@@ -273,20 +282,66 @@ def read_zones(
     exercise, but points are accepted too and behave as one-point zones -- so an
     existing centroid file can be handed to ``--zones`` unchanged, and differs
     from a ``--centroids`` run only in that its snap distance is now charged for.
+
+    **Rows sharing an id are one zone.** A model's zone layer is often a fine
+    grid carrying, as well as its own id, a column naming the coarser analysis
+    zone each cell rolls up into -- one such column per submodel, so the same
+    file serves a detailed run and a coarse one. Naming that column as
+    ``id_column`` dissolves the layer on it, and a zone made of several cells
+    gets its access points placed over all of them.
+
+    Note that such a mapping column is usually 1:1 over the detailed part of
+    the model and many-to-one only outside it. So the grid is a poor
+    ``weights_path`` for its own analysis zones: where a zone *is* one cell it
+    offers exactly one candidate, and the multi-point scheme collapses back to
+    a single centroid precisely where the model is most detailed. Weight with
+    something finer than the zones -- buildings -- or with nothing, and let
+    street length place the points.
+
+    Zones come back in the order their id first appears in the layer, as an
+    ungrouped layer comes back in row order. Rows with no id at all belong to
+    no zone and are dropped, with a warning -- silently routing them into a
+    zone of their own would be worse.
     """
     frame = read_vector(Path(path))
     if frame.crs is None:
         frame = frame.set_crs(crs)
     frame = frame.to_crs(PROJECTED_CRS)
 
-    if id_column is not None:
-        if id_column not in frame.columns:
-            raise ValueError(f"{path} has no id column {id_column!r}.")
-        ids = normalise_ids(frame[id_column].to_numpy())
-    else:
-        ids = np.arange(len(frame))
+    if id_column is None:
+        return np.arange(len(frame)), frame.geometry
+    if id_column not in frame.columns:
+        raise ValueError(f"{path} has no id column {id_column!r}.")
 
-    return ids, frame.geometry
+    unnamed = frame[id_column].isna()
+    if unnamed.any():
+        logger.warning(
+            "%d of %d row(s) in %s have no %r and are in no zone; dropped",
+            int(unnamed.sum()),
+            len(frame),
+            path,
+            id_column,
+        )
+        frame = frame.loc[~unnamed]
+
+    ids = frame[id_column]
+    if not ids.duplicated().any():
+        return normalise_ids(ids.to_numpy()), frame.geometry
+
+    # Dissolving is cheap next to routing (a second or so for a national grid)
+    # and keeps everything downstream working on one geometry per zone: the
+    # point-in-polygon test, the representative point a zone with no candidate
+    # falls back to, and the area the intrazonal estimate is drawn from.
+    geometry_column = frame.geometry.name
+    grouped = frame[[id_column, geometry_column]].dissolve(by=id_column, sort=False)
+    logger.info(
+        "Grouped %d row(s) of %s into %d zone(s) by %r",
+        len(frame),
+        Path(path).name,
+        len(grouped),
+        id_column,
+    )
+    return normalise_ids(grouped.index.to_numpy()), grouped.geometry
 
 
 def read_weight_points(
@@ -351,14 +406,25 @@ def read_weight_points(
 
 def network_node_weights(
     network: RoutableNetwork,
+    streets_only: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Every network node as a candidate demand point, weighted by street length.
+    Every network node on a street as a candidate demand point, weighted by street length.
 
     The zero-extra-data option: street density stands in for population density.
     A node's weight is half the length of link meeting it, counting both the
     edges leaving it and the edges arriving, so a one-way link still contributes
     at both of its ends.
+
+    Only streets count -- roads of every class, service roads and pedestrian
+    streets -- not paths (:data:`valma_bike_and_walk.network.NO_DEMAND_HIGHWAYS`).
+    People live and work along streets; a park or a forest is full of
+    cycleways and footways and has nobody at either end of a trip. Counting
+    them put the access points of central Oulu zones in Hupisaaret park, next
+    to Patosilta. A node with no street at it is no candidate at all. A zone
+    with no street takes its points from every node instead (``streets_only``
+    False; see :func:`load_zones`). A graph saved without the flag counts every
+    edge, as before.
 
     Weighting by length rather than by node count is deliberate. This project
     splits a way wherever its tags change as well as at junctions, so node counts
@@ -369,12 +435,17 @@ def network_node_weights(
     """
     rows = np.repeat(np.arange(network.n_nodes), np.diff(network.indptr))
     length = network.length.astype(np.float64)
+    if streets_only and network.demand_edge is not None:
+        length = length * network.demand_edge
     weight = np.bincount(rows, weights=length, minlength=network.n_nodes)
     weight += np.bincount(network.indices, weights=length, minlength=network.n_nodes)
-    return network.x, network.y, 0.5 * weight
+    on_street = weight > 0
+    return network.x[on_street], network.y[on_street], 0.5 * weight[on_street]
 
 
-def _zone_of_points(x: np.ndarray, y: np.ndarray, geometry: gpd.GeoSeries) -> np.ndarray:
+def _zone_of_points(
+    x: np.ndarray, y: np.ndarray, geometry: gpd.GeoSeries
+) -> np.ndarray:
     """
     Which zone each candidate point falls in; -1 for none.
 
@@ -539,13 +610,17 @@ def _place_access_points(
     candidate_y: np.ndarray,
     candidate_weight: np.ndarray,
     points_per_zone: int,
+    fallback_candidates: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Place each zone's access points. Returns (zone_index, x, y, weight).
 
     Weights come back normalised to sum to 1 within every zone. A zone with no
-    candidate inside it falls back to its own representative point, so no zone is
-    lost for want of a building or a network node.
+    candidate inside it takes its points from ``fallback_candidates`` instead,
+    when given -- the path nodes of a park or campus zone with no street -- and
+    otherwise, or if it has none of those either, falls back to its own
+    representative point, so no zone is lost for want of a building or a
+    network node.
     """
     n_zones = len(geometry)
     zone_of = _zone_of_points(candidate_x, candidate_y, geometry)
@@ -555,6 +630,24 @@ def _place_access_points(
         inside.shape[0],
         zone_of.shape[0],
     )
+
+    counts = np.bincount(zone_of[inside], minlength=n_zones)
+    without = np.flatnonzero(counts == 0)
+    if fallback_candidates is not None and without.size:
+        # Only the zones that came up empty, so the second search is small.
+        fx, fy, fw = fallback_candidates
+        fallback_of = _zone_of_points(fx, fy, geometry.iloc[without])
+        found = fallback_of >= 0
+        logger.info(
+            "%d zone(s) with no street take their points from %d other node(s)",
+            np.unique(fallback_of[found]).size,
+            int(found.sum()),
+        )
+        candidate_x = np.concatenate([candidate_x, fx[found]])
+        candidate_y = np.concatenate([candidate_y, fy[found]])
+        candidate_weight = np.concatenate([candidate_weight, fw[found]])
+        zone_of = np.concatenate([zone_of, without[fallback_of[found]]])
+        inside = np.flatnonzero(zone_of >= 0)
 
     # Group candidates by zone once, so the per-zone loop below is pure slicing.
     inside = inside[np.argsort(zone_of[inside], kind="stable")]
@@ -616,6 +709,7 @@ def _merge_shared_nodes(
     node_index: np.ndarray,
     weight: np.ndarray,
     access: np.ndarray,
+    access_m: np.ndarray,
     x: np.ndarray,
     y: np.ndarray,
 ) -> tuple[np.ndarray, ...]:
@@ -628,11 +722,11 @@ def _merge_shared_nodes(
     point carries the summed weight and the weighted mean of everything else.
     """
     if node_index.size == 0:
-        return zone_index, node_index, weight, access, x, y
+        return zone_index, node_index, weight, access, access_m, x, y
 
     order = np.lexsort((node_index, zone_index))
     zone_index, node_index = zone_index[order], node_index[order]
-    weight, access = weight[order], access[order]
+    weight, access, access_m = weight[order], access[order], access_m[order]
     x, y = x[order], y[order]
 
     key = zone_index * (int(node_index.max()) + 1) + node_index
@@ -640,7 +734,7 @@ def _merge_shared_nodes(
     inverse = np.ravel(inverse)
     n_points = first.shape[0]
     if n_points == key.shape[0]:
-        return zone_index, node_index, weight, access, x, y
+        return zone_index, node_index, weight, access, access_m, x, y
 
     logger.info(
         "Merged %d access point(s) sharing a network node with another in the same zone",
@@ -653,6 +747,7 @@ def _merge_shared_nodes(
         node_index[first],
         merged_weight,
         np.bincount(inverse, weights=weight * access, minlength=n_points) / safe,
+        np.bincount(inverse, weights=weight * access_m, minlength=n_points) / safe,
         np.bincount(inverse, weights=weight * x, minlength=n_points) / safe,
         np.bincount(inverse, weights=weight * y, minlength=n_points) / safe,
     )
@@ -693,6 +788,7 @@ def load_zones(
         raise ValueError(f"{path} holds no zones.")
     logger.info("Read %d zone(s) from %s", n_zones, path)
 
+    fallback = None
     if weights_path is not None:
         candidates = read_weight_points(
             weights_path,
@@ -704,20 +800,31 @@ def load_zones(
         logger.info("Distributing zone demand by %s", Path(weights_path).name)
     else:
         candidates = network_node_weights(network)
-        logger.info("Distributing zone demand by network node density")
+        if network.demand_edge is not None:
+            fallback = network_node_weights(network, streets_only=False)
+        logger.info(
+            "Distributing zone demand by street length (no weights layer given)"
+        )
 
     zone_index, x, y, weight = _place_access_points(
-        geometry, *candidates, points_per_zone=points_per_zone
+        geometry,
+        *candidates,
+        points_per_zone=points_per_zone,
+        fallback_candidates=fallback,
     )
 
     speed_kmh = (
-        access_speed_kmh if access_speed_kmh is not None else profile_for(network.mode).base_kph
+        access_speed_kmh
+        if access_speed_kmh is not None
+        else profile_for(network.mode).base_kph
     )
     if speed_kmh <= 0:
         raise ValueError(f"access_speed_kmh must be positive, got {speed_kmh}.")
     metres_per_second = speed_kmh * (1000.0 / SECONDS_PER_HOUR)
 
-    node_index, snap_distance = network.nearest_nodes(x, y, max_distance=max_snap_distance)
+    node_index, snap_distance = network.nearest_nodes(
+        x, y, max_distance=max_snap_distance
+    )
 
     keep_point = node_index >= 0
     if not keep_point.all():
@@ -775,12 +882,15 @@ def load_zones(
     remap = np.full(n_zones, -1, dtype=np.int64)
     remap[keep_zone] = np.arange(int(keep_zone.sum()))
 
-    access = snap_distance[keep_point] / metres_per_second
-    zone_index, node_index, weight, access, x, y = _merge_shared_nodes(
+    kept = int(keep_point.sum())
+    access_m = snap_distance[keep_point]
+    access = access_m / metres_per_second
+    zone_index, node_index, weight, access, access_m, x, y = _merge_shared_nodes(
         remap[zone_index[keep_point]],
         node_index[keep_point],
         weight[keep_point],
-        access if charge_access_time else np.zeros(int(keep_point.sum())),
+        access if charge_access_time else np.zeros(kept),
+        access_m if charge_access_time else np.zeros(kept),
         x[keep_point],
         y[keep_point],
     )
@@ -798,6 +908,7 @@ def load_zones(
         node_index=node_index.astype(np.int64),
         weight=weight,
         access_seconds=access,
+        access_metres=access_m,
         x=x,
         y=y,
         area_m2=geometry.area.to_numpy(dtype=float)[keep_zone],
@@ -810,6 +921,9 @@ def load_zones(
         ),
         representative_access_seconds=(
             rep_access if charge_access_time else np.zeros(int(keep_zone.sum()))
+        ),
+        representative_access_metres=(
+            rep_distance if charge_access_time else np.zeros(int(keep_zone.sum()))
         ),
     )
 

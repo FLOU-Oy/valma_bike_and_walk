@@ -15,6 +15,7 @@ from valma_bike_and_walk.network import (
     FORMAT_VERSION,
     NetworkFormatError,
     RoutableNetwork,
+    _hilbert_keys,
     hilbert_order,
 )
 
@@ -146,6 +147,56 @@ def test_hilbert_order_is_a_permutation_that_keeps_neighbours_close():
     assert np.array_equal(np.sort(order), np.arange(side * side))
     steps = np.abs(np.diff(cols[order])) + np.abs(np.diff(rows[order]))
     assert steps.max() == 1
+
+
+def _hilbert_key_reference(x: int, y: int, bits: int) -> int:
+    """
+    Scalar Hilbert distance in pure Python, as an oracle for the vectorised one.
+
+    Python ints are arbitrary precision, so this cannot overflow whatever the
+    platform's default integer width is -- which is the whole point of it.
+    """
+    d = 0
+    s = 1 << (bits - 1)
+    side = 1 << bits
+    while s > 0:
+        rx = 1 if (x & s) > 0 else 0
+        ry = 1 if (y & s) > 0 else 0
+        d += s * s * ((3 * rx) ^ ry)
+        if ry == 0:
+            if rx == 1:
+                x, y = side - 1 - x, side - 1 - y
+            x, y = y, x
+        s >>= 1
+    return d
+
+
+def test_hilbert_keys_match_an_arbitrary_precision_reference():
+    """
+    Guards an overflow that only numpy 1 could show.
+
+    At ``bits=16`` the top level computes ``32768 * 32768 * 3``, past int32.
+    ``3 * rx`` on a bool array takes the platform's default integer, which is
+    int32 on Windows under numpy 1 and int64 under numpy 2 -- so the wrap, and
+    the scrambled node order it caused, was invisible on a numpy 2 machine.
+    Comparing against Python ints catches it on either.
+    """
+    bits = 16
+    rng = np.random.default_rng(0)
+    corners = [(0, 0), (0, (1 << bits) - 1), ((1 << bits) - 1, 0),
+               ((1 << bits) - 1, (1 << bits) - 1)]  # fmt: skip
+    sample = corners + list(
+        map(tuple, rng.integers(0, 1 << bits, size=(200, 2)).tolist())
+    )
+    ix = np.array([p[0] for p in sample], dtype=np.int64)
+    iy = np.array([p[1] for p in sample], dtype=np.int64)
+
+    keys = _hilbert_keys(ix, iy, bits)
+    expected = [_hilbert_key_reference(x, y, bits) for x, y in sample]
+
+    assert keys.dtype == np.int64
+    assert max(expected) > np.iinfo(np.int32).max  # the test would be toothless otherwise
+    np.testing.assert_array_equal(keys, expected)
 
 
 def test_graph_from_another_format_is_refused(tmp_path):

@@ -5,7 +5,16 @@ import pytest
 
 from valma_bike_and_walk import links as links_module
 from valma_bike_and_walk.links import normalise, signal_waits
-from valma_bike_and_walk.signals import JUNCTION, MIDBLOCK, NONE, signal_codes
+from valma_bike_and_walk.signals import (
+    JUNCTION,
+    JUNCTION_MINOR,
+    JUNCTION_PRIMARY,
+    JUNCTION_SECONDARY,
+    JUNCTION_TERTIARY,
+    MIDBLOCK,
+    NONE,
+    signal_codes,
+)
 
 from .conftest import links_frame, write_pbf
 
@@ -67,18 +76,29 @@ def crossroads():
 
 def test_driving_through_a_junction_pays_once():
     c = crossroads()
-    assert route(c, 1, 2, 3, 4, 5) == [JUNCTION]  # stop line, centre, far crossing
-    assert route(c, 5, 4, 3, 2, 1) == [JUNCTION]
-    assert route(c, 6, 11, 7, 3, 4, 5) == [JUNCTION]  # in from the side road
-    assert c[(1, 2)]["entry"] == JUNCTION and c[(4, 5)]["entry"] == NONE
+    assert route(c, 1, 2, 3, 4, 5) == [JUNCTION_SECONDARY]  # stop line, centre, far crossing
+    assert route(c, 5, 4, 3, 2, 1) == [JUNCTION_SECONDARY]
+    assert route(c, 6, 11, 7, 3, 4, 5) == [JUNCTION_SECONDARY]  # in from the side road
+    assert c[(1, 2)]["entry"] == JUNCTION_SECONDARY and c[(4, 5)]["entry"] == NONE
 
 
 def test_crossing_on_a_path_pays_once_either_way():
     c = crossroads()
-    assert route(c, 9, 4, 10) == [JUNCTION] and route(c, 10, 4, 9) == [JUNCTION]
-    assert route(c, 12, 11, 13) == [JUNCTION] and route(c, 13, 11, 12) == [JUNCTION]
+    assert route(c, 9, 4, 10) == [JUNCTION_SECONDARY] and route(c, 10, 4, 9) == [JUNCTION_SECONDARY]
+    assert route(c, 12, 11, 13) == [JUNCTION_SECONDARY] and route(c, 13, 11, 12) == [JUNCTION_SECONDARY]
     # Paid on the way onto the crossing, not off it.
-    assert c[(9, 4)]["cross_end"] == JUNCTION and c[(4, 10)]["cross_end"] == NONE
+    assert c[(9, 4)]["cross_end"] == JUNCTION_SECONDARY and c[(4, 10)]["cross_end"] == NONE
+
+
+def test_a_junction_waits_by_its_largest_road():
+    """The side road's own crossing pays the main road's class."""
+    c = crossroads()
+    assert route(c, 12, 11, 13) == [JUNCTION_SECONDARY]
+    for main, code in (("primary", JUNCTION_PRIMARY), ("tertiary", JUNCTION_TERTIARY),
+                       ("residential", JUNCTION_MINOR)):
+        links = [(a, b, main if h == "secondary" else h) for a, b, h in LINKS]
+        c = codes_for(NODES, links, [2, 4, 7, 11], [2, 7])
+        assert route(c, 1, 2, 3, 4, 5) == [code] and route(c, 12, 11, 13) == [code]
 
 
 def test_a_right_turn_on_the_sidewalk_is_free():
@@ -116,24 +136,24 @@ def divided(crossings=()):
 
 def test_a_crossing_over_a_divided_road_is_one_wait():
     c = divided()
-    assert route(c, 33, 31, 32, 34) == [JUNCTION]
-    assert route(c, 34, 32, 31, 33) == [JUNCTION]
+    assert route(c, 33, 31, 32, 34) == [JUNCTION_PRIMARY]
+    assert route(c, 34, 32, 31, 33) == [JUNCTION_PRIMARY]
 
 
 def test_joining_the_road_inside_the_junction_pays_as_the_road_does():
     c = divided()
     # Cycleway in, then the side road through: the same one wait as the side road.
-    assert route(c, 36, 37, 35, 30, 2, 1) == [JUNCTION]
-    assert route(c, 7, 35, 30, 2, 1) == [JUNCTION]
+    assert route(c, 36, 37, 35, 30, 2, 1) == [JUNCTION_PRIMARY]
+    assert route(c, 7, 35, 30, 2, 1) == [JUNCTION_PRIMARY]
     # Onto the crossing, then off it onto the main road: one wait too.
-    assert route(c, 33, 31, 30, 2, 1) == [JUNCTION]
+    assert route(c, 33, 31, 30, 2, 1) == [JUNCTION_PRIMARY]
     # A service road reaching the main road inside the junction.
-    assert route(c, 42, 43, 41, 32, 4) == [JUNCTION]
+    assert route(c, 42, 43, 41, 32, 4) == [JUNCTION_PRIMARY]
 
 
 def test_leaving_the_road_inside_the_junction_is_free():
     c = divided()
-    assert route(c, 3, 31, 30, 35, 37, 36) == [JUNCTION]  # paid entering on the road
+    assert route(c, 3, 31, 30, 35, 37, 36) == [JUNCTION_PRIMARY]  # paid entering on the road
 
 
 def test_a_path_reaching_the_road_at_an_unsignalled_crossing_crosses_it():
@@ -164,19 +184,19 @@ def across(crossings=()):
 
 def test_a_path_over_untagged_carriageway_nodes_pays_once():
     c = across()
-    assert route(c, 24, 21, 22, 25) == [JUNCTION]
-    assert route(c, 25, 22, 21, 24) == [JUNCTION]
+    assert route(c, 24, 21, 22, 25) == [JUNCTION_SECONDARY]
+    assert route(c, 25, 22, 21, 24) == [JUNCTION_SECONDARY]
 
 
 def test_a_path_off_a_signalled_crossing_onto_the_road_pays_once():
     c = across()
-    assert route(c, 27, 26, 28, 29, 30) == [JUNCTION]
-    assert route(c, 30, 29, 28, 26, 27) == [JUNCTION]
+    assert route(c, 27, 26, 28, 29, 30) == [JUNCTION_SECONDARY]
+    assert route(c, 30, 29, 28, 26, 27) == [JUNCTION_SECONDARY]
 
 
 def test_a_zebra_is_no_free_way_onto_the_junction_roads():
     c = across(crossings=[21])
-    assert route(c, 24, 21, 22, 25) == [JUNCTION]
+    assert route(c, 24, 21, 22, 25) == [JUNCTION_SECONDARY]
 
 
 # Mid-block pedestrian lights, far from any junction. Road 20-21-22 with a
@@ -226,6 +246,11 @@ def test_waits_by_code():
     waits = signal_waits()
     assert waits[NONE] == 0
     assert waits[JUNCTION] == links_module.SIGNAL_WAIT_S
+    assert waits[JUNCTION_PRIMARY] == links_module.PRIMARY_SIGNAL_WAIT_S
+    assert waits[JUNCTION_SECONDARY] == links_module.SECONDARY_SIGNAL_WAIT_S
+    assert waits[JUNCTION_TERTIARY] == links_module.TERTIARY_SIGNAL_WAIT_S
+    assert waits[JUNCTION_MINOR] == links_module.MINOR_SIGNAL_WAIT_S
+    assert waits[JUNCTION_PRIMARY] > waits[JUNCTION_SECONDARY] > waits[JUNCTION_TERTIARY]
     assert waits[MIDBLOCK] == links_module.MIDBLOCK_SIGNAL_WAIT_S
 
 
@@ -269,10 +294,10 @@ def test_extract_writes_the_codes(tmp_path):
     pbf = write_pbf(tmp_path / "junction.osm.pbf", nodes, ways, node_tags=tags)
     settings = Settings(pbf_path=pbf, cache_dir=tmp_path / "cache", output_dir=tmp_path)
     links = read_links(settings, "bike").set_index(["u", "v"])
-    assert links.loc[(1, 2), "signal_entry"] == JUNCTION
+    assert links.loc[(1, 2), "signal_entry"] == JUNCTION_SECONDARY
     assert links.loc[(3, 4), "signal_entry"] == NONE
-    assert links.loc[(6, 7), "signal_entry"] == JUNCTION
-    assert links.loc[(9, 4), "signal_cross_end"] == JUNCTION
+    assert links.loc[(6, 7), "signal_entry"] == JUNCTION_SECONDARY
+    assert links.loc[(9, 4), "signal_cross_end"] == JUNCTION_SECONDARY
     assert links.loc[(9, 4), "signal_entry"] == NONE
     assert links.loc[(4, 10), "signal_cross_end"] == NONE
 
@@ -325,14 +350,14 @@ def test_crossing_the_side_street_on_the_path_stays_free():
 
 def test_stepping_off_the_path_onto_the_junction_roads_pays_once():
     c, twin = split_side()
-    assert route(c, 8, twin, 7, 3, 4, 5) == [JUNCTION]
-    assert route(c, 9, twin, 7, 3, 2, 1) == [JUNCTION]
+    assert route(c, 8, twin, 7, 3, 4, 5) == [JUNCTION_SECONDARY]
+    assert route(c, 9, twin, 7, 3, 2, 1) == [JUNCTION_SECONDARY]
 
 
 def test_leaving_the_road_onto_the_path_pays_only_the_road_entry():
     c, twin = split_side()
-    assert route(c, 6, 7, twin, 9) == [JUNCTION]  # the side road entering
-    assert route(c, 1, 2, 3, 7, twin, 8) == [JUNCTION]
+    assert route(c, 6, 7, twin, 9) == [JUNCTION_SECONDARY]  # the side road entering
+    assert route(c, 1, 2, 3, 7, twin, 8) == [JUNCTION_SECONDARY]
 
 
 def test_a_crossing_outside_any_junction_is_not_split():
@@ -372,7 +397,7 @@ def test_extract_splits_the_crossing_and_writes_the_connector(tmp_path):
     assert len(connector) == 1
     twin = int(connector["u"].iloc[0])
     assert twin < 0 and int(connector["v"].iloc[0]) == 7
-    assert connector["signal_entry"].iloc[0] == JUNCTION       # path -> road pays
+    assert connector["signal_entry"].iloc[0] == JUNCTION_SECONDARY       # path -> road pays
     assert connector["signal_entry_reverse"].iloc[0] == NONE   # road -> path is free
     cycle = links[links["highway"] == "cycleway"]
     assert set(cycle["u"]).union(cycle["v"]) == {8, 9, twin}

@@ -65,8 +65,8 @@ of) — via explicit, reviewable profiles in [`speeds.py`](src/valma_bike_and_wa
 | | walking | cycling |
 |---|---|---|
 | baseline | 4.8 km/h | 14 km/h |
-| cycleway (shared or untagged) | 4.8 km/h | 18 km/h |
-| segregated cycleway (`segregated=yes`) | 4.8 km/h | 18.9 km/h (×1.05) |
+| cycleway (segregated or untagged) | 4.8 km/h | 18 km/h |
+| shared cycleway (`segregated=no`) | 4.8 km/h | 17.1 km/h (×0.95) |
 | forest path | 4.3 km/h | 11 km/h |
 | steps | 1.2 km/h | 1.2 km/h (pushing) |
 | mud vs asphalt | ×0.70 | ×0.40 |
@@ -209,6 +209,45 @@ centroid ids are not integers, which OMX cannot hold; use
 `--omx-matrix-name`/`--omx-mapping-name` to change the matrix/lookup names
 inside it (defaults: `--mode`, `zone_number`).
 
+### Distances as well as times
+
+`--distance` measures how far each of those routes actually is:
+
+```bash
+valma matrix --links output/bike_links.gpkg --mode bike \
+             --zones taz.gpkg --id-column zone_id --distance
+```
+
+The distance is measured **along the route the travel time chose** — the link
+lengths summed down the same shortest-path tree — not by searching again for
+the shortest route by length. On a bike network those are routinely different
+routes: the travel time prices slope, surface, road class and traffic (see
+"Speeds come from the way" above), so the quickest way round is often the long
+way round. Measuring both on one route is the point. A demand model handed a
+time from one route and a distance from another would infer a speed nobody
+rides at, and the two would disagree about which trips are short.
+
+It costs one extra pass over each search's settled nodes and one float64 array
+per worker thread — about 10 % more wall clock on a 90 000-node grid, both for
+a point matrix and a bounded zone matrix — which is why it is a flag rather
+than always on. The times are bit-for-bit what the same run produces without
+it.
+
+Output goes beside the times, in the units each file already uses:
+
+- `travel_times_<mode>.npz` gains a `metres` array next to `seconds`, same
+  `ids`, same shape. Unreachable pairs are `inf` in both.
+- `travel_distances_<mode>.omx` holds the same matrix in **kilometres**, with
+  a `units` attribute saying so — the distance counterpart of
+  `travel_times_<mode>.omx` in minutes.
+
+With `--zones`, distances go through the whole zone machinery exactly as times
+do: the weighted mean over access-point pairs, access legs charged in metres at
+both ends, self-pairs dropped from the diagonal, the two-tier near/far
+stitching, and the equal-area-circle fallback for a diagonal routing could not
+produce. Which tier a cell came from is decided once, by the time matrix, so
+the two always describe the same journey.
+
 ### Filling a full zone system from a baseline
 
 `valma matrix` only has times for zones that snapped to the network and pairs
@@ -229,6 +268,21 @@ model's time when both zones were routed and the time is finite (and, with
 `--max-minutes`, no longer than that); otherwise it keeps the baseline. The
 model's times are read from `<output-dir>/travel_times_<mode>.npz` (`--model`
 to name another). Zones only in the model are ignored.
+
+`--quantity distance` lays the distances of a `--distance` run over a baseline
+*distance* matrix the same way. Both sides are in kilometres, so there is no
+speed conversion — `--baseline-speed-kmh` is refused — and `--max-km` is the
+cutoff instead of `--max-minutes`. A model system wanting both skims runs the
+overlay twice, once per quantity, against its own time and distance baselines:
+
+```bash
+valma matrix  --mode bike -c scenarios/bike.toml --distance
+valma overlay --mode bike --baseline data/time_vrk.omx --baseline-matrix bike \
+              --max-minutes 120 --out output/skim_time_vrk.omx
+valma overlay --mode bike --quantity distance \
+              --baseline data/dist_vrk.omx --baseline-matrix bike \
+              --out output/skim_dist_vrk.omx
+```
 
 ### Editing the link layer
 
@@ -386,7 +440,7 @@ zones = load_zones(
     network,
     "taz.gpkg",
     id_column="zone_id",
-    weights_path="population_grid.gpkg",   # omit to use network node density
+    weights_path="population_grid.gpkg",   # omit to use street length
     weight_column="population",
     points_per_zone=8,
 )
@@ -527,6 +581,41 @@ Points are accepted too, so an existing centroid file works unchanged; a
 one-point zone is just the single-centroid method with the snap distance
 charged for.
 
+### Rolling a grid up into analysis zones
+
+**Rows sharing an id are one zone.** A model's zone layer is often a fine grid
+that carries, besides its own cell id, one column per submodel naming the
+coarser analysis zone each cell belongs to — so the same file describes a
+detailed run and a coarse one. Name that column and the layer is dissolved on
+it:
+
+```bash
+# The grid's own cells, one zone each
+valma matrix --zones zonedata.gpkg --id-column input_zone_id ...
+
+# The same file routed at the analysis zones of one submodel
+valma matrix --zones zonedata.gpkg --id-column uusimaa ...
+```
+
+A zone made of several cells gets its access points placed over all of them,
+its area summed over all of them, and — if its cells are not adjacent — a
+representative point on one of them rather than in the gap between. Zones come
+back in the order their id first appears in the layer, as an ungrouped layer
+comes back in row order. Rows with no id at all are dropped with a warning
+rather than becoming a zone of their own. Dissolving a national grid costs
+about a second, and nothing happens at all when the ids are already unique.
+
+**Where the weights should come from is a separate question, and the grid is
+usually the wrong answer.** It is tempting to hand the same file to `--weights`
+with a population column, but a mapping column is typically 1:1 across the
+detailed part of the model — in one national zonedata, `uusimaa` is 2 987
+single-cell zones and only 51 multi-cell ones. Where a zone *is* one cell, the
+grid offers it exactly one candidate point, and multi-point placement collapses
+to the single-centroid method precisely where the model is most detailed. Use a
+layer finer than the analysis zones — building footprints by floor area, best
+of all — or give no `--weights` at all and let street length place the points
+(see below). Check with `--zone-points-gpkg` either way.
+
 ### How wrong is one point, and where
 
 Write a trip as running from `c_i + u` to `c_j + v`, with `c` the zone centroids
@@ -557,14 +646,26 @@ paying for multiple points over long distances buys nothing.
 
 | `--weights` | what it uses | when |
 |---|---|---|
-| *not given* | **network node density** — every node in the zone, weighted by the length of link meeting it | the default; needs no extra data at all |
-| a point or polygon layer | those points, optionally sized by `--weight-column` | buildings, address points, a population or workplace grid as points |
+| a point or polygon layer | those points, optionally sized by `--weight-column` | **always preferred when there is one**: buildings (best, sized by floor area), address points, a population or workplace grid as points |
+| *not given* | **street length** — every node on a street in the zone, weighted by the length of street meeting it | the fallback; needs no extra data at all |
 
-Street density is a fair proxy for where people are, which is what makes the
-no-extra-data default usable rather than a placeholder. Weighting by *length*
-rather than by node count is deliberate: this project splits links at tag
-changes as well as at junctions, so a node count would partly measure how finely
-OSM has been tagged.
+A weights layer always wins when given. Building footprints sized by floor area
+are the best of them: they place homes and workplaces alike, so a residential
+block and a hypermarket in the same zone each get their own share. A population
+grid places residents only.
+
+Without one, street density is a fair proxy for where people are, which is what
+makes the fallback usable rather than a placeholder. Only streets count: roads of
+every class, service roads (car parks included) and pedestrian streets. Paths —
+cycleways, footways, paths, tracks, steps — and connectors do not. A park full of
+footways would otherwise weigh as much as a block of flats: in central Oulu,
+60 % of one zone's weight came from the paths of Hupisaaret park, and its
+access points sat next to Patosilta. A zone with no street at all (a park, a
+campus, an island) takes its points from its path nodes instead, and one with no
+node of any kind falls back to its own representative point. Weighting by
+*length* rather than by node count is deliberate: this project splits links at
+tag changes as well as at junctions, so a node count would partly measure how
+finely OSM has been tagged.
 
 However many candidates a zone has, they are reduced to `--points-per-zone` by
 laying a grid over the zone, coarsening it until at most that many cells are
@@ -1120,9 +1221,21 @@ Where it differs from cycling, and why:
     junction and joining the road there does not pass the light for free. A
     path reaching the road at a crossing node is crossing it, not joining it.
 
-  Every one of these is the same wait, `SIGNAL_WAIT_S` (16 s, the average for
-  a random arrival with 40 % green over a 90 s cycle), so no way in is cheaper
-  than another. A mid-block pedestrian light — signalled crossings with no road
+  Every one of these is the same wait, so no way in is cheaper than another.
+  The wait goes by the junction's largest road, not by the road a crossing
+  goes over (which would make the side street's crossing a cheap way onto the
+  main road). The waits start from the average for a random arrival,
+  red² / (2 × cycle), and were tuned a little below it:
+
+  | Largest road | Cycle, green | Random-arrival average | Constant | Wait |
+  |---|---|---|---|---|
+  | trunk, primary | 100 s, 35 % | 21 s | `PRIMARY_SIGNAL_WAIT_S` | 19 s |
+  | secondary | 80 s, 40 % | 14 s | `SECONDARY_SIGNAL_WAIT_S` | 14 s |
+  | tertiary | 70 s, 45 % | 11 s | `TERTIARY_SIGNAL_WAIT_S` | 10 s |
+  | unclassified, residential | 60 s, 50 % | 7.5 s | `MINOR_SIGNAL_WAIT_S` | 7 s |
+
+  A layer extracted before the classes has one wait for every junction,
+  `SIGNAL_WAIT_S` (15 s). A mid-block pedestrian light — signalled crossings with no road
   light and no side road — costs `MIDBLOCK_SIGNAL_WAIT_S` (8 s), once to the
   road passing it and once to someone crossing; a sidewalk running past it is
   free. The constants are read at routing time, so they can be tuned (and are,

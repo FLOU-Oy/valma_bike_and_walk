@@ -15,13 +15,29 @@ Two entry points, differing in what a row of the result means:
   back to zone level with those weights. See that module for why one point per
   zone gets short trips wrong, and :func:`zone_travel_time_matrix` for how the
   two-tier scheme keeps the cost of fixing it close to the single-point one.
+
+**Distances.** Both entry points take ``return_distance=True`` and then return
+``(seconds, metres)``. The distance is measured *along the route the time
+matrix chose*, by summing ``network.length`` down the same shortest-path tree,
+not by searching again for the shortest route by length. Those are different
+routes whenever the network weights anything but length -- which, for a bike,
+is always: :mod:`valma_bike_and_walk.speeds` prices slope, surface, road class
+and traffic into the travel time, so the quickest way round is routinely the
+long way round. A pair of matrices describing one journey is what a demand
+model needs; a time from one route and a distance from another would put a
+speed in the model that nobody rides at.
+
+Distances cost one extra pass over each search's settled nodes and one float64
+array per worker thread, so they are opt-in rather than always on. They are in
+metres, as ``network.length`` is; the CLI converts to kilometres on the way out
+to OMX, exactly as it converts seconds to minutes.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Sequence
+from typing import Sequence, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -48,9 +64,29 @@ _REACHABLE_TOLERANCE = 1e-9
 #: "equal-area circle" intrazonal estimate.
 _DISC_MEAN_DISTANCE = 128.0 / (45.0 * np.pi)
 
+#: What a matrix function returns: one array, or a (seconds, metres) pair when
+#: it was asked for distances as well.
+Skims = Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]
 
-def _log_workspace(network: RoutableNetwork, workers: int, flow: bool = False) -> None:
-    per_thread = routing.workspace_bytes(network.n_nodes, network.n_edges, flow=flow)
+
+def _unpack(result: Skims, distance: bool) -> tuple[np.ndarray, np.ndarray | None]:
+    """A matrix function's return, always as ``(values, metres or None)``."""
+    if distance:
+        assert isinstance(result, tuple)
+        return result
+    assert not isinstance(result, tuple)
+    return result, None
+
+
+def _log_workspace(
+    network: RoutableNetwork,
+    workers: int,
+    flow: bool = False,
+    lengths: bool = False,
+) -> None:
+    per_thread = routing.workspace_bytes(
+        network.n_nodes, network.n_edges, flow=flow, lengths=lengths
+    )
     logger.info(
         "Routing scratch space: %.0f MB per worker, %.1f GB for %d worker(s)",
         per_thread / 1e6,
@@ -68,7 +104,8 @@ def travel_time_matrix(
     chunk_size: int | None = None,
     dtype: npt.DTypeLike = np.float32,
     progress_every: int = 10,
-) -> np.ndarray:
+    return_distance: bool = False,
+) -> Skims:
     """
     Travel time in seconds from every source node to every target node.
 
@@ -81,15 +118,19 @@ def travel_time_matrix(
       to speed the whole thing up, if your analysis has a cutoff anyway.
     - workers: threads to spread the sources over.
     - chunk_size: sources per task handed to a thread; sized automatically.
+    - return_distance: also return how long each of those routes is, in metres.
 
     Returns an ``(len(sources), len(targets))`` array; unreachable pairs are inf.
+    With ``return_distance`` it returns ``(seconds, metres)``, the second array
+    measuring the very route the first one timed; see the module docstring.
     """
     sources = np.asarray(sources, dtype=np.int64)
     targets = sources if targets is None else np.asarray(targets, dtype=np.int64)
     dtype = np.dtype(dtype)
 
     if sources.size == 0 or targets.size == 0:
-        return np.empty((sources.size, targets.size), dtype=dtype)
+        empty = np.empty((sources.size, targets.size), dtype=dtype)
+        return (empty, empty.copy()) if return_distance else empty
     if sources.min() < 0 or targets.min() < 0:
         raise ValueError(
             "Source and target indices must be non-negative; unsnapped points must be filtered out first."
@@ -98,15 +139,17 @@ def travel_time_matrix(
         raise ValueError("Node index out of range for this network.")
 
     logger.info(
-        "OD matrix %d x %d over %d nodes, %d worker(s)",
+        "OD matrix %d x %d over %d nodes, %d worker(s)%s",
         sources.size,
         targets.size,
         network.n_nodes,
         workers,
+        ", with distances" if return_distance else "",
     )
-    _log_workspace(network, workers)
+    _log_workspace(network, workers, lengths=return_distance)
 
     result = np.empty((sources.size, targets.size), dtype=dtype)
+    metres = np.empty_like(result) if return_distance else None
     routing.point_matrix(
         network.routing_graph(),
         sources,
@@ -116,8 +159,13 @@ def travel_time_matrix(
         workers=workers,
         chunk_size=chunk_size,
         progress_every=progress_every,
+        edge_length=network.length if return_distance else None,
+        out_length=metres,
     )
-    return result
+    if not return_distance:
+        return result
+    assert metres is not None  # allocated together with return_distance
+    return result, metres
 
 
 def _accumulate_zone_matrix(
@@ -128,7 +176,8 @@ def _accumulate_zone_matrix(
     workers: int,
     chunk_size: int | None,
     progress_every: int,
-) -> tuple[np.ndarray, np.ndarray]:
+    distance: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
     """
     Run every zone's access points as sources and sum their weighted terms.
 
@@ -136,16 +185,20 @@ def _accumulate_zone_matrix(
     ``(n_zones, n_zones)``, rather than the mean itself: the denominator *is*
     the weight of the access-point pairs that came back inside the cutoff,
     which is what the reachability bookkeeping needs.
+
+    With ``distance`` a second numerator comes back, in metres, over the same
+    pairs and against the same denominator.
     """
     n = zones.n_zones
     numerator = np.zeros((n, n), dtype=np.float64)
     denominator = np.zeros((n, n), dtype=np.float64)
+    numerator_m = np.zeros((n, n), dtype=np.float64) if distance else None
 
     points_per_task = routing.task_size(zones.n_points, workers, chunk_size)
     ranges = list(zones.chunk_ranges(points_per_task))
     logger.info(
         "Zone OD matrix %d x %d from %d access point(s) over %d nodes: "
-        "%d chunks of <=%d points, %d worker(s)",
+        "%d chunks of <=%d points, %d worker(s)%s",
         n,
         n,
         zones.n_points,
@@ -153,8 +206,9 @@ def _accumulate_zone_matrix(
         len(ranges),
         points_per_task,
         workers,
+        ", with distances" if distance else "",
     )
-    _log_workspace(network, workers)
+    _log_workspace(network, workers, lengths=distance)
 
     routing.zone_sums(
         network.routing_graph(),
@@ -163,6 +217,7 @@ def _accumulate_zone_matrix(
             node=zones.node_index,
             access=zones.access_seconds,
             weight=zones.weight,
+            access_metres=zones.access_metres,
         ),
         ranges,
         numerator,
@@ -171,8 +226,10 @@ def _accumulate_zone_matrix(
         decay_mu=decay_mu,
         workers=workers,
         progress_every=progress_every,
+        edge_length=network.length if distance else None,
+        numerator_metres=numerator_m,
     )
-    return numerator, denominator
+    return numerator, denominator, numerator_m
 
 
 def _drop_self_pairs(
@@ -180,6 +237,7 @@ def _drop_self_pairs(
     denominator: np.ndarray,
     zones: Zones,
     decay_mu: float | None,
+    numerator_m: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     Remove the a==b terms from the intrazonal cells, and say what full weight is.
@@ -207,7 +265,25 @@ def _drop_self_pairs(
     numerator[diagonal, diagonal] -= self_numerator
     denominator[diagonal, diagonal] -= self_weight
     full[diagonal, diagonal] -= self_weight
+
+    if numerator_m is not None:
+        # The same pair, measured the other way: out to the network and back.
+        self_metres = 2.0 * zones.access_metres
+        numerator_m[diagonal, diagonal] -= np.add.reduceat(
+            zones.weight**2 * self_metres, zones.indptr[:-1]
+        )
     return full
+
+
+def _intrazonal_fallback_metres(zones: Zones) -> np.ndarray:
+    """
+    Crow-flies intrazonal distance from the zone's area: ``128 R / (45 pi)``.
+
+    The estimate :func:`_intrazonal_fallback` is built from, and the right
+    fallback for a distance matrix in its own right. See that function for why
+    it is used at all and why only where routing came back with nothing.
+    """
+    return _DISC_MEAN_DISTANCE * zones.equivalent_radius_m()
 
 
 def _intrazonal_fallback(network: RoutableNetwork, zones: Zones) -> np.ndarray:
@@ -228,7 +304,7 @@ def _intrazonal_fallback(network: RoutableNetwork, zones: Zones) -> np.ndarray:
     finding that out is the whole reason for placing points by weight.
     """
     speed_ms = profile_for(network.mode).base_kph * (1000.0 / SECONDS_PER_HOUR)
-    return _DISC_MEAN_DISTANCE * zones.equivalent_radius_m() / speed_ms
+    return _intrazonal_fallback_metres(zones) / speed_ms
 
 
 def multipoint_travel_time_matrix(
@@ -242,7 +318,8 @@ def multipoint_travel_time_matrix(
     chunk_size: int | None = None,
     dtype: npt.DTypeLike = np.float32,
     progress_every: int = 10,
-) -> np.ndarray:
+    return_distance: bool = False,
+) -> Skims:
     """
     Zone-to-zone travel time, averaged over every pair of weighted access points.
 
@@ -262,20 +339,32 @@ def multipoint_travel_time_matrix(
       None for a matrix meant to be read as minutes.
     - exclude_self_pairs: drop the "trip" from an access point to itself when
       averaging the diagonal. See :func:`_drop_self_pairs`.
+    - return_distance: also return the weighted mean distance in metres, over
+      the same pairs, never decayed. See the module docstring.
 
     Returns an ``(n_zones, n_zones)`` array in ``zones.ids`` order; cells with
     too little reachable weight are inf, exactly as unreachable pairs are in
-    :func:`travel_time_matrix`.
+    :func:`travel_time_matrix`. With ``return_distance``, ``(seconds, metres)``
+    with the same cells inf in both.
     """
+    dtype = np.dtype(dtype)
     if zones.n_zones == 0:
-        return np.empty((0, 0), dtype=np.dtype(dtype))
+        empty = np.empty((0, 0), dtype=dtype)
+        return (empty, empty.copy()) if return_distance else empty
 
-    numerator, denominator = _accumulate_zone_matrix(
-        network, zones, max_seconds, decay_mu, workers, chunk_size, progress_every
+    numerator, denominator, numerator_m = _accumulate_zone_matrix(
+        network,
+        zones,
+        max_seconds,
+        decay_mu,
+        workers,
+        chunk_size,
+        progress_every,
+        distance=return_distance,
     )
 
     if exclude_self_pairs:
-        full = _drop_self_pairs(numerator, denominator, zones, decay_mu)
+        full = _drop_self_pairs(numerator, denominator, zones, decay_mu, numerator_m)
     else:
         full = np.ones(numerator.shape, dtype=np.float64)
 
@@ -284,13 +373,20 @@ def multipoint_travel_time_matrix(
         usable = (denominator > 0) & (
             fraction >= min_reachable_fraction - _REACHABLE_TOLERANCE
         )
-        mean = np.where(usable, numerator / np.where(usable, denominator, 1.0), np.inf)
+        safe = np.where(usable, denominator, 1.0)
+        mean = np.where(usable, numerator / safe, np.inf)
         if decay_mu is not None:
             mean = np.where(
                 usable, -np.log(np.maximum(mean, 1e-300)) / decay_mu, np.inf
             )
+        seconds = np.ascontiguousarray(mean, dtype=dtype)
+        if not return_distance:
+            return seconds
+        # Same pairs, same weights, same reachability verdict -- so the only
+        # thing that differs from the time above is what was summed.
+        metres = np.where(usable, numerator_m / safe, np.inf)
 
-    return np.ascontiguousarray(mean, dtype=np.dtype(dtype))
+    return seconds, np.ascontiguousarray(metres, dtype=dtype)
 
 
 def zone_travel_time_matrix(
@@ -306,7 +402,8 @@ def zone_travel_time_matrix(
     chunk_size: int | None = None,
     dtype: npt.DTypeLike = np.float32,
     progress_every: int = 10,
-) -> np.ndarray:
+    return_distance: bool = False,
+) -> Skims:
     """
     Zone-to-zone travel time, multi-point where it matters and single-point where it does not.
 
@@ -340,12 +437,18 @@ def zone_travel_time_matrix(
     ``intrazonal_fallback`` fills any diagonal cell the multi-point pass could
     not produce with the equal-area-circle estimate; see
     :func:`_intrazonal_fallback`.
+
+    ``return_distance`` carries a distance matrix through all of the above --
+    both tiers, the stitching and the intrazonal fallback -- and returns
+    ``(seconds, metres)``. Which tier a cell came from is decided once, by the
+    time matrix, so the two always describe the same journey.
     """
     dtype = np.dtype(dtype)
     if zones.n_zones == 0:
-        return np.empty((0, 0), dtype=dtype)
+        empty = np.empty((0, 0), dtype=dtype)
+        return (empty, empty.copy()) if return_distance else empty
 
-    near = multipoint_travel_time_matrix(
+    near_result = multipoint_travel_time_matrix(
         network,
         zones,
         max_seconds=max_seconds if near_seconds is None else near_seconds,
@@ -358,7 +461,9 @@ def zone_travel_time_matrix(
         chunk_size=chunk_size,
         dtype=dtype,
         progress_every=progress_every,
+        return_distance=return_distance,
     )
+    near, near_m = _unpack(near_result, return_distance)
     resolved = np.isfinite(near)
 
     # Whether the *diagonal* is trustworthy is a separate question from whether
@@ -370,13 +475,13 @@ def zone_travel_time_matrix(
     routed_diagonal = resolved[diagonal, diagonal]
 
     if near_seconds is None:
-        result = near
+        result, result_m = near, near_m
     else:
         logger.info(
             "Near tier: multi-point within %.0f s; far tier: one point per zone",
             near_seconds,
         )
-        far = travel_time_matrix(
+        far_result = travel_time_matrix(
             network,
             zones.representative.node_index,
             max_seconds=max_seconds,
@@ -384,7 +489,9 @@ def zone_travel_time_matrix(
             chunk_size=chunk_size,
             dtype=dtype,
             progress_every=progress_every,
+            return_distance=return_distance,
         )
+        far, far_m = _unpack(far_result, return_distance)
         access = zones.representative_access_seconds.astype(dtype)
         far = far + access[:, None] + access[None, :]
 
@@ -394,6 +501,12 @@ def zone_travel_time_matrix(
             100.0 * float(resolved.mean()),
         )
         result = np.where(resolved, near, far).astype(dtype)
+        result_m = None
+        if return_distance:
+            assert near_m is not None and far_m is not None
+            access_m = zones.representative_access_metres.astype(dtype)
+            far_m = far_m + access_m[:, None] + access_m[None, :]
+            result_m = np.where(resolved, near_m, far_m).astype(dtype)
 
     if intrazonal_fallback and not routed_diagonal.all():
         logger.info(
@@ -407,8 +520,18 @@ def zone_travel_time_matrix(
             result[diagonal, diagonal],
             _intrazonal_fallback(network, zones).astype(dtype),
         )
+        if return_distance:
+            assert result_m is not None
+            result_m[diagonal, diagonal] = np.where(
+                routed_diagonal,
+                result_m[diagonal, diagonal],
+                _intrazonal_fallback_metres(zones).astype(dtype),
+            )
 
-    return result
+    if not return_distance:
+        return result
+    assert result_m is not None  # carried alongside result throughout
+    return result, result_m
 
 
 def default_workers() -> int:
@@ -416,21 +539,31 @@ def default_workers() -> int:
     return max(1, (os.cpu_count() or 2) - 2)
 
 
-def summarise(matrix: np.ndarray) -> dict[str, float]:
+def _summarise(matrix: np.ndarray, unit: str, per_unit: float) -> dict[str, float]:
     """Quick sanity statistics for an OD matrix, ignoring unreachable pairs."""
     finite = np.isfinite(matrix)
     reachable = matrix[finite]
-    off_diagonal = reachable[reachable > 0]
+    positive = reachable[reachable > 0]
     return {
         "pairs": float(matrix.size),
         "reachable_fraction": float(finite.mean()),
-        "min_minutes": (
-            float(off_diagonal.min() / 60) if off_diagonal.size else float("nan")
+        f"min_{unit}": (
+            float(positive.min() / per_unit) if positive.size else float("nan")
         ),
-        "median_minutes": (
-            float(np.median(off_diagonal) / 60) if off_diagonal.size else float("nan")
+        f"median_{unit}": (
+            float(np.median(positive) / per_unit) if positive.size else float("nan")
         ),
-        "max_minutes": (
-            float(off_diagonal.max() / 60) if off_diagonal.size else float("nan")
+        f"max_{unit}": (
+            float(positive.max() / per_unit) if positive.size else float("nan")
         ),
     }
+
+
+def summarise(matrix: np.ndarray) -> dict[str, float]:
+    """Quick sanity statistics for a matrix of seconds, reported in minutes."""
+    return _summarise(matrix, "minutes", 60.0)
+
+
+def summarise_metres(matrix: np.ndarray) -> dict[str, float]:
+    """Quick sanity statistics for a matrix of metres, reported in kilometres."""
+    return _summarise(matrix, "km", 1000.0)

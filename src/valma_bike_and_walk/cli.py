@@ -19,6 +19,11 @@ The pipeline is two stages, and the GeoPackage between them is the point:
   valma assign  --links output/bike_links.gpkg --mode bike --centroids points.csv \\
                 --demand od.csv --gpkg
 
+`matrix --distance` measures how far each routed journey is as well as how
+long it takes, along the same route, and writes it as `metres` in the .npz and
+in km to `travel_distances_<mode>.omx`. `overlay --quantity distance` lays
+those over a distance baseline.
+
 `matrix` and `assign` route between zones given either way round. `--centroids`
 takes one point per zone, the classic method. `--zones` takes polygons instead
 and spreads each zone's trip ends over several weighted points inside it, which
@@ -121,6 +126,7 @@ from valma_bike_and_walk.gpkg import write_edges_gpkg
 from valma_bike_and_walk.matrix import (
     default_workers,
     summarise,
+    summarise_metres,
     travel_time_matrix,
     zone_travel_time_matrix,
 )
@@ -134,7 +140,12 @@ from valma_bike_and_walk.network import (
 )
 from valma_bike_and_walk.osm import resolve_clip
 from valma_bike_and_walk.speeds import profile_for
-from valma_bike_and_walk.overlay import overlay, read_model_minutes, read_omx_dense
+from valma_bike_and_walk.overlay import (
+    overlay,
+    read_model_km,
+    read_model_minutes,
+    read_omx_dense,
+)
 from valma_bike_and_walk.traffic import (
     DEFAULT_ADJACENT_DISTANCE_M,
     DEFAULT_MAX_ANGLE_DEG,
@@ -480,20 +491,30 @@ def cmd_overlay(args: argparse.Namespace) -> int:
     base_ids, base = read_omx_dense(
         args.baseline, args.baseline_matrix, args.baseline_mapping
     )
-    speed_kmh = args.baseline_speed_kmh
-    if speed_kmh is _MODE_BASE_SPEED:
-        # Converted at the same pace the model walks or rides at, so a cell
-        # does not change just for having come from the baseline.
-        speed_kmh = profile_for(args.mode).base_kph
-    if speed_kmh is not None:
-        # A distance matrix, in km: turn it into minutes at a fixed speed.
-        logger.info("Baseline taken as km, at %g km/h", speed_kmh)
-        base *= np.float32(60.0 / speed_kmh)
-    model_ids, model = read_model_minutes(model_path)
+    distance = args.quantity == "distance"
+    if distance:
+        if args.baseline_speed_kmh is not None:
+            raise SystemExit(
+                "--baseline-speed-kmh turns a distance baseline into minutes, "
+                "which a --quantity distance overlay has no use for: both "
+                "matrices are already in km."
+            )
+        units, cutoff = "kilometers", args.max_km
+        model_ids, model = read_model_km(model_path)
+    else:
+        speed_kmh = args.baseline_speed_kmh
+        if speed_kmh is _MODE_BASE_SPEED:
+            # Converted at the same pace the model walks or rides at, so a cell
+            # does not change just for having come from the baseline.
+            speed_kmh = profile_for(args.mode).base_kph
+        if speed_kmh is not None:
+            # A distance matrix, in km: turn it into minutes at a fixed speed.
+            logger.info("Baseline taken as km, at %g km/h", speed_kmh)
+            base *= np.float32(60.0 / speed_kmh)
+        units, cutoff = "minutes", args.max_minutes
+        model_ids, model = read_model_minutes(model_path)
 
-    result, replaced = overlay(
-        base_ids, base, model_ids, model, max_minutes=args.max_minutes
-    )
+    result, replaced = overlay(base_ids, base, model_ids, model, cutoff=cutoff)
     name = args.matrix_name or args.mode
     write_omx_matrix(
         args.out,
@@ -501,11 +522,11 @@ def cmd_overlay(args: argparse.Namespace) -> int:
         result,
         matrix_name=name,
         mapping_name=args.baseline_mapping,
-        units="minutes",
+        units=units,
         append=True,
     )
     print(
-        f"Wrote {name!r} to {args.out} ({result.shape[0]}x{result.shape[1]}, minutes)"
+        f"Wrote {name!r} to {args.out} ({result.shape[0]}x{result.shape[1]}, {units})"
     )
     print(
         f"  {replaced:,} of {result.size:,} cells ({replaced / result.size:.1%}) "
@@ -718,62 +739,96 @@ def cmd_matrix(args: argparse.Namespace) -> int:
 
     max_seconds = args.max_minutes * 60 if args.max_minutes else None
     if isinstance(points, Zones):
-        matrix = zone_travel_time_matrix(
+        result = zone_travel_time_matrix(
             network,
             points,
             max_seconds=max_seconds,
             near_seconds=args.near_minutes * 60 if args.near_minutes else None,
             workers=args.workers,
             chunk_size=args.chunk_size,
+            return_distance=args.distance,
         )
     else:
-        matrix = travel_time_matrix(
+        result = travel_time_matrix(
             network,
             points.node_index,
             max_seconds=max_seconds,
             workers=args.workers,
             chunk_size=args.chunk_size,
+            return_distance=args.distance,
         )
+    matrix, metres = result if args.distance else (result, None)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     out = args.output_dir / f"travel_times_{args.mode}.npz"
-    np.savez_compressed(out, ids=points.ids, seconds=matrix)
+    arrays = {"ids": points.ids, "seconds": matrix}
+    if metres is not None:
+        # Alongside the times rather than in a file of its own: the two come
+        # from one set of searches, share one set of ids, and describe one
+        # journey each. `valma overlay --quantity distance` reads it back.
+        arrays["metres"] = metres
+    np.savez_compressed(out, **arrays)
     print(
-        f"Wrote {out} ({matrix.shape[0]}x{matrix.shape[1]}, "
+        f"Wrote {out} ({matrix.shape[0]}x{matrix.shape[1]}"
+        f"{', times and distances' if metres is not None else ''}, "
         f"{out.stat().st_size / 1e6:.1f} MB)"
     )
 
-    omx_out = (
-        args.output_dir / f"travel_times_{args.mode}.omx"
-        if args.omx is None or args.omx is _OMX_DEFAULT_PATH
-        else args.omx
-    )
-    omx_out.parent.mkdir(parents=True, exist_ok=True)
+    named = args.omx is not None and args.omx is not _OMX_DEFAULT_PATH
+    omx_out = args.omx if named else args.output_dir / f"travel_times_{args.mode}.omx"
+    # Minutes and kilometres, unlike the .npz: the OMX goes to other modelling
+    # tools, and that is what they expect of a time and a distance matrix.
+    _write_matrix_omx(args, omx_out, points.ids, matrix / 60.0, "minutes")
+    if metres is not None:
+        # A file of its own rather than a second matrix beside the times: that
+        # is how a model system keeps its skims (time_vrk.omx, dist_vrk.omx),
+        # and it lets the matrix inside keep the mode's own name in both.
+        distance_out = (
+            omx_out.with_stem(f"{omx_out.stem}_dist")
+            if named
+            else args.output_dir / f"travel_distances_{args.mode}.omx"
+        )
+        _write_matrix_omx(args, distance_out, points.ids, metres / 1000.0, "kilometers")
+
+    stats = summarise(matrix)
+    if metres is not None:
+        # Same pairs and the same reachability, so only the distances are new.
+        stats.update(
+            {k: v for k, v in summarise_metres(metres).items() if k.endswith("_km")}
+        )
+    for key, value in stats.items():
+        print(f"  {key}: {value:,.3f}")
+    return 0
+
+
+def _write_matrix_omx(
+    args: argparse.Namespace,
+    path: Path,
+    ids: np.ndarray,
+    values: np.ndarray,
+    units: str,
+) -> None:
+    """One OMX from ``valma matrix``, skipped rather than fatal when unasked for."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        # Minutes, unlike the .npz: the OMX goes to other modelling tools,
-        # and minutes is what they expect of a travel-time matrix.
         write_omx_matrix(
-            omx_out,
-            points.ids,
-            matrix / 60.0,
+            path,
+            ids,
+            values,
             matrix_name=args.omx_matrix_name or args.mode,
             mapping_name=args.omx_mapping_name,
-            units="minutes",
+            units=units,
         )
     except ValueError as exc:
         # Written by default, so ids OMX cannot hold only fail a run that asked.
         if args.omx is not None:
             raise
-        logger.info("Not writing %s: %s", omx_out, exc)
+        logger.info("Not writing %s: %s", path, exc)
     else:
         print(
-            f"Wrote {omx_out} ({matrix.shape[0]}x{matrix.shape[1]}, "
-            f"{omx_out.stat().st_size / 1e6:.1f} MB)"
+            f"Wrote {path} ({values.shape[0]}x{values.shape[1]}, {units}, "
+            f"{path.stat().st_size / 1e6:.1f} MB)"
         )
-
-    for key, value in summarise(matrix).items():
-        print(f"  {key}: {value:,.3f}")
-    return 0
 
 
 def _assign_demand(args: argparse.Namespace, points: Centroids | Zones):
@@ -1025,7 +1080,11 @@ def cmd_view(args: argparse.Namespace) -> int:
         )
         print(f"  municipalities: {len(data.municipalities.names)}")
         share_demand = args.share_demand
-        if share_demand is None and args.demand is not None and args.demand.suffix == ".omx":
+        if (
+            share_demand is None
+            and args.demand is not None
+            and args.demand.suffix == ".omx"
+        ):
             share_demand = args.demand
         if share_demand is not None:
             from valma_bike_and_walk.viewer.municipalities import load_trip_shares
@@ -1040,7 +1099,10 @@ def cmd_view(args: argparse.Namespace) -> int:
                 args.municipality_column,
                 cache,
             )
-            share = data.municipalities.mode_trips.sum() / data.municipalities.all_trips.sum()
+            share = (
+                data.municipalities.mode_trips.sum()
+                / data.municipalities.all_trips.sum()
+            )
             print(f"  {mode} share of trips: {share:.1%} (from {share_demand.name})")
         from valma_bike_and_walk.viewer.trip_lengths import (
             TripLengthGroups,
@@ -1122,15 +1184,23 @@ def _counter_flows(
     from valma_bike_and_walk.viewer.select import CounterFlows, SelectSetup
 
     if args.centroids is None:
-        raise SystemExit("valma view --demand needs --centroids, as assign was run with.")
+        raise SystemExit(
+            "valma view --demand needs --centroids, as assign was run with."
+        )
     argv = _view_assign_argv(args, mode)
     assign_args = build_parser().parse_args(argv)
 
     points = _analysis_points(assign_args, network)
     demand = _assign_demand(assign_args, points)
-    description = " ".join(argv[1:]) + " | " + " ".join(
-        cache_key(Path(p)) for p in (args.links, args.demand, args.centroids)
-    ) + " | impedance " + hashlib.sha1(network.travel_time.tobytes()).hexdigest()
+    description = (
+        " ".join(argv[1:])
+        + " | "
+        + " ".join(
+            cache_key(Path(p)) for p in (args.links, args.demand, args.centroids)
+        )
+        + " | impedance "
+        + hashlib.sha1(network.travel_time.tobytes()).hexdigest()
+    )
     setup = SelectSetup(
         network=network,
         zone_ids=np.asarray(points.ids),
@@ -1165,7 +1235,15 @@ def _add_routing(parser: argparse.ArgumentParser) -> None:
             "realistic and lets intrazonal demand load onto the network."
         ),
     )
-    parser.add_argument("--id-column")
+    parser.add_argument(
+        "--id-column",
+        help=(
+            "Column holding each row's zone id. With --zones, rows sharing an "
+            "id are dissolved into one zone, so a model's fine grid can be "
+            "routed at the coarser analysis zones a mapping column names "
+            "-- one such column per submodel."
+        ),
+    )
     parser.add_argument("--x-column", default="lon")
     parser.add_argument("--y-column", default="lat")
     parser.add_argument(
@@ -1181,10 +1259,11 @@ def _add_routing(parser: argparse.ArgumentParser) -> None:
         type=Path,
         help=(
             "With --zones: point or polygon layer saying where demand actually "
-            "sits -- buildings, address points, a population grid as points. "
-            "Without it, the network's own nodes are used, weighted by street "
-            "length, which needs no extra data and is a fair proxy for where "
-            "people are."
+            "sits -- buildings (best, with floor area as --weight-column), "
+            "address points, a population grid as points. Always used when "
+            "given. Without it, the network's street nodes are used, weighted "
+            "by street length (paths left out), which needs no extra data and "
+            "is a fair proxy for where people are."
         ),
     )
     parser.add_argument(
@@ -1379,6 +1458,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     overlay_parser.add_argument(
+        "--quantity",
+        choices=("time", "distance"),
+        default="time",
+        help=(
+            "Which of the routed matrix's two quantities to lay over the "
+            "baseline (default: %(default)s). 'distance' needs a run of "
+            "'valma matrix --distance' and a baseline in km, and writes km; "
+            "a model wanting both skims runs this twice, once each, against "
+            "its own time and distance baselines."
+        ),
+    )
+    overlay_parser.add_argument(
         "--baseline",
         type=Path,
         required=True,
@@ -1408,6 +1499,11 @@ def build_parser() -> argparse.ArgumentParser:
             "Keep the baseline where the model's time is longer than this -- "
             "e.g. trips that only route across a slow island connector."
         ),
+    )
+    overlay_parser.add_argument(
+        "--max-km",
+        type=float,
+        help="--max-minutes for a --quantity distance overlay, in kilometres.",
     )
     overlay_parser.add_argument(
         "--out",
@@ -1635,6 +1731,19 @@ def build_parser() -> argparse.ArgumentParser:
             "roughly the square of its cutoff, so this recovers nearly all of "
             "the accuracy for a fraction of the multi-point cost. Aim for "
             "five or so zone radii."
+        ),
+    )
+    matrix.add_argument(
+        "--distance",
+        action="store_true",
+        help=(
+            "Also measure how long each of those routes is. The distance "
+            "follows the route the travel time chose, not the shortest route "
+            "by length -- a bike's quickest way round is routinely the long "
+            "way round -- so the two matrices describe one journey and divide "
+            "into a speed somebody could actually ride. Costs one extra pass "
+            "per search. Written as 'metres' in the .npz and, in kilometres, "
+            "to <output-dir>/travel_distances_<mode>.omx."
         ),
     )
     matrix.add_argument(

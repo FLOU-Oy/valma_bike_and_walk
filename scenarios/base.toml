@@ -95,6 +95,7 @@ assignment_results = "../data/assignment_results_koko_suomi.gpkg"
 
 [matrix]
 max_minutes = 60.0
+# distance = true                       # also measure each route's length
 # omx = true                            # also write <output_dir>/<scenario>/... .omx
 # omx_matrix_name = "bike"
 
@@ -110,6 +111,8 @@ max_minutes = 60.0
 # baseline = "../data/baseline.omx"
 # baseline_matrix = "bike"
 # baseline_speed_kmh = true             # baseline in km, at the mode's base speed
+# quantity = "distance"                 # lay distances over a km baseline instead
+# max_km = 40.0                         # max_minutes for a distance overlay
 
 [view]
 # count_lines = "../data/count_lines.gpkg"

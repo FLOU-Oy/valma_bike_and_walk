@@ -52,18 +52,34 @@ def read_omx_dense(
     return ids, matrix
 
 
-def read_model_minutes(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    """(ids, minutes) from a ``travel_times_<mode>.npz`` written by ``valma matrix``."""
+def _read_model(path: Path, key: str, per_unit: float) -> tuple[np.ndarray, np.ndarray]:
+    """(ids, values) from a ``travel_times_<mode>.npz`` written by ``valma matrix``."""
     with np.load(path) as data:
+        if key not in data:
+            raise ValueError(
+                f"{path} has no {key!r} array; it holds {sorted(data)}. Rerun "
+                "`valma matrix` with --distance to measure distances as well "
+                "as times."
+            )
         ids = data["ids"]
-        minutes = data["seconds"].astype(np.float32) / np.float32(60.0)
+        values = data[key].astype(np.float32) / np.float32(per_unit)
     try:
         ids = ids.astype(np.int64)
     except ValueError as exc:
         raise ValueError(
             f"{path} has non-integer zone ids; they cannot be matched to an OMX lookup."
         ) from exc
-    return ids, minutes
+    return ids, values
+
+
+def read_model_minutes(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """(ids, minutes) from a ``travel_times_<mode>.npz`` written by ``valma matrix``."""
+    return _read_model(path, "seconds", 60.0)
+
+
+def read_model_km(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """(ids, km) from the ``metres`` of a ``valma matrix --distance`` run."""
+    return _read_model(path, "metres", 1000.0)
 
 
 def overlay(
@@ -71,7 +87,7 @@ def overlay(
     base: np.ndarray,
     model_ids: np.ndarray,
     model: np.ndarray,
-    max_minutes: float | None = None,
+    cutoff: float | None = None,
 ) -> tuple[np.ndarray, int]:
     """
     ``base`` with ``model``'s values written over it wherever they apply.
@@ -79,6 +95,10 @@ def overlay(
     Returns the new matrix, in ``base_ids`` order and shape, and the number of
     cells replaced. ``base`` is not modified. Model zones missing from
     ``base_ids`` are ignored -- the baseline defines the zone system.
+
+    ``cutoff`` keeps the baseline wherever the model's value exceeds it, in
+    whatever unit both matrices are in: minutes for a time overlay, kilometres
+    for a distance one.
     """
     base_ids = np.asarray(base_ids)
     model_ids = np.asarray(model_ids)
@@ -99,8 +119,8 @@ def overlay(
     rows = order[pos[found]]
     sub_model = model[np.ix_(found, found)]
     use = np.isfinite(sub_model)
-    if max_minutes is not None:
-        use &= sub_model <= max_minutes
+    if cutoff is not None:
+        use &= sub_model <= cutoff
 
     result = np.array(base, dtype=np.float32, copy=True)
     block = result[np.ix_(rows, rows)]
