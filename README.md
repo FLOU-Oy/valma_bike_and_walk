@@ -460,6 +460,41 @@ is no `if __name__ == "__main__":` ceremony to observe. The first run on a
 machine spends a few seconds compiling the routing kernels; the compiled code is
 cached, so later runs start straight away.
 
+### From VALMA
+
+[`valma_bike_and_walk.valma`](src/valma_bike_and_walk/valma.py) is the whole
+interface the VALMA model system calls, in process (see
+[docs/emme-deployment.md](docs/emme-deployment.md) for installing into EMME's
+Python). VALMA turns it on with `--bike-and-walk-config DIR` (or
+`BIKE_AND_WALK_CONFIG` in its `dev-config.json`); without it, VALMA runs as it
+always has and never imports this package. What VALMA does with it:
+
+```python
+from valma_bike_and_walk import valma as bw
+
+setup = bw.Setup(
+    config_dir=args.bike_and_walk_config,   # walk.toml, bike.toml
+    zone_data_file=args.zone_data_file,     # VALMA's zone data ...
+    submodel=args.submodel,                 # ... and the column naming its zones
+    output_dir=results / "bike_and_walk",
+)
+
+# Once, after EMME's pt walk and bike skims: ours wherever we routed,
+# EMME's everywhere else, in VALMA's zone order, minutes and km.
+pt = bw.skims(setup, zone_numbers, {"time": {...}, "dist": {...}})
+
+# Once, at the end, on the demand VALMA has written.
+volumes = bw.assign(setup, {"aht": demand_aht_omx, "vrk": demand_vrk_omx})
+```
+
+The settings files hold everything about the network and routing; VALMA's
+zone data and submodel always override the zones they name, so the two zone
+systems cannot disagree. Each mode's `[overlay]` `max_minutes` and `max_km`
+decide how far our values replace EMME's. Set them to cover the model's own
+distance bounds (walk 10 km and bike 20 km of beeline, plus detours), or longer
+trips will mix the two sources. Intrazonal distances are ours too: VALMA keeps
+a positive skim diagonal and uses its zone data only where EMME left 0.
+
 ## Settings files and scenarios
 
 Any option can be written in a TOML file instead of on the command line, named
