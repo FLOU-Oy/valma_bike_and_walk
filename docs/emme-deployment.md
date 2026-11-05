@@ -84,16 +84,46 @@ Do **not** use `pip install --user`: EMME puts
 `AppData\Roaming\Python\Python311\site-packages` first on `sys.path`, and it is
 shared with any other Python 3.11 on the machine.
 
+**The per-user folder is on the venv's path too, ahead of EMME's packages.** A
+`--system-site-packages` venv reads the venv first, then
+`AppData\Roaming\Python\Python311\site-packages`, then EMME's. Anything the venv
+lacks is taken from the per-user folder if it is there, whatever version it
+holds, and that folder differs per Windows user and per machine. Found
+2026-11-05: geopandas, openpyxl and et_xmlfile came only from there, and its
+shapely 2.1.0 and pyproj 3.7.1 shadowed EMME's 2.0.1 and 3.5.0. So give the
+venv everything the package imports, at EMME's versions where EMME has them:
+
+```powershell
+& $PY -m pip install --no-deps --ignore-installed `
+    geopandas==1.0.1 pyogrio==0.10.0 openpyxl==3.1.4 et_xmlfile==2.0.0 `
+    shapely==2.0.1 pyproj==3.5.0
+```
+
+pyogrio is what makes reading a national link layer take a minute: without it
+geopandas falls back to EMME's fiona, which reads row by row and took 21
+minutes for the 4.3 million walk links. It carries its own GDAL (3.9.1, beside
+fiona's 3.6.4); the two have run in one process with EMME throughout testing
+without trouble. `--no-deps` keeps it from moving EMME's numpy or `packaging`.
+
+`--ignore-installed` makes pip install into the venv even though it can see a
+copy elsewhere. Check with `& $PY -I -c "import valma_bike_and_walk.valma"`:
+`-I` leaves the per-user folder out, so it fails if anything still comes from
+there.
+
+For development, `& $PY -m pip install --no-deps -e C:\valma-bw\valma_bike_and_walk`
+makes the venv follow the working copy instead of a snapshot.
+
 ## Known traps
 
 - **`pip install pytest` moves `packaging`.** pytest 9 wants a newer
   `packaging` than EMME's 23.1 and will shadow it in the venv. Harmless in
   itself (pure Python), but pin `packaging==23.1` and use `pytest<9` if you
   want the venv to mirror production exactly.
-- **pip installs duplicate `pyproj` and `shapely` into the venv** even though
-  EMME provides them at the pinned versions. Two GDAL/PROJ stacks in one
-  process is worth avoiding; install `geopandas` with `--no-deps` so it uses
-  EMME's fiona rather than pulling `pyogrio`, a third GDAL.
+- **`pyproj` and `shapely` belong in the venv, at EMME's versions.** Removing
+  the venv's copies so EMME's are used looks tidier, but it lets the per-user
+  folder's copies win instead (see above). Install `geopandas` with
+  `--no-deps`, and `pyogrio` explicitly, so nothing pulls in newer numpy or
+  `packaging` along the way.
 - **numpy 1 vs 2 differences are invisible on a developer machine.** See
   below; this cost a day.
 
