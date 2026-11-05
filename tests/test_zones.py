@@ -124,7 +124,7 @@ def test_reduce_points_reaches_k_when_candidates_are_clustered(net, tmp_path):
     w = np.ones(40)
 
     for k in (2, 4, 8, 16):
-        rx, _, _ = _reduce_points(x, y, w, k)
+        rx, _, _, _ = _reduce_points(x, y, w, k)
         assert rx.shape[0] == k, f"k={k} gave {rx.shape[0]} point(s)"
         # Both clusters keep representation rather than one swallowing the grid.
         assert (rx < 1000).any() and (rx > 9000).any()
@@ -299,7 +299,7 @@ def test_reduce_points_preserves_the_weighted_centroid():
     w = rng.uniform(0.1, 10, 500)
 
     for k in (1, 4, 16):
-        rx, ry, rw = _reduce_points(x, y, w, k)
+        rx, ry, rw, _ = _reduce_points(x, y, w, k)
         assert rx.shape[0] <= k
         assert rw.sum() == pytest.approx(w.sum())
         assert (rw * rx).sum() == pytest.approx((w * x).sum())

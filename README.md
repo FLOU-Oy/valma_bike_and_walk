@@ -243,7 +243,7 @@ Output goes beside the times, in the units each file already uses:
 
 With `--zones`, distances go through the whole zone machinery exactly as times
 do: the weighted mean over access-point pairs, access legs charged in metres at
-both ends, self-pairs dropped from the diagonal, the two-tier near/far
+both ends, within-cell trips priced on the diagonal, the two-tier near/far
 stitching, and the equal-area-circle fallback for a diagonal routing could not
 produce. Which tier a cell came from is decided once, by the time matrix, so
 the two always describe the same journey.
@@ -766,12 +766,24 @@ and dropped with a warning, exactly as in a single-tier run.
   (default: the mode's base speed); `--no-access-time` restores the old
   behaviour.
 - **Intrazonal demand is assigned.** Zone `i`'s own demand is spread over the
-  ordered pairs of its access points, excluding the pair from a point to itself
-  and renormalising so the total is preserved. A zone with only one access point
-  still has nowhere to put it; that is reported, not silently dropped.
-- **The intrazonal travel time is a real number**, averaged over distinct point
-  pairs. Where routing cannot produce one — a single-point zone, or a zone the
-  near tier did not cover — it falls back to the equal-area circle,
+  ordered pairs of its access points. The share between two people in the
+  *same* point's cell (`w²` of it) is a real, short trip, but both its ends are
+  one node, so it is counted and logged rather than loaded — never moved onto
+  the longer paths between cells. A point that stands for a single candidate
+  has no cell to speak of; its share is spread over the other pairs instead,
+  so the total is preserved. A zone with only one such point still has nowhere
+  to put it; that is reported, not silently dropped.
+- **The intrazonal travel time is a real number**, averaged over every pair of
+  people in the zone. Pairs in different cells are routed between their access
+  points. A pair in the same cell cannot be routed, so it is priced from how
+  spread out that cell's candidates were: each access point remembers the
+  radius `r = √(2(σx² + σy²))` of the uniform disc with the same weighted
+  spread, and a trip inside it costs `1.3 · 0.9054 · r` (the disc's mean
+  separation, times a typical short-trip detour) plus the access legs, at the
+  mode's base speed. `--zone-points-gpkg` writes `cell_radius_m` and
+  `intracell_m` for each point. Where routing cannot produce a value at all — a
+  zone whose one point is a single candidate, or a zone the near tier did not
+  cover — it falls back to the equal-area circle,
   `0.9054 · R / v` for `R = √(area/π)`. That is a crow-flies estimate, not a
   routed answer, and it is only ever used to *fill* a missing value, never to
   overrule one: a zone whose demand really does sit in one corner has genuinely

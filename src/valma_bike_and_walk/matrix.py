@@ -45,7 +45,7 @@ import numpy.typing as npt
 from valma_bike_and_walk import routing
 from valma_bike_and_walk.network import RoutableNetwork
 from valma_bike_and_walk.speeds import SECONDS_PER_HOUR, profile_for
-from valma_bike_and_walk.zones import Zones
+from valma_bike_and_walk.zones import DISC_MEAN_DISTANCE, Zones
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +60,8 @@ DEFAULT_NEAR_REACHABLE_FRACTION = 1.0
 _REACHABLE_TOLERANCE = 1e-9
 
 #: Mean distance between two points drawn uniformly from a disc of radius R,
-#: as a multiple of R: 128 / (45 * pi). The classic closed form behind the
-#: "equal-area circle" intrazonal estimate.
-_DISC_MEAN_DISTANCE = 128.0 / (45.0 * np.pi)
+#: as a multiple of R: 128 / (45 * pi). See :data:`zones.DISC_MEAN_DISTANCE`.
+_DISC_MEAN_DISTANCE = DISC_MEAN_DISTANCE
 
 #: What a matrix function returns: one array, or a (seconds, metres) pair when
 #: it was asked for distances as well.
@@ -232,45 +231,67 @@ def _accumulate_zone_matrix(
     return numerator, denominator, numerator_m
 
 
-def _drop_self_pairs(
+def _price_self_pairs(
     numerator: np.ndarray,
     denominator: np.ndarray,
     zones: Zones,
     decay_mu: float | None,
+    speed_ms: float,
     numerator_m: np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    Remove the a==b terms from the intrazonal cells, and say what full weight is.
+    Give the a==b terms of the intrazonal cells their real length, or drop them.
 
-    A zone's own diagonal picks up one "trip" per access point that never leaves
-    it. Those are an artefact of discretising a continuous zone -- two people
-    drawn independently from the same zone coincide with probability zero in
-    reality -- and they drag the intrazonal time down by a factor that depends
-    on nothing but K. Subtracting them from both numerator and denominator
-    leaves the weighted mean over genuinely distinct point pairs.
+    A zone's own diagonal picks up one "pair" per access point with itself, and
+    routing prices it at nothing but the access legs: out to the node and back.
+    It is not that. The pair stands for two people in the same access point's
+    cell -- the shortest intrazonal trips there are, but trips -- and leaving it
+    at the access legs drags the intrazonal value down by a factor that depends
+    on K, while dropping it and renormalising (what this used to do) hands its
+    weight to the longer between-cell pairs and drags it up.
+
+    So a point with a cell to measure (``cell_radius_m > 0``) has its a==b pair
+    priced at :meth:`Zones.intracell_metres` on top of the access legs, at the
+    mode's base speed for time, and keeps its weight. A point standing for a
+    single candidate has no spread to price; its pair is removed from numerator
+    and denominator as before, which is what leaves a one-candidate zone with no
+    routed diagonal and so to the equal-area circle.
 
     Returns the full (unreachable-free) denominator each cell is measured
-    against: 1 everywhere, less the self weight on the diagonal.
+    against: 1 everywhere, less the dropped self weight on the diagonal.
     """
     full = np.ones(numerator.shape, dtype=np.float64)
-    self_weight = zones.self_weight
+    weight2 = zones.weight**2
+    priced = zones.cell_radius_m > 0
+    starts = zones.indptr[:-1]
 
-    # A self-pair's travel time is not zero once access time is charged: it is
-    # the leg from the demand point to its node and back again.
-    self_time = 2.0 * zones.access_seconds
-    self_value = self_time if decay_mu is None else np.exp(-decay_mu * self_time)
-    self_numerator = np.add.reduceat(zones.weight**2 * self_value, zones.indptr[:-1])
+    def per_zone(values: np.ndarray) -> np.ndarray:
+        return np.add.reduceat(values, starts)
+
+    # What routing put in for each a==b pair: the access legs alone.
+    routed_time = 2.0 * zones.access_seconds
+    intracell_m = zones.intracell_metres()
+    priced_time = routed_time + intracell_m / speed_ms
+    if decay_mu is None:
+        routed_value, priced_value = routed_time, priced_time
+    else:
+        routed_value = np.exp(-decay_mu * routed_time)
+        priced_value = np.exp(-decay_mu * priced_time)
 
     diagonal = np.arange(zones.n_zones)
-    numerator[diagonal, diagonal] -= self_numerator
-    denominator[diagonal, diagonal] -= self_weight
-    full[diagonal, diagonal] -= self_weight
+    dropped_weight = per_zone(np.where(priced, 0.0, weight2))
+    numerator[diagonal, diagonal] += per_zone(
+        weight2 * np.where(priced, priced_value - routed_value, -routed_value)
+    )
+    denominator[diagonal, diagonal] -= dropped_weight
+    full[diagonal, diagonal] -= dropped_weight
 
     if numerator_m is not None:
-        # The same pair, measured the other way: out to the network and back.
-        self_metres = 2.0 * zones.access_metres
-        numerator_m[diagonal, diagonal] -= np.add.reduceat(
-            zones.weight**2 * self_metres, zones.indptr[:-1]
+        # The same pair in metres: the access legs are already in, so a priced
+        # pair adds its within-cell distance and a dropped one takes the legs out.
+        routed_m = 2.0 * zones.access_metres
+        numerator_m[diagonal, diagonal] += per_zone(
+            weight2 * np.where(priced, intracell_m, -routed_m)
         )
     return full
 
@@ -293,8 +314,9 @@ def _intrazonal_fallback(network: RoutableNetwork, zones: Zones) -> np.ndarray:
     Two points drawn uniformly from a disc of radius R are 128R/(45*pi) apart on
     average. Crude -- real paths bend around things, and real demand is not
     uniform over a zone -- but finite and roughly right, which beats the
-    alternatives when there is no routed answer at all: a zone with one access
-    point has no distinct pair to measure, and a two-tier run whose near tier
+    alternatives when there is no routed answer at all: a zone whose one access
+    point is a single candidate has neither a distinct pair nor a cell spread
+    to measure, and a two-tier run whose near tier
     did not reach would otherwise report twice the representative point's
     access time.
 
@@ -337,8 +359,11 @@ def multipoint_travel_time_matrix(
       gravity or logit model, where demand responds to ``exp(-mu * t)`` and
       Jensen's inequality makes the arithmetic mean the wrong summary; leave it
       None for a matrix meant to be read as minutes.
-    - exclude_self_pairs: drop the "trip" from an access point to itself when
-      averaging the diagonal. See :func:`_drop_self_pairs`.
+    - exclude_self_pairs: do not take the routed "trip" from an access point to
+      itself -- the access legs and nothing else -- at face value when averaging
+      the diagonal: price it as a trip inside the point's cell where the cell
+      has a spread to measure, and drop it where it has not. See
+      :func:`_price_self_pairs`. False keeps the routed value as it is.
     - return_distance: also return the weighted mean distance in metres, over
       the same pairs, never decayed. See the module docstring.
 
@@ -364,7 +389,10 @@ def multipoint_travel_time_matrix(
     )
 
     if exclude_self_pairs:
-        full = _drop_self_pairs(numerator, denominator, zones, decay_mu, numerator_m)
+        speed_ms = profile_for(network.mode).base_kph * (1000.0 / SECONDS_PER_HOUR)
+        full = _price_self_pairs(
+            numerator, denominator, zones, decay_mu, speed_ms, numerator_m
+        )
     else:
         full = np.ones(numerator.shape, dtype=np.float64)
 
