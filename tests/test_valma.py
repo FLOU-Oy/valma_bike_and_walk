@@ -96,31 +96,58 @@ def test_skims_refuse_a_baseline_of_the_wrong_size(setup):
         valma.skims(setup, ZONES, {"dist": {"walk": np.zeros((2, 2))}})
 
 
-def test_assign_loads_valmas_demand_file_per_period(setup, tmp_path):
-    demand = tmp_path / "demand_aht.omx"
-    trips = np.array([[4.0, 6.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+def write_demand(path, trips):
     write_omx_matrix(
-        demand,
+        path,
         ZONES,
         trips,
         matrix_name="walk",
         mapping_name="zone_number",
         units="trips",
     )
+    return path
 
-    # Both modes asked for, as VALMA does; the file holds walk only, so bike is
+
+def test_assign_writes_one_layer_per_mode_with_a_column_per_period(setup, tmp_path):
+    trips = np.array([[4.0, 6.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    aht = write_demand(tmp_path / "demand_aht.omx", trips)
+    vrk = write_demand(tmp_path / "demand_vrk.omx", 2.0 * trips)
+
+    # Both modes asked for, as VALMA does; the files hold walk only, so bike is
     # skipped -- before it could ask for the bike.toml this setup lacks.
-    paths = valma.assign(setup, {"aht": demand})
+    result = valma.assign(setup, {"aht": aht, "vrk": vrk})
 
-    assert set(paths["aht"]) == {"walk"}
-    path = paths["aht"]["walk"]
-    assert path.is_file()
-    assert path.is_relative_to(setup.output_dir / "aht")
-    volumes = gpd.read_file(path, layer=LINKS_LAYER)
+    assert set(result) == {"walk"}
+    walk = result["walk"]
+    assert walk.gpkg == setup.output_dir / "walk_volumes.gpkg"
+    volumes = gpd.read_file(walk.gpkg, layer=LINKS_LAYER)
     # Intrazonal trips load too, so the network carries more than the 6
     # trips between zones would on their own.
-    assert volumes["volume"].max() >= 6.0
-    assert volumes["volume"].sum() > 6.0
+    assert volumes["volume_aht"].max() >= 6.0
+    assert volumes["volume_aht"].sum() > 6.0
+    np.testing.assert_allclose(volumes["volume_vrk"], 2.0 * volumes["volume_aht"])
+
+    assert walk.trips == {"aht": 10.0, "vrk": 20.0}
+    assert walk.kilometres["aht"] > 0
+    assert walk.kilometres["vrk"] == pytest.approx(2.0 * walk.kilometres["aht"])
+
+
+def test_assign_writes_only_loaded_links_unless_asked(setup, tmp_path):
+    # Demand inside zone 10 only: the links over in zone 20 carry nothing.
+    trips = np.zeros((3, 3))
+    trips[0, 0] = 5.0
+    demand = write_demand(tmp_path / "demand_pt.omx", trips)
+
+    loaded = valma.assign(setup, {"pt": demand})["walk"]
+    rows = gpd.read_file(loaded.gpkg, layer=LINKS_LAYER)
+    assert (rows["volume_pt"] > 0).all()
+
+    with np.load(loaded.npz) as everything:
+        assert everything["volume_pt"].size > len(rows)
+        assert (everything["volume_pt"] == 0).any()
+
+    every = valma.assign(setup, {"pt": demand}, all_links=True)["walk"]
+    assert len(gpd.read_file(every.gpkg, layer=LINKS_LAYER)) > len(rows)
 
 
 def test_skims_route_once_however_many_periods_ask(setup, monkeypatch):

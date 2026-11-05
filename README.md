@@ -483,9 +483,19 @@ setup = bw.Setup(
 # EMME's everywhere else, in VALMA's zone order, minutes and km.
 pt = bw.skims(setup, zone_numbers, {"time": {...}, "dist": {...}})
 
-# Once, at the end, on the demand VALMA has written.
+# Once, at the end, on the demand VALMA has written. Each mode's network and
+# zones are loaded once for all periods.
 volumes = bw.assign(setup, {"aht": demand_aht_omx, "vrk": demand_vrk_omx})
+volumes["bike"].gpkg        # bike_volumes.gpkg: volume_aht, volume_vrk per edge
+volumes["bike"].kilometres  # {"aht": ..., "vrk": ...} person-km loaded
 ```
+
+The volumes GeoPackage holds only the edges that carry something in some
+period (`all_links=True` for every edge); `link_volumes_<mode>.npz` beside it
+always has every edge. VALMA reports the daily km in
+`vehicle_kilometers_by_mode.txt` and every period in
+`bike_and_walk_kilometers.txt`, and leaves EMME's own walk and bike link volumes
+out of its results.
 
 The settings files hold everything about the network and routing; VALMA's
 zone data and submodel always override the zones they name, so the two zone

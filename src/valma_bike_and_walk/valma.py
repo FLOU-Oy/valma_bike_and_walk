@@ -11,7 +11,8 @@ VALMA makes two calls, and everything else stays on this side:
   from us too: zone polygons give every zone a routed intrazonal distance,
   where EMME leaves 0.
 - :func:`assign` once, at the end of the run, on the demand files VALMA has
-  just written. It returns where the link volumes went.
+  just written. It writes one volumes GeoPackage per mode, a column per
+  period, and returns where they went and the person-km each period loaded.
 
 Settings come from a directory holding ``walk.toml`` and ``bike.toml`` (and
 whatever they ``extends``), exactly as ``valma -c`` reads them. VALMA passes
@@ -179,34 +180,143 @@ def skims(
     return result
 
 
+@dataclass(frozen=True)
+class ModeVolumes:
+    """One mode's assignment of every demand file VALMA handed over."""
+
+    gpkg: Path
+    """``<mode>_volumes.gpkg``: one row per directed edge, ``volume_<label>`` each."""
+    npz: Path
+    """``link_volumes_<mode>.npz``: every edge, loaded or not, same columns."""
+    kilometres: dict[str, float]
+    """Demand times distance on the network, per label: person-km loaded."""
+    trips: dict[str, float]
+    """The demand read from each label's file, as VALMA wrote it."""
+
+
 def assign(
     setup: Setup,
     demand: Mapping[str, Path],
     modes: Iterable[str] = MODES,
-) -> dict[str, dict[str, Path]]:
+    all_links: bool = False,
+) -> dict[str, ModeVolumes]:
     """
     Assign VALMA's walk and bike demand, and draw the volumes on the links.
 
     ``demand`` maps a label -- a time period such as ``"aht"`` or ``"vrk"`` --
     to an OMX file holding one matrix per mode, named after it, with a
-    ``zone_number`` mapping: VALMA's own ``demand_<period>.omx``. Each label's
-    results go under ``<output_dir>/<label>/``, and the volumes GeoPackage of
-    each is returned as ``paths[label][mode]``. A mode a file has no matrix
-    for is skipped -- VALMA's transit-only period has no walk or bike demand.
+    ``zone_number`` mapping: VALMA's own ``demand_<period>.omx``. A mode a file
+    has no matrix for is skipped there -- VALMA's transit-only period has no
+    walk or bike demand.
+
+    Each mode's network and zones are loaded once and every label assigned on
+    them, and the results go into one GeoPackage per mode with a
+    ``volume_<label>`` column each -- not a file per label, which would re-read
+    and re-write a national link layer every time. Only edges that carry
+    something in some label are written, unless ``all_links``; the ``.npz``
+    beside it always has every edge.
     """
-    paths: dict[str, dict[str, Path]] = {}
-    for label, demand_path in demand.items():
-        present = _matrices_in(demand_path)
-        for mode in modes:
-            if mode not in present:
-                logger.info("No %s demand in %s; not assigned", mode, demand_path)
-                continue
-            argv = [
-                *setup.overrides(mode, Path(setup.output_dir) / label),
-                "--demand", str(demand_path),
-                "--demand-matrix", mode,
-                "--gpkg",
-            ]  # fmt: skip
-            args = _run("assign", argv, setup.settings(mode))
-            paths.setdefault(label, {})[mode] = args.output_dir / f"{mode}_volumes.gpkg"
-    return paths
+    from valma_bike_and_walk.assignment import (
+        assign_traffic,
+        assign_zone_traffic,
+        link_volume_frame,
+    )
+    from valma_bike_and_walk.cli import (
+        _analysis_points,
+        _assign_demand,
+        _link_layer,
+        _network_and_links,
+        _record,
+    )
+    from valma_bike_and_walk.connectors import island_link_ids
+    from valma_bike_and_walk.gpkg import write_edges_gpkg
+    from valma_bike_and_walk.links import read_links
+    from valma_bike_and_walk.zones import Zones
+
+    present = {label: _matrices_in(path) for label, path in demand.items()}
+    result: dict[str, ModeVolumes] = {}
+    for mode in modes:
+        labels = [label for label in demand if mode in present[label]]
+        for label in demand:
+            if label not in labels:
+                logger.info("No %s demand in %s; not assigned", mode, demand[label])
+        if not labels:
+            continue
+
+        argv = [
+            *setup.overrides(mode),
+            "--demand", str(demand[labels[0]]),
+            "--demand-matrix", mode,
+            "--gpkg",
+        ]  # fmt: skip
+        parsed = _parse(["assign", *argv], setup.settings(mode))
+        args = parsed.args
+        network, links_path = _network_and_links(args)
+        points = _analysis_points(args, network)
+        if len(points) == 0:
+            raise RuntimeError(f"No {mode} zone snapped to the network.")
+        max_seconds = args.max_minutes * 60 if args.max_minutes else None
+
+        volumes: dict[str, np.ndarray] = {}
+        trips: dict[str, float] = {}
+        for label in labels:
+            args.demand = Path(demand[label])
+            matrix = _assign_demand(args, points)
+            trips[label] = float(matrix.sum())
+            logger.info("Assigning %s %s: %.6g trips", mode, label, trips[label])
+            if isinstance(points, Zones):
+                volume = assign_zone_traffic(
+                    network,
+                    points,
+                    matrix,
+                    max_seconds=max_seconds,
+                    near_seconds=args.near_minutes * 60 if args.near_minutes else None,
+                    workers=args.workers,
+                    chunk_size=args.chunk_size,
+                )
+            else:
+                volume = assign_traffic(
+                    network,
+                    points.node_index,
+                    matrix,
+                    max_seconds=max_seconds,
+                    workers=args.workers,
+                    chunk_size=args.chunk_size,
+                )
+            volumes[f"volume_{label}"] = volume
+
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        frame = link_volume_frame(network, next(iter(volumes.values())))
+        frame.pop("volume", None)
+        npz = args.output_dir / f"link_volumes_{mode}.npz"
+        np.savez_compressed(npz, **frame, **volumes)
+
+        # Island crossings stand in for nothing anyone travels on, so they are
+        # left off the map as `valma assign --gpkg` leaves them.
+        layer = read_links(args.links) if args.links else links_path
+        edge_mask = np.ones(network.n_edges, dtype=bool)
+        if args.connectors is not None:
+            layer = _link_layer(args)
+            crossings = island_link_ids(read_links(args.connectors))
+            edge_mask &= ~np.isin(network.link_id, crossings)
+        if not all_links:
+            edge_mask &= np.logical_or.reduce([v > 0 for v in volumes.values()])
+        gpkg = args.output_dir / f"{mode}_volumes.gpkg"
+        write_edges_gpkg(
+            network, layer, gpkg, extra_columns=volumes, edge_mask=edge_mask
+        )
+        _record(args, parsed.parser, "assign", parsed.files)
+
+        length_km = network.length.astype(np.float64) / 1000.0
+        kilometres = {
+            column.removeprefix("volume_"): float((v * length_km).sum())
+            for column, v in volumes.items()
+        }
+        logger.info(
+            "Wrote %s: %d edge(s), %s",
+            gpkg,
+            int(edge_mask.sum()),
+            ", ".join(f"{k} {v:,.0f} km" for k, v in kilometres.items()),
+        )
+        result[mode] = ModeVolumes(gpkg, npz, kilometres, trips)
+    return result
