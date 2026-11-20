@@ -123,6 +123,7 @@ def make_zones(
     area_m2: list[float] | None = None,
     network: RoutableNetwork | None = None,
     access_metres_per_zone: list[list[float]] | None = None,
+    cell_radius_per_zone: list[list[float]] | None = None,
 ) -> Zones:
     """
     Build a :class:`Zones` straight from node lists, skipping :func:`load_zones`.
@@ -131,7 +132,11 @@ def make_zones(
     access points came from. Weights default to uniform within each zone and
     access time to zero; the representative point of a zone is its first node.
     ``access_metres_per_zone`` is the same leg in metres, for distance matrices.
+    ``cell_radius_per_zone`` defaults to zero: every point a single candidate,
+    whose a==b pair is dropped rather than priced.
     """
+    if cell_radius_per_zone is None:
+        cell_radius_per_zone = [[0.0] * len(n) for n in nodes_per_zone]
     n_zones = len(nodes_per_zone)
     if weights_per_zone is None:
         weights_per_zone = [[1.0 / len(n)] * len(n) for n in nodes_per_zone]
@@ -177,6 +182,9 @@ def make_zones(
         ),
         representative_access_seconds=np.zeros(n_zones),
         representative_access_metres=np.zeros(n_zones),
+        cell_radius_m=np.array(
+            [r for zone in cell_radius_per_zone for r in zone], dtype=float
+        ),
     )
 
 

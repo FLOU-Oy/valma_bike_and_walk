@@ -2,8 +2,7 @@
 
 Notes from putting `valma_bike_and_walk` into the same interpreter as
 OpenPaths EMME, so the VALMA model system can call it in process instead of
-shelling out. Written 2026-11-04, part way through; the last section says what
-was still unresolved.
+shelling out. Written 2026-11-04.
 
 ## Why in process at all
 
@@ -85,16 +84,46 @@ Do **not** use `pip install --user`: EMME puts
 `AppData\Roaming\Python\Python311\site-packages` first on `sys.path`, and it is
 shared with any other Python 3.11 on the machine.
 
+**The per-user folder is on the venv's path too, ahead of EMME's packages.** A
+`--system-site-packages` venv reads the venv first, then
+`AppData\Roaming\Python\Python311\site-packages`, then EMME's. Anything the venv
+lacks is taken from the per-user folder if it is there, whatever version it
+holds, and that folder differs per Windows user and per machine. Found
+2026-11-05: geopandas, openpyxl and et_xmlfile came only from there, and its
+shapely 2.1.0 and pyproj 3.7.1 shadowed EMME's 2.0.1 and 3.5.0. So give the
+venv everything the package imports, at EMME's versions where EMME has them:
+
+```powershell
+& $PY -m pip install --no-deps --ignore-installed `
+    geopandas==1.0.1 pyogrio==0.10.0 openpyxl==3.1.4 et_xmlfile==2.0.0 `
+    shapely==2.0.1 pyproj==3.5.0
+```
+
+pyogrio is what makes reading a national link layer take a minute: without it
+geopandas falls back to EMME's fiona, which reads row by row and took 21
+minutes for the 4.3 million walk links. It carries its own GDAL (3.9.1, beside
+fiona's 3.6.4); the two have run in one process with EMME throughout testing
+without trouble. `--no-deps` keeps it from moving EMME's numpy or `packaging`.
+
+`--ignore-installed` makes pip install into the venv even though it can see a
+copy elsewhere. Check with `& $PY -I -c "import valma_bike_and_walk.valma"`:
+`-I` leaves the per-user folder out, so it fails if anything still comes from
+there.
+
+For development, `& $PY -m pip install --no-deps -e C:\valma-bw\valma_bike_and_walk`
+makes the venv follow the working copy instead of a snapshot.
+
 ## Known traps
 
 - **`pip install pytest` moves `packaging`.** pytest 9 wants a newer
   `packaging` than EMME's 23.1 and will shadow it in the venv. Harmless in
   itself (pure Python), but pin `packaging==23.1` and use `pytest<9` if you
   want the venv to mirror production exactly.
-- **pip installs duplicate `pyproj` and `shapely` into the venv** even though
-  EMME provides them at the pinned versions. Two GDAL/PROJ stacks in one
-  process is worth avoiding; install `geopandas` with `--no-deps` so it uses
-  EMME's fiona rather than pulling `pyogrio`, a third GDAL.
+- **`pyproj` and `shapely` belong in the venv, at EMME's versions.** Removing
+  the venv's copies so EMME's are used looks tidier, but it lets the per-user
+  folder's copies win instead (see above). Install `geopandas` with
+  `--no-deps`, and `pyogrio` explicitly, so nothing pulls in newer numpy or
+  `packaging` along the way.
 - **numpy 1 vs 2 differences are invisible on a developer machine.** See
   below; this cost a day.
 
@@ -124,9 +153,9 @@ failed**. The two failures are in `test_elevation.py`
 `test_a_steep_but_believable_hill_is_untouched`), pre-existing on the
 `routing-signal-fixes` branch and unrelated to deployment.
 
-## Unresolved: fiona cannot find proj.db
+## Resolved: fiona cannot find proj.db
 
-`python -m tests.emme_only.test_assignment` from `valma-model-system` fails at
+`python -m tests.emme_only.test_assignment` from `valma-model-system` failed at
 the very end, writing its result GeoPackage:
 
 ```
@@ -134,26 +163,42 @@ fiona.errors.CRSError: The EPSG code is unknown.
 PROJ: proj_create_from_database: Cannot find proj.db
 ```
 
-EMME itself runs fine up to that point — the assignment completes, so this is
-not a numba or LLVM problem.
+**Cause: `valma-model-system` itself, not the venv's packages.**
+`Scripts/datahandling/resultdata.py` sets, before importing fiona:
 
-Tried and **did not** help: removing the duplicate `pyproj` and `shapely` from
-the venv so EMME's copies are used.
-
-The control experiment had not been run when this was written, and it is the
-next thing to do:
-
-```powershell
-& $EMME -c "from fiona.crs import from_epsg; print(from_epsg(3067))"
-& $PY   -c "from fiona.crs import from_epsg; print(from_epsg(3067))"
-& $EMME -c "import os; print({k:v for k,v in os.environ.items() if 'PROJ' in k.upper() or 'GDAL' in k.upper()})"
+```python
+os.environ["PROJ_DATA"] = (sys.exec_prefix
+                           + "\\Lib\\site-packages\\fiona\\proj_data")
 ```
 
-If EMME's own untouched interpreter fails the first one too, the venv is
-innocent and this is an environment-variable problem — most likely that
-Bentley's EMME launcher sets `PROJ_DATA`/`GDAL_DATA` and invoking `python.exe`
-directly bypasses it. `proj.db` is present in both
-`fiona\proj_data\` and `pyproj\proj_dir\share\proj\`.
+That assumes fiona lives under `sys.exec_prefix`. In EMME's own interpreter it
+does. In a `--system-site-packages` venv, `sys.exec_prefix` is the venv
+(`C:\valma-bw\venv`) while fiona is still EMME's copy, so `PROJ_DATA` points
+at a directory that does not exist. `PROJ_DATA` outranks both fiona's bundled
+data and `PROJ_LIB`, so PROJ finds nothing.
 
-If only the venv fails, the venv is genuinely breaking it and `sys.path`
-differences are the place to look.
+Verified 2026-11-04: the same line, then a fiona GPKG write with EPSG:3067,
+succeeds under `$EMME` and fails under `$PY` with exactly the error above. A
+plain fiona write *without* that line succeeds in both, with or without the
+machine-wide `PROJ_LIB` (see below) set. The earlier control experiment
+(`from_epsg(3067)` alone) passes in both, so it could not tell them apart.
+
+**Fix (in `valma-model-system`):** find fiona's real location without importing
+it:
+
+```python
+import importlib.util
+_fiona = importlib.util.find_spec("fiona")
+os.environ["PROJ_DATA"] = os.path.join(
+    os.path.dirname(_fiona.origin), "proj_data")
+```
+
+It still overrides on purpose, which matters for the next point.
+
+**Unrelated machine setting worth knowing about:** PostgreSQL 15/PostGIS sets
+the machine-wide variables `PROJ_LIB` (to
+`C:\Program Files\PostgreSQL\15\share\contrib\postgis-3.3\proj`) and
+`GDAL_DATA` (to PostgreSQL's `gdal-data`). Every Python on the machine
+inherits them. They did not cause this failure, but a different PROJ/GDAL
+version's data can break things in subtle ways. That is a good reason to keep
+setting `PROJ_DATA` explicitly rather than drop the line.

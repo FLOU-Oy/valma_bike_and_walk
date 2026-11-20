@@ -243,7 +243,7 @@ Output goes beside the times, in the units each file already uses:
 
 With `--zones`, distances go through the whole zone machinery exactly as times
 do: the weighted mean over access-point pairs, access legs charged in metres at
-both ends, self-pairs dropped from the diagonal, the two-tier near/far
+both ends, within-cell trips priced on the diagonal, the two-tier near/far
 stitching, and the equal-area-circle fallback for a diagonal routing could not
 produce. Which tier a cell came from is decided once, by the time matrix, so
 the two always describe the same journey.
@@ -459,6 +459,51 @@ matrix delimits its rows, and `zones.weight` sums to 1 within every zone.
 is no `if __name__ == "__main__":` ceremony to observe. The first run on a
 machine spends a few seconds compiling the routing kernels; the compiled code is
 cached, so later runs start straight away.
+
+### From VALMA
+
+[`valma_bike_and_walk.valma`](src/valma_bike_and_walk/valma.py) is the whole
+interface the VALMA model system calls, in process (see
+[docs/emme-deployment.md](docs/emme-deployment.md) for installing into EMME's
+Python). VALMA turns it on with `--bike-and-walk-config DIR` (or
+`BIKE_AND_WALK_CONFIG` in its `dev-config.json`); without it, VALMA runs as it
+always has and never imports this package. What VALMA does with it:
+
+```python
+from valma_bike_and_walk import valma as bw
+
+setup = bw.Setup(
+    config_dir=args.bike_and_walk_config,   # walk.toml, bike.toml
+    zone_data_file=args.zone_data_file,     # VALMA's zone data ...
+    submodel=args.submodel,                 # ... and the column naming its zones
+    output_dir=results / "bike_and_walk",
+)
+
+# Once, after EMME's pt walk and bike skims: ours wherever we routed,
+# EMME's everywhere else, in VALMA's zone order, minutes and km.
+pt = bw.skims(setup, zone_numbers, {"time": {...}, "dist": {...}})
+
+# Once, at the end, on the demand VALMA has written. Each mode's network and
+# zones are loaded once for all periods.
+volumes = bw.assign(setup, {"aht": demand_aht_omx, "vrk": demand_vrk_omx})
+volumes["bike"].gpkg        # bike_volumes.gpkg: volume_aht, volume_vrk per edge
+volumes["bike"].kilometres  # {"aht": ..., "vrk": ...} person-km loaded
+```
+
+The volumes GeoPackage holds only the edges that carry something in some
+period (`all_links=True` for every edge); `link_volumes_<mode>.npz` beside it
+always has every edge. VALMA reports the daily km in
+`vehicle_kilometers_by_mode.txt` and every period in
+`bike_and_walk_kilometers.txt`, and leaves EMME's own walk and bike link volumes
+out of its results.
+
+The settings files hold everything about the network and routing; VALMA's
+zone data and submodel always override the zones they name, so the two zone
+systems cannot disagree. Each mode's `[overlay]` `max_minutes` and `max_km`
+decide how far our values replace EMME's. Set them to cover the model's own
+distance bounds (walk 10 km and bike 20 km of beeline, plus detours), or longer
+trips will mix the two sources. Intrazonal distances are ours too: VALMA keeps
+a positive skim diagonal and uses its zone data only where EMME left 0.
 
 ## Settings files and scenarios
 
@@ -731,12 +776,24 @@ and dropped with a warning, exactly as in a single-tier run.
   (default: the mode's base speed); `--no-access-time` restores the old
   behaviour.
 - **Intrazonal demand is assigned.** Zone `i`'s own demand is spread over the
-  ordered pairs of its access points, excluding the pair from a point to itself
-  and renormalising so the total is preserved. A zone with only one access point
-  still has nowhere to put it; that is reported, not silently dropped.
-- **The intrazonal travel time is a real number**, averaged over distinct point
-  pairs. Where routing cannot produce one — a single-point zone, or a zone the
-  near tier did not cover — it falls back to the equal-area circle,
+  ordered pairs of its access points. The share between two people in the
+  *same* point's cell (`w²` of it) is a real, short trip, but both its ends are
+  one node, so it is counted and logged rather than loaded — never moved onto
+  the longer paths between cells. A point that stands for a single candidate
+  has no cell to speak of; its share is spread over the other pairs instead,
+  so the total is preserved. A zone with only one such point still has nowhere
+  to put it; that is reported, not silently dropped.
+- **The intrazonal travel time is a real number**, averaged over every pair of
+  people in the zone. Pairs in different cells are routed between their access
+  points. A pair in the same cell cannot be routed, so it is priced from how
+  spread out that cell's candidates were: each access point remembers the
+  radius `r = √(2(σx² + σy²))` of the uniform disc with the same weighted
+  spread, and a trip inside it costs `1.3 · 0.9054 · r` (the disc's mean
+  separation, times a typical short-trip detour) plus the access legs, at the
+  mode's base speed. `--zone-points-gpkg` writes `cell_radius_m` and
+  `intracell_m` for each point. Where routing cannot produce a value at all — a
+  zone whose one point is a single candidate, or a zone the near tier did not
+  cover — it falls back to the equal-area circle,
   `0.9054 · R / v` for `R = √(area/π)`. That is a crow-flies estimate, not a
   routed answer, and it is only ever used to *fill* a missing value, never to
   overrule one: a zone whose demand really does sit in one corner has genuinely

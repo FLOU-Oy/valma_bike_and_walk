@@ -133,6 +133,17 @@ _GRID_BISECT_STEPS = 16
 #: purposes; well above it, the zone is in separated pieces.
 _REPRESENTATIVE_OFFSET_WARN_M = 500.0
 
+#: Mean distance between two points drawn uniformly from a disc of radius R,
+#: as a multiple of R: 128 / (45 * pi). The classic closed form behind the
+#: "equal-area circle" intrazonal estimate, used here one level down as well,
+#: for two people in the same access point's cell.
+DISC_MEAN_DISTANCE = 128.0 / (45.0 * np.pi)
+
+#: Street distance over crow-flies distance for a trip inside one access point's
+#: cell. Those trips are never routed -- both ends are the same point -- so their
+#: crow-flies estimate is stretched by a typical short-trip circuity instead.
+INTRACELL_DETOUR = 1.3
+
 
 def _group_bounds(counts: np.ndarray) -> np.ndarray:
     """CSR-style ``(n_groups + 1,)`` offsets from per-group counts."""
@@ -173,6 +184,12 @@ class Zones:
     representative: Centroids  # one point per zone, aligned with ids
     representative_access_seconds: np.ndarray  # (n_zones,)
     representative_access_metres: np.ndarray  # (n_zones,)
+    #: (n_points,) how spread out the demand each access point stands for is:
+    #: the radius of the uniform disc with the same weighted spread as the
+    #: candidates its grid cell collapsed, ``sqrt(2 * (var_x + var_y))``. Zero
+    #: for a point that stands for a single candidate, which has no spread to
+    #: measure. See :meth:`intracell_metres`.
+    cell_radius_m: np.ndarray
 
     @property
     def n_zones(self) -> int:
@@ -207,6 +224,28 @@ class Zones:
         exactly this much.
         """
         return np.add.reduceat(self.weight**2, self.indptr[:-1])
+
+    def intracell_metres(self) -> np.ndarray:
+        """
+        (n_points,) street distance between two people in the same point's cell.
+
+        The a==b pair of access points is not a trip of zero length: it is two
+        people in the same part of the zone, the shortest intrazonal trips there
+        are. Routing cannot measure it -- both ends are one node -- so it is the
+        disc estimate ``128 R / (45 pi)`` at the cell's radius, stretched by
+        :data:`INTRACELL_DETOUR`. Access legs come on top, as for any pair.
+
+        Zero where :attr:`cell_radius_m` is: a point standing for a single
+        candidate has no within-cell trip to price, and its a==b pair is
+        dropped instead.
+        """
+        return INTRACELL_DETOUR * DISC_MEAN_DISTANCE * self.cell_radius_m
+
+    @property
+    def priced_self_weight(self) -> np.ndarray:
+        """(n_zones,) the part of :attr:`self_weight` with a within-cell trip to price."""
+        priced = np.where(self.cell_radius_m > 0, self.weight**2, 0.0)
+        return np.add.reduceat(priced, self.indptr[:-1])
 
     def weight_matrix(self) -> csr_matrix:
         """
@@ -526,7 +565,7 @@ def _fit_grid_cell(
 
 def _reduce_points(
     x: np.ndarray, y: np.ndarray, weight: np.ndarray, k: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Reduce one zone's candidates to at most ``k`` weighted points.
 
@@ -535,9 +574,15 @@ def _reduce_points(
     each occupied cell to its weighted centroid. Deterministic, and it preserves
     the weighted mean position exactly: summing ``w_c * centroid_c`` over cells
     gives back ``sum(w_i * x_i)``.
+
+    Returns ``(x, y, weight, moment)``. ``moment`` is each point's weighted
+    second moment about its own position, ``var_x + var_y`` over the
+    candidates it stands for, in m^2: what collapsing the cell to one point
+    threw away, kept so the trip between two people in the same cell can still
+    be priced. Zero for a point that is a single candidate.
     """
     if x.shape[0] <= k:
-        return x, y, weight
+        return x, y, weight, np.zeros_like(x, dtype=float)
 
     if weight.sum() <= 0:  # no usable weights: count every candidate equally
         weight = np.ones_like(weight)
@@ -545,14 +590,14 @@ def _reduce_points(
     x0, y0 = float(x.min()), float(y.min())
     span = max(float(x.max()) - x0, float(y.max()) - y0)
     if span <= 0:  # every candidate at the same spot
-        return x[:1].copy(), y[:1].copy(), np.array([float(weight.sum())])
+        return x[:1].copy(), y[:1].copy(), np.array([float(weight.sum())]), np.zeros(1)
 
     cell = _fit_grid_cell(x, y, x0, y0, span, k)
     if cell is None:
         # No grid fitted (pathological spacing). Keep the heaviest candidates;
         # weights are renormalised per zone afterwards regardless.
         keep = np.sort(np.argsort(weight)[::-1][:k])
-        return x[keep], y[keep], weight[keep]
+        return x[keep], y[keep], weight[keep], np.zeros(keep.shape[0])
 
     _, inverse = np.unique(_cell_keys(x, y, x0, y0, cell), return_inverse=True)
     inverse = np.ravel(inverse)
@@ -562,7 +607,14 @@ def _reduce_points(
     safe = np.where(cell_weight > 0, cell_weight, 1.0)
     cell_x = np.bincount(inverse, weights=weight * x, minlength=n_cells) / safe
     cell_y = np.bincount(inverse, weights=weight * y, minlength=n_cells) / safe
-    return cell_x, cell_y, cell_weight
+    # About the cell's own centroid, so the subtraction is of like magnitudes
+    # rather than E[x^2] - E[x]^2 in national coordinates.
+    dx, dy = x - cell_x[inverse], y - cell_y[inverse]
+    moment = (
+        np.bincount(inverse, weights=weight * (dx * dx + dy * dy), minlength=n_cells)
+        / safe
+    )
+    return cell_x, cell_y, cell_weight, moment
 
 
 def _representative_points(
@@ -611,9 +663,12 @@ def _place_access_points(
     candidate_weight: np.ndarray,
     points_per_zone: int,
     fallback_candidates: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Place each zone's access points. Returns (zone_index, x, y, weight).
+    Place each zone's access points. Returns (zone_index, x, y, weight, moment).
+
+    ``moment`` is each point's within-cell second moment; see
+    :func:`_reduce_points`.
 
     Weights come back normalised to sum to 1 within every zone. A zone with no
     candidate inside it takes its points from ``fallback_candidates`` instead,
@@ -662,6 +717,7 @@ def _place_access_points(
     xs: list[np.ndarray] = []
     ys: list[np.ndarray] = []
     ws: list[np.ndarray] = []
+    ms: list[np.ndarray] = []
     per_zone = np.zeros(n_zones, dtype=np.int64)
     empty = 0
 
@@ -671,9 +727,10 @@ def _place_access_points(
             zx = fallback_x[zone : zone + 1]
             zy = fallback_y[zone : zone + 1]
             zw = np.ones(1)
+            zm = np.zeros(1)
             empty += 1
         else:
-            zx, zy, zw = _reduce_points(
+            zx, zy, zw, zm = _reduce_points(
                 candidate_x[block],
                 candidate_y[block],
                 candidate_weight[block],
@@ -684,6 +741,7 @@ def _place_access_points(
         xs.append(np.asarray(zx, dtype=float))
         ys.append(np.asarray(zy, dtype=float))
         ws.append(np.asarray(zw, dtype=float) / float(np.sum(zw)))
+        ms.append(np.asarray(zm, dtype=float))
         per_zone[zone] = len(zx)
 
         if n_zones >= 2000 and (zone + 1) % 2000 == 0:
@@ -701,6 +759,7 @@ def _place_access_points(
         np.concatenate(xs),
         np.concatenate(ys),
         np.concatenate(ws),
+        np.concatenate(ms),
     )
 
 
@@ -712,29 +771,33 @@ def _merge_shared_nodes(
     access_m: np.ndarray,
     x: np.ndarray,
     y: np.ndarray,
+    moment: np.ndarray,
 ) -> tuple[np.ndarray, ...]:
     """
     Collapse access points of one zone that snapped to the same network node.
 
     Common in a small zone, or wherever the reduction grid came out finer than
     the network. Two rows on the same node in the same zone route identically, so
-    merging them saves a whole Dijkstra each and changes no result: the merged
-    point carries the summed weight and the weighted mean of everything else.
+    merging them saves a whole Dijkstra each: the merged point carries the
+    summed weight and the weighted mean of everything else. Its second moment
+    is that of everything it now stands for -- each part's own spread plus how
+    far that part sat from the merged centroid -- so a trip between two of the
+    cells it absorbed is priced as one inside a single, wider cell.
     """
     if node_index.size == 0:
-        return zone_index, node_index, weight, access, access_m, x, y
+        return zone_index, node_index, weight, access, access_m, x, y, moment
 
     order = np.lexsort((node_index, zone_index))
     zone_index, node_index = zone_index[order], node_index[order]
     weight, access, access_m = weight[order], access[order], access_m[order]
-    x, y = x[order], y[order]
+    x, y, moment = x[order], y[order], moment[order]
 
     key = zone_index * (int(node_index.max()) + 1) + node_index
     _, first, inverse = np.unique(key, return_index=True, return_inverse=True)
     inverse = np.ravel(inverse)
     n_points = first.shape[0]
     if n_points == key.shape[0]:
-        return zone_index, node_index, weight, access, access_m, x, y
+        return zone_index, node_index, weight, access, access_m, x, y, moment
 
     logger.info(
         "Merged %d access point(s) sharing a network node with another in the same zone",
@@ -742,14 +805,24 @@ def _merge_shared_nodes(
     )
     merged_weight = np.bincount(inverse, weights=weight, minlength=n_points)
     safe = np.where(merged_weight > 0, merged_weight, 1.0)
+    merged_x = np.bincount(inverse, weights=weight * x, minlength=n_points) / safe
+    merged_y = np.bincount(inverse, weights=weight * y, minlength=n_points) / safe
+    dx, dy = x - merged_x[inverse], y - merged_y[inverse]
+    merged_moment = (
+        np.bincount(
+            inverse, weights=weight * (moment + dx * dx + dy * dy), minlength=n_points
+        )
+        / safe
+    )
     return (
         zone_index[first],
         node_index[first],
         merged_weight,
         np.bincount(inverse, weights=weight * access, minlength=n_points) / safe,
         np.bincount(inverse, weights=weight * access_m, minlength=n_points) / safe,
-        np.bincount(inverse, weights=weight * x, minlength=n_points) / safe,
-        np.bincount(inverse, weights=weight * y, minlength=n_points) / safe,
+        merged_x,
+        merged_y,
+        merged_moment,
     )
 
 
@@ -806,7 +879,7 @@ def load_zones(
             "Distributing zone demand by street length (no weights layer given)"
         )
 
-    zone_index, x, y, weight = _place_access_points(
+    zone_index, x, y, weight, moment = _place_access_points(
         geometry,
         *candidates,
         points_per_zone=points_per_zone,
@@ -885,14 +958,17 @@ def load_zones(
     kept = int(keep_point.sum())
     access_m = snap_distance[keep_point]
     access = access_m / metres_per_second
-    zone_index, node_index, weight, access, access_m, x, y = _merge_shared_nodes(
-        remap[zone_index[keep_point]],
-        node_index[keep_point],
-        weight[keep_point],
-        access if charge_access_time else np.zeros(kept),
-        access_m if charge_access_time else np.zeros(kept),
-        x[keep_point],
-        y[keep_point],
+    zone_index, node_index, weight, access, access_m, x, y, moment = (
+        _merge_shared_nodes(
+            remap[zone_index[keep_point]],
+            node_index[keep_point],
+            weight[keep_point],
+            access if charge_access_time else np.zeros(kept),
+            access_m if charge_access_time else np.zeros(kept),
+            x[keep_point],
+            y[keep_point],
+            moment[keep_point],
+        )
     )
 
     counts = np.bincount(zone_index, minlength=int(keep_zone.sum()))
@@ -925,6 +1001,9 @@ def load_zones(
         representative_access_metres=(
             rep_distance if charge_access_time else np.zeros(int(keep_zone.sum()))
         ),
+        # The radius of the uniform disc with this spread: var_x + var_y over
+        # a disc of radius R is R^2 / 2.
+        cell_radius_m=np.sqrt(2.0 * np.maximum(moment, 0.0)),
     )
 
     stats = zones.summarise()
@@ -953,6 +1032,8 @@ def zone_points_frame(zones: Zones) -> gpd.GeoDataFrame:
             "zone_id": np.repeat(zones.ids, zones.points_per_zone),
             "weight": zones.weight,
             "access_seconds": zones.access_seconds,
+            "cell_radius_m": zones.cell_radius_m,
+            "intracell_m": zones.intracell_metres(),
             "node_index": zones.node_index,
         },
         geometry=gpd.points_from_xy(zones.x, zones.y),

@@ -2157,6 +2157,13 @@ def main(argv: list[str] | None = None) -> int:
         print(config_file.dump(args, parser, command, sources=sources, header=header), end="")
         return 0
 
+    return execute(parsed)
+
+
+def execute(parsed: _Parsed) -> int:
+    """Run a parsed command, and record its settings next to its results if it succeeds."""
+    args, parser, command, config = parsed.args, parsed.parser, parsed.command, parsed.config
+    args.config_files = parsed.files
     code = int(args.func(args))
     if code == 0 and command in _RECORDED:
         files_used = config.files if config is not None else []

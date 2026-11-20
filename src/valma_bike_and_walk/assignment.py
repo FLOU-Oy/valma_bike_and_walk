@@ -372,25 +372,35 @@ def _intrazonal_pairs(zones: Zones, intrazonal: np.ndarray) -> coo_matrix:
     share of all travel and precisely the share that belongs on local streets,
     so it is worth getting right.
 
-    Pair ``(a, b)`` takes ``D_ii * w_a * w_b``, restricted to ``a != b`` and
-    renormalised by ``1 - sum(w^2)`` so the zone's total demand is preserved
-    rather than quietly losing the self-pair share. A zone with a single access
-    point has no distinct pair to carry its intrazonal demand; those zones are
-    reported and skipped.
+    Pair ``(a, b)`` takes ``D_ii * w_a * w_b`` for ``a != b``. The ``a == b``
+    pairs are the trips between two people in the same access point's cell, and
+    are treated as the matrix treats them (see
+    :func:`valma_bike_and_walk.matrix._price_self_pairs`): where the point has
+    a cell to measure, its share ``D_ii * w_a^2`` is a real trip that stays
+    inside the cell -- both ends are one node, so there is no path to load and
+    it is counted rather than loaded; where it has none, the pair is dropped
+    and the rest renormalised by ``1 - sum(w^2)`` over those points, so the
+    zone's total demand is preserved. Either way, within-cell trips are never
+    moved onto the longer paths between cells.
     """
     indptr = zones.indptr
-    self_weight = zones.self_weight
+    dropped_weight = zones.self_weight - zones.priced_self_weight
+    priced_weight = zones.priced_self_weight
 
     rows: list[np.ndarray] = []
     cols: list[np.ndarray] = []
     values: list[np.ndarray] = []
     unplaced = 0.0
+    within_cell = 0.0
 
     for zone in np.flatnonzero(intrazonal > 0):
         lo, hi = int(indptr[zone]), int(indptr[zone + 1])
-        scale = 1.0 - float(self_weight[zone])
-        if hi - lo < 2 or scale <= 0:
+        scale = 1.0 - float(dropped_weight[zone])
+        if scale <= 1e-12:
             unplaced += float(intrazonal[zone])
+            continue
+        within_cell += float(intrazonal[zone]) * float(priced_weight[zone]) / scale
+        if hi - lo < 2:
             continue
 
         points = np.arange(lo, hi)
@@ -408,10 +418,18 @@ def _intrazonal_pairs(zones: Zones, intrazonal: np.ndarray) -> coo_matrix:
         cols.append(destination[distinct])
         values.append(value[distinct])
 
+    if within_cell > 0:
+        logger.info(
+            "%.6g intrazonal demand is between two people in the same access "
+            "point's cell: real trips, priced in the matrix, but with no path "
+            "to load, so they add to no link.",
+            within_cell,
+        )
     if unplaced > 0:
         logger.warning(
             "%.6g intrazonal demand could not be placed: those zones have only "
-            "one access point, so there is no path inside them to load.",
+            "one access point, standing for a single candidate, so there is no "
+            "path or cell inside them to carry it.",
             unplaced,
         )
 
@@ -440,8 +458,8 @@ def expand_demand(
     where the trips start and end.
 
     The interzonal part is two sparse products, ``W @ D @ W.T``. The intrazonal
-    part is built separately by :func:`_intrazonal_pairs`, because it needs the
-    self-pairs excluded and the rest renormalised.
+    part is built separately by :func:`_intrazonal_pairs`, because the self-pairs
+    need the same treatment the matrix gives them.
 
     Cost is the honest one: nonzeros grow by roughly ``K^2``. At the default K
     of 8 that is 64x more OD pairs, which is why they stay sparse -- and it
